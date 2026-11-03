@@ -66,6 +66,16 @@ fn bf(x: u16) f32 {
     return @bitCast(@as(u32, x) << 16);
 }
 
+/// TF_GLM_DFLASH2_EDGE: the selector's edge weight in a chain pick (the Python engine's dflash2.py EDGE is 0.6; this
+/// engine's selector weighed the edge at 1). Drafts only propose, so a reply's tokens are the target's at any value.
+var edge_weight: ?f32 = null;
+fn edgeWeight() f32 {
+    if (edge_weight) |w| return w;
+    const w: f32 = if (std.c.getenv("TF_GLM_DFLASH2_EDGE")) |v| (std.fmt.parseFloat(f32, std.mem.span(v)) catch 1.0) else 1.0;
+    edge_weight = if (std.math.isFinite(w) and w >= 0 and w <= 4) w else 1.0;
+    return edge_weight.?;
+}
+
 /// Stream `i`'s 7 drafts: each row's best of every rank's 16 by logit plus codebook score; greedy, chance kept.
 pub fn select(dr: *const df.Drafter, i: usize, M: usize, q: df.Req) void {
     const out = q.out.?;
@@ -104,11 +114,12 @@ pub fn select(dr: *const df.Drafter, i: usize, M: usize, q: df.Req) void {
         for (&pg, P, g) |*o, p, x| o.* = bf(p) * x;
         var best: usize = 0;
         var sc: [TOPK]f32 = undefined;
+        const edge = edgeWeight();
         for (0..n) |m| {
             const Sc = dr.succ[@as(usize, c[m].id) * RANK ..][0..RANK];
             var dot: f32 = 0;
             for (pg, Sc) |a, b| dot += a * bf(b);
-            sc[m] = c[m].v + dot;
+            sc[m] = c[m].v + edge * dot;
             if (sc[m] > sc[best]) best = m;
         }
         var z: f64 = 0;
