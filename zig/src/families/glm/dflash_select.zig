@@ -7,6 +7,17 @@ const TOPK = df.TOPK;
 
 const Cand = struct { v: f32, id: u32 };
 
+/// TF_GLM_DFLASH2_TCONF: the temperature of the chances' softmax only (the pick stays argmax(value + edge); the
+/// reference engine's served confidence is this softmax at 2). Drafts only propose: a reply's tokens are the same
+/// at any value, so this is exact.
+var conf_temp: ?f32 = null;
+fn confTemp() f32 {
+    if (conf_temp) |t| return t;
+    const t: f32 = if (std.c.getenv("TF_GLM_DFLASH2_TCONF")) |v| (std.fmt.parseFloat(f32, std.mem.span(v)) catch 1.0) else 1.0;
+    conf_temp = if (std.math.isFinite(t) and t >= 0.25 and t <= 8) t else 1.0;
+    return conf_temp.?;
+}
+
 /// A sampled stream's draw (TF_GLM_DFLASH2_COUPLED=1): the seed, 1 / T and top_p its target rows race with. Each draft is
 /// then the candidates' race under the noise the target's row will draw at that position (sample.cu's keyed uniform),
 /// so a drafter close to the target picks the token the target will draw, not only its likeliest one.
@@ -122,11 +133,12 @@ pub fn select(dr: *const df.Drafter, i: usize, M: usize, q: df.Req) void {
             sc[m] = c[m].v + edge * dot;
             if (sc[m] > sc[best]) best = m;
         }
+        const tc: f64 = confTemp();
         var z: f64 = 0;
-        for (sc[0..n]) |x| z += @exp(@as(f64, x - sc[best]) / dr.temp);
+        for (sc[0..n]) |x| z += @exp(@as(f64, x - sc[best]) / dr.temp / tc);
         const pick = if (q.keyed) |k| race(sc[0..n], c[0..n], k, @intCast(q.pos + @as(i64, @intCast(t)))) else best;
         out[t - 1] = c[pick].id;
-        if (q.probs) |p| p[t - 1] = @exp(@as(f64, sc[pick] - sc[best]) / dr.temp) / z;
+        if (q.probs) |p| p[t - 1] = @exp(@as(f64, sc[pick] - sc[best]) / dr.temp / tc) / z;
         prev = c[pick].id;
     }
 }
