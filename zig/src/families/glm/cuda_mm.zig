@@ -89,6 +89,20 @@ pub const Kernels = struct {
     two: ?[4][3]cuda.Function = null, // glm_mm{16,4,6,8}_{16,32,64}t: two decode problems a launch, each its own K slices
     reduce_two: ?cuda.Function = null, // glm_mm_reduce_two: both problems' slices, glm_mm_reduce's sums
     two_on: bool = true, // TF_GLM_MM_TWO=0: the two problems take their own launches (the same bits either way)
+    decode: ?[stage_variants.len]Decode = null, // the 16- and 32-row kernels at each pipeline depth (TF_GLM_MM_STAGES); null (a table built without load): the 3-stage kernels
+    si: usize = default_stage_index, // the index into stage_variants the decode launches take
+
+    /// Decode windows' kernels at one pipeline depth: by width (16, 4, 6, 8 bits) and rows a block (16, 32).
+    pub const Decode = struct {
+        rows: [4][2]cuda.Function, // glm_mm{B}_{16,32}[s{S}]
+        pair: [4]cuda.Function, // glm_mm{B}_16x2[s{S}]
+        two: [4][2]cuda.Function, // glm_mm{B}_{16,32}t[s{S}]
+    };
+
+    /// The stage count the decode launches run at (TF_GLM_MM_STAGES: 3, 5, 6 or 8; 6 unless set).
+    pub fn stages(k: *const Kernels) usize {
+        return stage_variants[k.si];
+    }
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = .{ .by_rows = undefined, .packed_rows = undefined, .packed_prompt = undefined, .pair = undefined, .tile_packed = undefined, .prompt = try m.function("glm_mm16_rows"), .reduce = try m.function("glm_mm_reduce"), .tile = try m.function("glm_mm_tile16"), .pdl = true, .q8 = try m.function("glm_q8_rows"), .mm8a8 = .{
@@ -120,6 +134,22 @@ pub const Kernels = struct {
         }
         k.two = two;
         k.reduce_two = try m.function("glm_mm_reduce_two");
+        k.si = stageIndex(if (std.c.getenv("TF_GLM_MM_STAGES")) |v| std.mem.span(v) else null);
+        var decode: [stage_variants.len]Decode = undefined;
+        inline for (stage_variants, 0..) |st, vi| {
+            inline for (widths, 0..) |b, wi| {
+                inline for (.{ 16, 32 }, 0..) |bm, i| {
+                    decode[vi].rows[wi][i] = try m.function(decodeName(b, bm, "", st));
+                    try decode[vi].rows[wi][i].allowDynamicShared(sharedBytesStages(b, bm, st));
+                    decode[vi].two[wi][i] = try m.function(decodeName(b, bm, "t", st));
+                    try decode[vi].two[wi][i].allowDynamicShared(sharedBytesStages(b, bm, st));
+                }
+                decode[vi].pair[wi] = try m.function(decodeName(b, 16, "x2", st));
+                try decode[vi].pair[wi].allowDynamicShared(sharedBytesStages(b, 16, st));
+            }
+        }
+        k.decode = decode;
+        std.log.info("glm_mm decode windows: {d} pipeline stages (TF_GLM_MM_STAGES)", .{k.stages()});
         try k.prompt.allowDynamicShared(smem(128));
         if (std.c.getenv("TF_GLM_PDL")) |v| k.pdl = !std.mem.eql(u8, std.mem.span(v), "0");
         k.chain = Chain.read();
@@ -207,6 +237,40 @@ pub fn sharedBytesStages(bits: u8, bm: usize, stages: usize) u32 {
     return @intCast(stages * (bm * 128 + 8 * 32 * wpc * 4 + 128));
 }
 
+/// The decode windows' pipeline depths glm_mm.cu instantiates (TF_GLM_MM_STAGES); 3 is the kernels before them.
+pub const stage_variants = [_]usize{ 3, 5, 6, 8 };
+
+/// glm_mm{b}_{bm}{kind} at 3 stages, glm_mm{b}_{bm}{kind}s{stages} past it (glm_mm.cu's GLM_MM_DECODE_STAGES).
+fn decodeName(comptime b: u8, comptime bm: usize, comptime kind: []const u8, comptime stages: usize) [:0]const u8 {
+    return if (stages == 3) std.fmt.comptimePrint("glm_mm{d}_{d}{s}", .{ b, bm, kind }) else std.fmt.comptimePrint("glm_mm{d}_{d}{s}s{d}", .{ b, bm, kind, stages });
+}
+
+test "decode kernel names: the three-stage kernels keep their names, deeper ones add s<stages>" {
+    try std.testing.expectEqualStrings("glm_mm8_16", decodeName(8, 16, "", 3));
+    try std.testing.expectEqualStrings("glm_mm8_16s6", decodeName(8, 16, "", 6));
+    try std.testing.expectEqualStrings("glm_mm4_32ts8", decodeName(4, 32, "t", 8));
+    try std.testing.expectEqualStrings("glm_mm16_16x2s5", decodeName(16, 16, "x2", 5));
+}
+pub const default_stage_index = 2; // 6 stages
+
+/// TF_GLM_MM_STAGES: "3", "5", "6" or "8" picks that depth; unset, empty or anything else is the default (logged).
+pub fn stageIndex(v: ?[]const u8) usize {
+    const t = v orelse return default_stage_index;
+    for (stage_variants, 0..) |st, i| if (t.len == 1 and t[0] == '0' + @as(u8, @intCast(st))) return i;
+    if (t.len != 0) std.log.err("TF_GLM_MM_STAGES: 3, 5, 6 or 8 (not '{s}'): {d}", .{ t, stage_variants[default_stage_index] });
+    return default_stage_index;
+}
+
+test "TF_GLM_MM_STAGES: 3, 5, 6, 8 by index; unset, empty or anything else the default" {
+    try std.testing.expectEqual(@as(usize, 0), stageIndex("3"));
+    try std.testing.expectEqual(@as(usize, 1), stageIndex("5"));
+    try std.testing.expectEqual(@as(usize, 2), stageIndex("6"));
+    try std.testing.expectEqual(@as(usize, 3), stageIndex("8"));
+    try std.testing.expectEqual(default_stage_index, stageIndex(null));
+    try std.testing.expectEqual(default_stage_index, stageIndex(""));
+    try std.testing.expectEqual(default_stage_index, stageIndex("4"));
+}
+
 /// K slices fixed by the shape: column tiles times slices reach the target, each slice at least 4 groups of 64.
 pub fn splitK(n: usize, k: usize) usize {
     const tiles = (n + 63) / 64;
@@ -258,8 +322,11 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
         } else if (big) { // packed prompts: the 128-row blocks in two stages, two an SM (the 3-stage kernel's sums)
             try cuda.launch.launch(k.packed_prompt[wi - 1], .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = 256 }, .shared = sharedBytesStages(w.bits, bm, 2), .pdl = k.pdl }, s, &a);
         } else {
-            const f = if (wi == 0) k.by_rows[i] else k.packed_rows[wi - 1][i];
-            try cuda.launch.launch(f, .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = if (bm <= 32) 128 else 256 }, .shared = sharedBytes(w.bits, bm), .pdl = k.pdl }, s, &a);
+            // 16- and 32-row blocks: the decode kernels at the chosen pipeline depth (the same sums as the 3-stage ones)
+            const dec: ?*const Kernels.Decode = if (i <= 1) (if (k.decode) |*tbl| &tbl[k.si] else null) else null;
+            const f = if (dec) |tbl| tbl.rows[wi][i] else if (wi == 0) k.by_rows[i] else k.packed_rows[wi - 1][i];
+            const shared = if (dec != null) sharedBytesStages(w.bits, bm, k.stages()) else sharedBytes(w.bits, bm);
+            try cuda.launch.launch(f, .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = if (bm <= 32) 128 else 256 }, .shared = shared, .pdl = k.pdl }, s, &a);
         }
         if (sk > 1) {
             const total = rows * w.n;
@@ -298,7 +365,10 @@ pub fn matmulPair(k: *const Kernels, s: cuda.Stream, x0: u64, x1: u64, ldx: usiz
     a.add(@as(c_int, @intCast(w0.n)));
     a.add(@as(c_int, @intCast(w0.k)));
     const cols: u32 = @intCast((w0.n + 63) / 64);
-    try cuda.launch.launch(k.pair[wi], .{ .grid = .{ .x = cols, .y = 1, .z = 2 }, .block = .{ .x = 128 }, .shared = sharedBytes(w0.bits, 16), .pdl = k.pdl }, s, &a);
+    const dec: ?*const Kernels.Decode = if (k.decode) |*tbl| &tbl[k.si] else null;
+    const f = if (dec) |tbl| tbl.pair[wi] else k.pair[wi];
+    const shared = if (dec != null) sharedBytesStages(w0.bits, 16, k.stages()) else sharedBytes(w0.bits, 16);
+    try cuda.launch.launch(f, .{ .grid = .{ .x = cols, .y = 1, .z = 2 }, .block = .{ .x = 128 }, .shared = shared, .pdl = k.pdl }, s, &a);
     return true;
 }
 
@@ -361,7 +431,10 @@ pub fn matmulTwo(k: *const Kernels, s: cuda.Stream, p: [2]Two, part: u64, part_b
     var a: cuda.Args = .{};
     a.add(t);
     const blocks: u32 = @intCast(t.blocks0 + t.cols[1] * t.sk[1]);
-    try cuda.launch.launch(fs[wi][i], .{ .grid = .{ .x = blocks }, .block = .{ .x = if (bm <= 32) 128 else 256 }, .shared = sharedBytes(p[0].w.bits, bm), .pdl = k.pdl }, s, &a);
+    const dec: ?*const Kernels.Decode = if (i <= 1) (if (k.decode) |*tbl| &tbl[k.si] else null) else null;
+    const f = if (dec) |tbl| tbl.two[wi][i] else fs[wi][i];
+    const shared = if (dec != null) sharedBytesStages(p[0].w.bits, bm, k.stages()) else sharedBytes(p[0].w.bits, bm);
+    try cuda.launch.launch(f, .{ .grid = .{ .x = blocks }, .block = .{ .x = if (bm <= 32) 128 else 256 }, .shared = shared, .pdl = k.pdl }, s, &a);
     if (r.total[0] + r.total[1] == 0) return true;
     r.blocks0 = @intCast(@divTrunc(r.total[0] + 255, 256));
     r.f32 = 0;

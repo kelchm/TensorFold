@@ -405,6 +405,39 @@ GLM_MM_TWO(6)
 GLM_MM_TWO(8)
 GLM_MM_TWO(16)
 
+// Decode windows (16 and 32 rows a block) with a deeper cp.async pipeline (TF_GLM_MM_STAGES=5, 6 or 8; 3 is the kernels
+// above): a block keeps more weight bytes in flight on a GPU whose memory latency is long for its bandwidth (GB10).
+// Each K group's loads, MMAs and FMAs are those of the three-stage kernel in the same order, so every output is the
+// same bits; only how many groups ahead the stages are fetched changes. One instance a (bits, rows, stages).
+template <int B, int BM, int WM, int S>
+__device__ __forceinline__ void mm_two_s(const MmTwo& p) {
+    const int b = (int)blockIdx.x, z = b >= p.blocks0 ? 1 : 0, l = b - (z ? p.blocks0 : 0), c = p.cols[z];
+    mm_kernel<B, BM, WM, S>(p.x[z], p.ldx[z], p.w[z], p.s[z], p.out[z], p.part[z], p.f32, p.M, p.N[z], p.K[z], p.SK[z],
+                            l / c, l % c);
+}
+#define GLM_MM_DECODE_STAGES(B, S)                                                                                      \
+    extern "C" __global__ void __launch_bounds__(128) glm_mm##B##_16s##S(const __nv_bfloat16* __restrict__ x,         \
+        long long ldx, const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out,          \
+        float* __restrict__ part, int f32, int M, int N, int K, int SK) {                                              \
+        mm_kernel<B, 16, 1, S>(x, ldx, w, s, out, part, f32, M, N, K, SK);                                             \
+    }                                                                                                                  \
+    extern "C" __global__ void __launch_bounds__(128) glm_mm##B##_32s##S(const __nv_bfloat16* __restrict__ x,         \
+        long long ldx, const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out,          \
+        float* __restrict__ part, int f32, int M, int N, int K, int SK) {                                              \
+        mm_kernel<B, 32, 1, S>(x, ldx, w, s, out, part, f32, M, N, K, SK);                                             \
+    }                                                                                                                  \
+    extern "C" __global__ void __launch_bounds__(128) glm_mm##B##_16x2s##S(const MmPair p) {                          \
+        const int z = blockIdx.z;                                                                                      \
+        mm_kernel<B, 16, 1, S>(p.x[z], p.ldx, p.w[z], p.s[z], p.out[z], nullptr, p.f32, p.M, p.N, p.K, 1, 0);           \
+    }                                                                                                                  \
+    extern "C" __global__ void __launch_bounds__(128) glm_mm##B##_16ts##S(const MmTwo p) { mm_two_s<B, 16, 1, S>(p); } \
+    extern "C" __global__ void __launch_bounds__(128) glm_mm##B##_32ts##S(const MmTwo p) { mm_two_s<B, 32, 1, S>(p); }
+#define GLM_MM_DECODE_ALL(B) GLM_MM_DECODE_STAGES(B, 5) GLM_MM_DECODE_STAGES(B, 6) GLM_MM_DECODE_STAGES(B, 8)
+GLM_MM_DECODE_ALL(4)
+GLM_MM_DECODE_ALL(6)
+GLM_MM_DECODE_ALL(8)
+GLM_MM_DECODE_ALL(16)
+
 // Both problems' K slices added in slice order, then rounded once: glm_mm_reduce's sums for each (x: problem 0's
 // blocks, then problem 1's; a problem of one slice has none). Dependent launch (TF_GLM_PDL_CHAIN's reduce, as
 // glm_mm_reduce): it may start while the two-problem matmul that writes `part` runs, so every thread waits for that
