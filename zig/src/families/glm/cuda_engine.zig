@@ -90,6 +90,7 @@ pub const Engine = struct {
     profs: [fw.window_rows]?*prof_mod.Prof = @splat(null), // TF_GLM_PROF=1: verify sections' GPU time, by rows
     profiling_prompt: ?*prof_mod.Prof = null,
     prompt_profs: [4]?*prof_mod.Prof = @splat(null), // and prompt chunks': to 64, 256, 1024, 2048 rows
+    shared_profs: [shared_rows]?*prof_mod.Prof = @splat(null), // and shared windows' (several streams in one forward), by total rows
     checkpoint_digest: [32]u8,
     settings: ranks.Settings,
     m: fw.Modules,
@@ -237,6 +238,9 @@ pub const Engine = struct {
         errdefer e.smp.deinit();
         errdefer e.freeProfs();
         if (prof_mod.Prof.wanted()) for (&e.profs) |*p| {
+            p.* = try prof_mod.Prof.init(d, io);
+        };
+        if (prof_mod.Prof.wanted()) for (&e.shared_profs) |*p| {
             p.* = try prof_mod.Prof.init(d, io);
         };
         if (prof_mod.Prof.wanted()) for (&e.prompt_profs) |*p| {
@@ -600,6 +604,7 @@ pub const Engine = struct {
     }
 
     const verifyLabel = @import("cuda_engine_prof.zig").verifyLabel;
+    const sharedLabel = @import("cuda_engine_prof.zig").sharedLabel;
 
     /// Several streams' windows in one forward: shared row ops, per-part attention and KDA.
     pub fn verifyShared(e: *Engine, parts: []const Part) !void {
@@ -617,7 +622,10 @@ pub const Engine = struct {
             rows += p.ids.len;
         }
         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .taps = if (e.drafter) |dr| dr.taps(false) else null, .side = e.side, .moe_fuse = e.moe_fuse };
+        var f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .taps = if (e.drafter) |dr| dr.taps(false) else null, .side = e.side, .moe_fuse = e.moe_fuse };
+        f.prof = e.shared_profs[rows - 1];
+        if (f.prof) |p| try p.begin(e.stream, sharedLabel(rows));
+        defer if (f.prof) |p| p.end();
         try f.run(@ptrCast(ids[0..rows]));
         if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
         // every part greedy (no grammar, no sampled stream; the same on every rank): all rows in one pick, one launch,
