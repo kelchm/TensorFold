@@ -134,18 +134,24 @@ const Owned = struct {
 
 const env = @import("sys").env;
 
-/// Every peer's send/recv connected now, before the weights fill memory (connected on first use, ibv_reg_mr can fail).
-fn warmPeers(d: *const cuda.Driver, g: *const cuda.tp_group.Group) !void {
+/// The send/recv the prompt exchange will use, connected now, before the weights fill memory (connected on first use,
+/// ibv_reg_mr can fail): direct split (TF_GLM_PREFILL_REDUCE=split) reaches every peer; ring sends to the next rank
+/// and takes from the previous, as cuda_relay does; gather posts no point-to-point exchange at all, so on a fabric where
+/// some ranks reach only their neighbours (a ring of four without a switch) nothing is connected across it.
+fn warmPeers(d: *const cuda.Driver, g: *const cuda.tp_group.Group, set: ranks.Settings) !void {
+    if (!set.split) return; // gather: all-gathers only, which NCCL's rings connect at the first collective
     const bytes = 4 << 20; // a prompt piece's exchange: every channel a large send/recv takes
     var buf = try cuda.DeviceBuffer.alloc(d, 2 * bytes * g.world);
     defer buf.free();
     var s = try cuda.Stream.init(d, false);
     defer s.deinit();
+    const next = (g.rank + 1) % g.world;
+    const prev = (g.rank + g.world - 1) % g.world;
     try g.lib.check(g.lib.api.ncclGroupStart(), "ncclGroupStart");
     const posted: anyerror!void = post: {
         for (0..g.world) |peer| if (peer != g.rank) {
-            g.send(s, buf.ptr + peer * bytes, bytes, peer) catch |err| break :post err;
-            g.recv(s, buf.ptr + (g.world + peer) * bytes, bytes, peer) catch |err| break :post err;
+            if (!set.ring or peer == next) g.send(s, buf.ptr + peer * bytes, bytes, peer) catch |err| break :post err;
+            if (!set.ring or peer == prev) g.recv(s, buf.ptr + (g.world + peer) * bytes, bytes, peer) catch |err| break :post err;
         };
         break :post {};
     };
@@ -222,7 +228,7 @@ fn openRank(a: StartArgs, set: ranks.Settings) !Loaded {
     try lib.check(lib.api.ncclCommInitRank(&comm, @intCast(p.world), id, @intCast(p.rank)), "ncclCommInitRank");
     own.group = .{ .lib = lib, .comm = comm, .rank = p.rank, .world = p.world };
     errdefer _ = own.group.lib.api.ncclCommDestroy(own.group.comm);
-    if (p.world > 1) try warmPeers(ctx.d, &own.group);
+    if (p.world > 1) try warmPeers(ctx.d, &own.group, set);
     cuda.p2p_report.afterInit(&diag, .{ .lib = &own.group.lib, .comm = comm, .d = ctx.d, .later = true });
     const cap = capacity(o.context);
     own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.group.lib, own.group.comm, p.rank, p.world, .{ .capacity = cap, .drafts = o.drafts, .settings = set, .vision = o.vision, .drafter = o.drafter != null });
