@@ -405,6 +405,7 @@ fn nameLike(s: []const u8) bool {
 pub const TextFilter = struct {
     pending: std.ArrayList(u8) = .empty,
     hidden: ?[]const u8 = null,
+    hid: bool = false, // an envelope was hidden (TF_TOOL_CALL_GUARD logs it)
 
     pub fn feed(f: *TextFilter, a: Allocator, text: []const u8) Allocator.Error![]const u8 {
         try f.pending.appendSlice(a, text);
@@ -447,6 +448,7 @@ pub const TextFilter = struct {
             const name = rest[1..end];
             if (callTag(name)) {
                 f.hidden = try std.ascii.allocLowerString(a, name);
+                f.hid = true;
             } else try out.appendSlice(a, rest[0 .. end + 1]);
             try f.reset(a, rest[end + 1 ..]);
         }
@@ -473,10 +475,17 @@ fn callTag(name: []const u8) bool {
     return nameLike(name[0..colon]) and std.ascii.eqlIgnoreCase(name[colon + 1 ..], "tool_call");
 }
 
-/// ``parallel_tool_calls: false`` keeps one call and hides call markup from streamed prose.
+/// ``parallel_tool_calls: false`` keeps one call and hides call markup from streamed prose; ``guard``
+/// (TF_TOOL_CALL_GUARD, tool_guard.zig) hides it from a reply to a request that offers no tools.
 pub const Policy = struct {
     single: bool = false,
+    guard: bool = false,
+    drop_rejected: bool = false, // TF_TOOL_CALL_GUARD with tools offered: unoffered or malformed envelopes leave the reply
     filter: TextFilter = .{},
+
+    pub fn filtering(p: *const Policy) bool {
+        return p.single or p.guard;
+    }
 
     pub fn maxCalls(p: *const Policy) ?usize {
         return if (p.single) 1 else null;
@@ -484,15 +493,15 @@ pub const Policy = struct {
 
     /// Filters a str delta's text (dict deltas lose tool_calls and filter content), or passes it through.
     pub fn text(p: *Policy, a: Allocator, s: []const u8) Allocator.Error![]const u8 {
-        return if (p.single) p.filter.feed(a, s) else s;
+        return if (p.filtering()) p.filter.feed(a, s) else s;
     }
 
     pub fn flush(p: *Policy) []const u8 {
-        return if (p.single) p.filter.finish() else "";
+        return if (p.filtering()) p.filter.finish() else "";
     }
 
     pub fn content(p: *const Policy, a: Allocator, s: []const u8) Allocator.Error![]const u8 {
-        if (!p.single) return s;
+        if (!p.filtering()) return s;
         var f: TextFilter = .{};
         const head = try f.feed(a, s);
         return std.mem.concat(a, u8, &.{ head, f.finish() });
@@ -521,6 +530,13 @@ pub const Policy = struct {
     }
 };
 
+/// ``s`` without its call envelopes (whole ones, and an unclosed one to the end).
+pub fn hideCalls(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
+    var f: TextFilter = .{};
+    const head = try f.feed(a, s);
+    return std.mem.concat(a, u8, &.{ head, f.finish() });
+}
+
 /// The first whole envelope from ``from`` (``<((?:NAME:)?tool_call)>.*?</\1>``, any case).
 fn wholeEnvelope(a: Allocator, s: []const u8, from: usize) Allocator.Error!?struct { start: usize, end: usize } {
     var at = from;
@@ -536,4 +552,5 @@ fn wholeEnvelope(a: Allocator, s: []const u8, from: usize) Allocator.Error!?stru
 
 test {
     _ = @import("tool_stream_test.zig");
+    _ = @import("tool_guard.zig");
 }

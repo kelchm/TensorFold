@@ -10,6 +10,7 @@ const messages = @import("messages.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_parse = @import("tool_parse.zig");
 const tool_stream = @import("tool_stream.zig");
+const tool_guard = @import("tool_guard.zig");
 const ids = @import("ids.zig");
 const log = @import("log.zig");
 const request_log = @import("request_log.zig");
@@ -176,6 +177,11 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
         if (p != .bool) return cx.refuse("parallel_tool_calls must be a boolean");
         policy.single = !p.bool;
     }
+    // TF_TOOL_CALL_GUARD: no tools offered, but the history called them
+    if (is_chat and input.tools.len == 0 and tool_guard.on() and tool_guard.usedTools(input.messages)) {
+        input.messages = try tool_guard.withNote(cx.a, input.messages);
+        policy.guard = true;
+    } else if (is_chat and input.tools.len > 0 and tool_guard.on()) policy.drop_rejected = true;
     const options = body.get("stream_options");
     return .{
         .input = input,
@@ -332,19 +338,30 @@ const Run = struct {
     fn attachCalls(r: *Run, reply: *chat.Reply) Allocator.Error!?[]Value {
         if (reply.response_channel == .structured_json) return null;
         const tools = r.plan.input.tools;
-        if (tools.len == 0) return null;
+        if (tools.len == 0) {
+            if (r.plan.policy.guard) {
+                const shown = try r.plan.policy.content(r.a, reply.content);
+                if (shown.len != reply.content.len) log.line("tool-call guard: hid call markup from {s}, a reply to a request without tools", .{r.id});
+                reply.content = shown;
+            }
+            return null;
+        }
         const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
         if (parsed.rejected_envelopes > 0) log.line("warning: kept {d} malformed or unoffered tool envelopes as content", .{parsed.rejected_envelopes});
         // max_tokens cut a call the stream had begun: the whole reply returns it cut too, as the stream did (#1238)
         const cut = if (!r.plan.policy.single and std.mem.eql(u8, reply.finish_reason, "length")) try tool_stream.cutCalls(r.a, reply.content, tools) else null;
         if (cut != null) reply.content = try @import("reply_text.zig").cutProse(r.a, reply.content);
         const found = cut orelse parsed.calls;
+        // TF_TOOL_CALL_GUARD: the envelopes the parser kept as text (unoffered tools, malformed calls) leave the reply
+        const dropped = r.plan.policy.drop_rejected and parsed.rejected_envelopes > 0;
+        const base = if (dropped) try tool_stream.hideCalls(r.a, parsed.content) else parsed.content;
+        if (dropped) log.line("tool-call guard: hid {d} unoffered or malformed tool envelopes from {s}", .{ parsed.rejected_envelopes, r.id });
         const calls = (if (r.turn != null) cortheon.clientCalls(found) else found) orelse {
-            if (r.plan.policy.single or parsed.calls != null) reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
+            if (r.plan.policy.single or parsed.calls != null or dropped) reply.content = try r.plan.policy.parsedContent(r.a, base);
             return null;
         };
         if (cut != null) return calls;
-        reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
+        reply.content = try r.plan.policy.parsedContent(r.a, base);
         reply.finish_reason = "tool_calls";
         if (r.plan.policy.single) reply.tool_calls_streamed = false;
         return if (r.plan.policy.single and calls.len > 1) calls[0..1] else calls;
@@ -463,6 +480,10 @@ const Run = struct {
             if (!s.tools) {
                 // completions stream text only, with its logprob rows when asked
                 if (!r.is_chat and delta != .string and (delta != .object or delta.object.get("content") == null)) return;
+                if (r.plan.policy.guard) {
+                    const d = (r.policyDelta(delta) catch return error.Closed) orelse return;
+                    return r.emit(r.chunk(d, null) catch return error.Closed);
+                }
                 return r.emit(r.chunk(delta, null) catch return error.Closed);
             }
             const filtered = r.policyDelta(delta) catch return error.Closed;
@@ -475,7 +496,7 @@ const Run = struct {
 
     /// The one-call policy on a streamed delta: text filtered, tool_calls dropped; null when nothing is left.
     fn policyDelta(r: *Run, delta: Value) Allocator.Error!?Value {
-        if (!r.plan.policy.single) return if (delta.truthy()) delta else null;
+        if (!r.plan.policy.filtering()) return if (delta.truthy()) delta else null;
         if (delta == .string) {
             const t = try r.plan.policy.text(r.a, delta.string);
             return if (t.len > 0) Value{ .string = t } else null;
@@ -578,6 +599,10 @@ const Run = struct {
             } else if (r.plan.policy.kept(reply.content, r.prose_sent.items)) |rest| {
                 r.emit(r.chunk(.{ .string = rest }, null) catch return) catch return;
             }
+        } else if (r.plan.policy.guard) {
+            const tail = r.plan.policy.flush();
+            if (tail.len > 0) r.emit(r.chunk(.{ .string = tail }, null) catch return) catch return;
+            if (r.plan.policy.filter.hid) log.line("tool-call guard: hid call markup from {s}, a streamed reply to a request without tools", .{r.id});
         }
         const last = r.chunk(.{ .string = "" }, if (reply.finish_reason.len > 0) reply.finish_reason else "length") catch return;
         if (compaction) |s| compact.stamp(&cx, &reply, s) catch return;
