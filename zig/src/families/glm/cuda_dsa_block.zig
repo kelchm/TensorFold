@@ -44,6 +44,17 @@ pub const Caches = struct {
     pk_rows: usize,
     pt: u64 = 0, // on pages: the stream's table (i32 page ids), lc and pk then this cache's place in page 0; 0: rows
     ps: u64 = 0, // on pages: bytes from one page to the next
+    lpt: u64 = 0, // sharded (TF_GLM_KV_SHARD): the latent rows' own table and stride (lc, ls); 0: pt and ps
+    lps: u64 = 0,
+
+    /// The latent rows' table and page stride: pt and ps, or sharded the latent pages' own.
+    pub fn latPt(c: Caches) u64 {
+        return if (c.lpt != 0) c.lpt else c.pt;
+    }
+
+    pub fn latPs(c: Caches) u64 {
+        return if (c.lpt != 0) c.lps else c.ps;
+    }
 };
 
 /// The block's scratch for up to `rows` rows.
@@ -144,7 +155,38 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
         try sparse.selectTokensProfile(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, t, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts, k.split, k.prof);
         const stamp = prof.span(k.prof, stream, .mla);
         defer stamp.end();
-        try latent.sparseAttentionFormat(set, stream, v.qa, c.lc, c.ls, t, v.tokens, v.counts, sparse.width, v.partials, v.ol, rows, l.heads, l.lw, scale);
+        try latent.sparseAttentionFormat(set, stream, v.qa, c.lc, c.ls, latTable(l, c), v.tokens, v.counts, sparse.width, v.partials, v.ol, rows, l.heads, l.lw, scale);
+    }
+}
+
+/// attend without its attention, for a rank that holds none of the stream's latent rows (TF_GLM_KV_SHARD): the rows'
+/// latents written (into this rank's trash page), their index keys and gates, and the token lists (every rank picks,
+/// and a split selection all-gathers); the holder attends for both ranks' heads.
+pub fn attendNoLatent(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, r0: usize, rows: usize, pos: u64, host_pos: usize) !Scratch {
+    const ix = l.index;
+    const v = try attendWrite(k, stream, l, c, s, r0, rows, pos);
+    if (sparseRows(l, host_pos, rows)) try sparse.selectTokensProfile(k.set, k.ops, stream, v.qi, v.ikr + ix.d * 2, ix.d + ix.heads, c.pk, table(l, c), pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts, k.split, k.prof);
+    return v;
+}
+
+/// attend's attention alone, for `rows` rows whose latents, keys and token lists are in place: the queries at `qa`, the
+/// outputs into `ol` ([rows][heads][lw] bf16), the lists at `tokens` and `counts` (sparse rows), the scratch's partials
+/// and position slot; the same launches `attend` makes for those rows. Owner-computed attention (cuda_kv_shard_attn)
+/// runs it for the other rank's heads, with that rank's queries.
+pub fn attendOnly(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize, qa: u64, ol: u64, tokens: u64, counts: u64) !void {
+    var v = s;
+    v.qa = qa;
+    v.ol = ol;
+    const scale = attnScale(l);
+    if (host_pos < l.dense_limit) {
+        const stamp = prof.span(k.prof, stream, .mla);
+        try denseAttention(k, stream, l, c, v, pos, rows, nch, part_rows, scale);
+        stamp.end();
+    }
+    if (sparseRows(l, host_pos, rows)) {
+        const stamp = prof.span(k.prof, stream, .mla);
+        defer stamp.end();
+        try latent.sparseAttentionFormat(k.set, stream, qa, c.lc, c.ls, latTable(l, c), tokens, counts, sparse.width, v.partials, ol, rows, l.heads, l.lw, scale);
     }
 }
 
@@ -152,6 +194,11 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
 /// table); BF16's are page rows.
 fn table(l: Layer, c: Caches) latent.Table {
     return .{ .pt = c.pt, .ps = c.ps, .page_rows = c.ps / (l.lw * 2), .logical = c.ls != 0 };
+}
+
+/// The latent rows' table (`table` but through Caches.latPt/latPs: the same unsharded).
+fn latTable(l: Layer, c: Caches) latent.Table {
+    return .{ .pt = c.latPt(), .ps = c.latPs(), .page_rows = c.latPs() / (l.lw * 2), .logical = c.ls != 0 };
 }
 
 fn attnScale(l: Layer) f32 {
@@ -179,10 +226,10 @@ pub fn attendWrite(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scra
     const ix = l.index;
     const kw_rows = ix.d + ix.heads;
     const v = attendScratch(l, s, r0);
-    if (c.ps % (l.lw * 2) != 0) return error.LatentShape; // pages whole latent rows apart (the token lists' unit)
+    if (c.ps % (l.lw * 2) != 0 or c.latPs() % (l.lw * 2) != 0) return error.LatentShape; // pages whole latent rows apart (the token lists' unit)
     const t = table(l, c);
     var stamp = prof.span(k.prof, stream, .cache_write);
-    try latent.latentWriteFormat(set, stream, v.lat, l.lw, c.lc, c.ls, t, pos, rows, l.lw);
+    try latent.latentWriteFormat(set, stream, v.lat, l.lw, c.lc, c.ls, latTable(l, c), pos, rows, l.lw);
     stamp.end();
     stamp = prof.span(k.prof, stream, .index_update);
     try sparse.indexUpdate(set, stream, v.ikr, kw_rows, v.igr, ix.ln_w, ix.ln_b, ix.ape, c.ik, c.ig, c.pk, t, pos, rows);
@@ -218,6 +265,14 @@ pub fn writeSeg(l: Layer, c: Caches, v: Scratch, pos: u64, rows: usize, row0: us
     return .{ .lat = v.lat, .cache = c.lc, .scales = c.ls, .kr = v.ikr, .gr = v.igr, .ik = c.ik, .ig = c.ig, .pk = c.pk, .pos = pos, .pt = c.pt, .rows = @intCast(rows), .row0 = @intCast(row0), .b0 = @intCast(b0) };
 }
 
+/// The latent write's entry of a segment: `writeSeg`'s with the latent rows' table (the same unsharded).
+pub fn writeSegLatent(l: Layer, c: Caches, v: Scratch, pos: u64, rows: usize, row0: usize, b0: usize) !WriteSeg {
+    var g = try writeSeg(l, c, v, pos, rows, row0, b0);
+    if (c.latPs() % (l.lw * 2) != 0) return error.LatentShape;
+    g.pt = c.latPt();
+    return g;
+}
+
 /// The pool blocks indexUpdate launches for `rows` rows (tf_glm_pool_keys' grid).
 pub fn poolBlocks(rows: usize) usize {
     return rows / 4 + 2;
@@ -227,13 +282,19 @@ pub fn poolBlocks(rows: usize) usize {
 /// tf_glm_index_write_segs, tf_glm_pool_keys_segs): each block is the block its segment's own attendWrite launch
 /// runs, so the same bytes; `rows` the window's, `blocks` every segment's pool blocks, `ps` the pages' stride.
 pub fn writeSegs(k: Kernels, stream: cuda.Stream, l: Layer, t: *const WriteSegs, rows: usize, blocks: usize, ps: u64) !void {
+    return writeSegsLatent(k, stream, l, t, t, rows, blocks, ps, ps);
+}
+
+/// `writeSegs` with the latent writes through their own table (`lt`, entries from writeSegLatent) and stride `lps`:
+/// sharded the latent pages are not the key pages; unsharded `lt` is `t` and `lps` is `ps`, the same launches.
+pub fn writeSegsLatent(k: Kernels, stream: cuda.Stream, l: Layer, lt: *const WriteSegs, t: *const WriteSegs, rows: usize, blocks: usize, lps: u64, ps: u64) !void {
     const set = k.set;
     const ix = l.index;
     var stamp = prof.span(k.prof, stream, .cache_write);
     var a: cuda.Args = .{};
     a.add(@as(i64, @intCast(l.lw)));
-    a.add(@as(i64, @intCast(ps)));
-    a.add(t.*);
+    a.add(@as(i64, @intCast(lps)));
+    a.add(lt.*);
     try cuda.launch.launch(set.glue.lat_write_fp8_paged_segs, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 512 } }, stream, &a);
     stamp.end();
     stamp = prof.span(k.prof, stream, .index_update);
@@ -288,6 +349,6 @@ fn denseAttention(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scrat
             at = s.at;
         }
         const off = r0 * l.heads * l.lw * 2;
-        try latent.attentionFormat(k.set, stream, s.qa + off, c.lc, c.ls, .{ .pt = c.pt, .ps = c.ps }, at, s.partials, s.ol + off, s.dummy, n, l.heads, l.lw, nch, scale, hb);
+        try latent.attentionFormat(k.set, stream, s.qa + off, c.lc, c.ls, .{ .pt = c.latPt(), .ps = c.latPs() }, at, s.partials, s.ol + off, s.dummy, n, l.heads, l.lw, nch, scale, hb);
     }
 }

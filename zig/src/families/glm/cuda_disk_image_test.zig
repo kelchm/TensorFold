@@ -198,7 +198,7 @@ fn roundTrip(dev_bytes: u64, host_bytes: u64) !void {
     // a blank state as a disk read takes it (room for the head's whole window), filled from the image
     var blank = try pool.take(@intCast(image.leaseBytes(sh, at, sh.headRows(at))));
     defer pool.give(&blank);
-    var back: [6]u64 = undefined;
+    var back: [image.Words.count]u64 = undefined;
     const in: image.Copy = .{ .d = &d, .pool = &pool, .lease = &blank, .segs = segs.items, .words = &back };
     try in.run(0, img, false);
     const w = try image.Words.decode(back, at);
@@ -238,7 +238,7 @@ test "GLM disk image: the store's image is rank 0's then each other rank's prefi
     const cuts = [_]u64{ 0, 40, image.Words.bytes + sh.prefix - 8, image.imageBytes(sh, at) + 100, total }; // ranges across the seams
     for (cuts[0 .. cuts.len - 1], cuts[1..]) |lo, hi| {
         pieces.clearRetainingCapacity();
-        try image.route(sh, &prefixes, at, lo, hi - lo, &pieces, a);
+        try image.route(sh, &prefixes, at, lo, hi - lo, null, &pieces, a);
         var n: u64 = 0;
         for (pieces.items) |p| {
             n += p.len;
@@ -253,7 +253,7 @@ test "GLM disk image: the store's image is rank 0's then each other rank's prefi
     try expectEqual(prefixes[1], seen[1]);
     try expectEqual(prefixes[2], seen[2]);
     try expectEqual(image.imageBytes(sh, at) - image.Words.bytes - sh.prefix, shared);
-    try expectError(error.SnapshotShape, image.route(sh, &prefixes, at, total - 4, 8, &pieces, a));
+    try expectError(error.SnapshotShape, image.route(sh, &prefixes, at, total - 4, 8, null, &pieces, a));
 }
 
 /// The fields of an engine the kept-state functions read, over a host-memory driver.
@@ -269,7 +269,13 @@ const Fake = struct {
     snap_pages: ?pages.Pool = null,
     drafter: ?*@import("dflash.zig").Drafter = null, // 0015: beside DFlash2 a kept state holds no head rows
     slot: u32 = 0,
-    share: struct { rank: u32 = 0 } = .{},
+    share: struct { rank: usize = 0, world: usize = 1 } = .{},
+    settings: @import("cuda_ranks.zig").Settings = .{}, // TF_GLM_KV_SHARD off: no state has a home part
+    // ...so a restore never carries: its staging, counters and link are never read
+    kv_stage: ?cuda.DeviceBuffer = null,
+    kv_ctx: @import("cuda_kv_shard_attn.zig").Ctx = undefined,
+    lib: *const cuda.nccl.Library = undefined,
+    comm: cuda.nccl.Comm = null,
 };
 
 test "GLM disk image: a disk read's blank state is refused until sealed, and its seal checks the words" {
@@ -285,12 +291,12 @@ test "GLM disk image: a disk read's blank state is refused until sealed, and its
     try e.snaps.ensureTotalCapacity(a, 8);
     defer e.snaps.deinit(a);
     const at: u32 = 2048;
-    try snaps.blankAs(&e, 7, at);
+    try snaps.blankAs(&e, 7, at, null);
     defer {
         var s = e.snaps.get(7).?;
         snaps.free(&e, &s);
     }
-    try expectError(error.StateKept, snaps.blankAs(&e, 7, at));
+    try expectError(error.StateKept, snaps.blankAs(&e, 7, at, null));
     try expectError(error.UnsealedState, snaps.restore(&e, 7));
     try expectError(error.DiskWords, snaps.seal(&e, 7, at + @import("cuda_state.zig").window_rows + 1, .{ 0, 0 }, 0)); // a head past its verify window
     try expectError(error.DiskWords, snaps.seal(&e, 7, at, .{ 0, 0 }, @as(u64, 1) << @intCast(e.cur.st.cur.len))); // a copy bit no layer has
@@ -306,7 +312,7 @@ test "GLM disk image: a disk read's blank state is refused until sealed, and its
     try expectError(error.StateKept, snaps.seal(&e, 7, at, .{ 0, 0 }, 0));
     const far: u32 = capacity - 1024; // a state past the rings' rows
     const back: u32 = far - @as(u32, @intCast(e.cur.st.ring_rows)); // the least base whose ring still holds its rows
-    try snaps.blankAs(&e, 8, far);
+    try snaps.blankAs(&e, 8, far, null);
     defer {
         var held = e.snaps.get(8).?;
         snaps.free(&e, &held);
@@ -314,7 +320,7 @@ test "GLM disk image: a disk read's blank state is refused until sealed, and its
     try expectError(error.DiskWords, snaps.seal(&e, 8, far, .{ back - 1, back }, 0)); // a main ring too far back
     try expectError(error.DiskWords, snaps.seal(&e, 8, far, .{ back, back - 1 }, 0)); // a head ring too far back
     try snaps.seal(&e, 8, far, .{ back, back }, 0);
-    try snaps.blankAs(&e, 9, far);
+    try snaps.blankAs(&e, 9, far, null);
     defer {
         var held = e.snaps.get(9).?;
         snaps.free(&e, &held);

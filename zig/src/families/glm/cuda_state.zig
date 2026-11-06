@@ -54,7 +54,9 @@ fn arena(d: *const cuda.Driver, sizes: []const usize, out: []u64) !Arena {
 pub const page_rows = latent.chunk;
 
 /// Where a paged sequence's caches are: the pool's pages at `kv`, `page_bytes` apart, through a table of `pages`.
-pub const Paged = struct { kv: u64, pages: usize, page_bytes: u64 };
+/// Sharded (TF_GLM_KV_SHARD, `shard`): `kv` holds every page's pooled keys alone, `page_bytes` apart, and the latent
+/// rows are this rank's own pages at `lat`, `lat_page` apart, through a second, latent table (cuda_kv_shard).
+pub const Paged = struct { kv: u64, pages: usize, page_bytes: u64, lat: u64 = 0, lat_page: u64 = 0, shard: bool = false };
 
 /// The DSA (MLA) layers among the loaded ones; the MTP layer's caches come after theirs.
 pub fn mlaLayers(w: *const weights.Weights) usize {
@@ -81,8 +83,19 @@ pub fn pageBytesOf(w: *const weights.Weights, kv8: bool, head: bool) u64 {
 }
 
 /// Cache `j`'s rows on pages: its part of page 0 at `p.kv`, the others through the table. In E4M3 its codes come
-/// first, then the part's scales (`ls`), then the pooled keys.
-fn onPages(x: *dsa_block.Caches, c: anytype, p: Paged, table: u64, j: usize, kv8: bool) void {
+/// first, then the part's scales (`ls`), then the pooled keys. Sharded, the codes and scales are cache `j`'s part of
+/// latent page 0 at `p.lat` (through `ltable`) and the pooled keys its part of key page 0 at `p.kv`.
+fn onPages(x: *dsa_block.Caches, c: anytype, p: Paged, table: u64, ltable: u64, j: usize, kv8: bool) void {
+    if (p.shard) {
+        x.lc = p.lat + j * page_rows * (c.kv_lora + 4);
+        x.ls = x.lc + page_rows * c.kv_lora;
+        x.pk = p.kv + j * (page_rows / sparse.pool * c.i_dim * 2);
+        x.pt = table;
+        x.ps = p.page_bytes;
+        x.lpt = ltable;
+        x.lps = p.lat_page;
+        return;
+    }
     x.lc = p.kv + j * pageCacheBytes(c, kv8);
     if (kv8) x.ls = x.lc + page_rows * c.kv_lora;
     x.pk = if (kv8) x.ls + page_rows * 4 else x.lc + page_rows * c.kv_lora * 2;
@@ -90,9 +103,10 @@ fn onPages(x: *dsa_block.Caches, c: anytype, p: Paged, table: u64, j: usize, kv8
     x.ps = p.page_bytes;
 }
 
-/// A State's fields in order; on pages (a table of `table` entries) no latent or pooled rows, and the table last.
-/// Without the target MTP head (`head` false: DFlash2 or no drafts) its cache's fields take no bytes.
-fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, kv8: bool, table: ?usize, head: bool) ![]usize {
+/// A State's fields in order; on pages (a table of `table` entries) no latent or pooled rows, and the table last
+/// (sharded, `ltable`: the latent table after it). Without the target MTP head (`head` false: DFlash2 or no drafts) its
+/// cache's fields take no bytes.
+fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, kv8: bool, table: ?usize, head: bool, ltable: bool) ![]usize {
     const c = &w.config;
     const s = &w.share;
     const nd = mlaLayers(w);
@@ -113,6 +127,7 @@ fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize
     }
     try sizes.appendSlice(gpa, &.{ 4, c.hidden * 2 }); // MTP position and sequence-owned first-draft row
     if (table) |t| try sizes.append(gpa, t * 4);
+    if (table) |t| if (ltable) try sizes.append(gpa, t * 4);
     return sizes.toOwnedSlice(gpa);
 }
 
@@ -428,6 +443,9 @@ pub const State = struct {
     kv8: bool = false, // E4M3 latent rows (codes and fp32 scales): on pages each part holds both
     head: bool = true, // the target MTP head's cache holds rows (and on pages takes the pages' last part)
     pages: []const u32 = &.{}, // on pages: the page ids its table holds, in row order (none while no stream holds it)
+    ltable: u64 = 0, // sharded (TF_GLM_KV_SHARD): its latent table (i32 this rank's latent pages, `pages` entries)
+    lpages: []const u32 = &.{}, // sharded: the latent pages that table holds (cuda_kv_shard.latentIds)
+    hold: ?@import("cuda_kv_shard.zig").Hold = null, // sharded: which ranks hold its latent rows (null: unsharded)
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize) !State {
         return initFormat(gpa, d, w, capacity, false);
@@ -460,7 +478,12 @@ pub const State = struct {
 
     /// `pagedBytes` with or without the target MTP head's rings (its rows are the pages' part).
     pub fn pagedBytesOf(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, pages: usize, head: bool) !usize {
-        const sizes = try stateSizes(gpa, w, capacity, false, pages, head);
+        return pagedBytesFor(gpa, w, capacity, pages, head, false);
+    }
+
+    /// `pagedBytesOf`, sharded (`shard`: a latent table beside the table) or not.
+    pub fn pagedBytesFor(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, pages: usize, head: bool, shard: bool) !usize {
+        const sizes = try stateSizes(gpa, w, capacity, false, pages, head, shard);
         defer gpa.free(sizes);
         var total: usize = 0;
         for (sizes) |n| total += std.mem.alignForward(usize, n, 256);
@@ -475,7 +498,7 @@ pub const State = struct {
         const n = s.kda.len() * c.kda_dim;
         const kw = 3 * n + 2 * c.kda_dim + s.kda.len();
         const pk_rows = capacity / sparse.pool + 2;
-        const sizes = try stateSizes(gpa, w, capacity, kv8, if (paged) |q| q.pages else null, head);
+        const sizes = try stateSizes(gpa, w, capacity, kv8, if (paged) |q| q.pages else null, head, if (paged) |q| q.shard else false);
         defer gpa.free(sizes);
         const p = try gpa.alloc(u64, sizes.len);
         defer gpa.free(p);
@@ -493,6 +516,7 @@ pub const State = struct {
         var st: State = .{ .ring_rows = ring_rows, .ring_row = c.i_dim * 2, .rings = rings, .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ls = if (kv8) p[8 + 4 * nd] + @intFromBool(head) * capacity * c.kv_lora else 0, .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .prompt_hidden = p[13 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw, .kv8 = kv8, .head = head };
         if (paged) |q| {
             st.table = p[14 + 4 * nd];
+            if (q.shard) st.ltable = p[15 + 4 * nd];
             st.capacity = 0; // no rows until a stream's pages are mapped
             st.place(w, q);
         }
@@ -501,8 +525,8 @@ pub const State = struct {
 
     /// A paged sequence's caches on the pages of `p` (the engine's own, made before its pool, placed when it is made).
     pub fn place(st: *State, w: *const weights.Weights, p: Paged) void {
-        for (st.caches, 0..) |*x, j| onPages(x, &w.config, p, st.table, j, st.kv8);
-        if (st.head) onPages(&st.mtp_caches, &w.config, p, st.table, st.caches.len, st.kv8);
+        for (st.caches, 0..) |*x, j| onPages(x, &w.config, p, st.table, st.ltable, j, st.kv8);
+        if (st.head) onPages(&st.mtp_caches, &w.config, p, st.table, st.ltable, st.caches.len, st.kv8);
     }
 
     pub fn deinit(st: *State) void {

@@ -70,14 +70,18 @@ pub const Loaded = struct {
     vision: ?*images_mod.Images = null, // rank 0's tower for the server's image offer
     layout: ?kv.Layout = null, // every stream's memory as one pool of KV pages (null: a window each, by TF_KV_PAGES)
     engine_paged: bool = false, // with a layout, the engine's own sequence takes pages too: the plan sets a window aside
+    kv_parts: ?lanes.kv_parts.Source = null, // TF_GLM_KV_SHARD: the pool's parts and counters for /health and /metrics
 };
 
 /// The pool behind every stream: the engine's own sequence and `streams` more on `pages` KV pages, on every rank.
 pub fn attach(p: *anyopaque, streams: u32, pages: usize) !void {
     const own: *Owned = @ptrCast(@alignCast(p));
     const l = own.layout orelse return error.NoPages;
+    // TF_GLM_KV_SHARD: rank 0 refuses one stream (a part would stay idle) and a part too short, before the step
+    try @import("cuda_kv_shard.zig").refusePool(own.e.settings.kv_shard, streams + 1, @import("cuda_kv_shard.zig").Geometry.half(pages), own.e.capacity);
     try own.lanes.x.pool(streams + 1, pages, l.pageBytes());
     own.e.pages = try pages_mod.Pages.init(own.gpa, own.e, l, streams + 1, pages, true);
+    if (own.e.kvCtx() != null) own.e.kv_ctx.counts = &own.e.pages.?.shard.?.parts.counts; // rank 0's counters
 }
 
 /// Whether a request's caches fit now (the lane host's admission, on its engine thread).
@@ -342,7 +346,15 @@ fn finishRank(a: OpenArgs) !Loaded {
         .vision = own.e.images,
         .layout = own.layout,
         .engine_paged = set.pages,
+        .kv_parts = if (set.kv_shard.on) .{ .ctx = own, .read = readKvParts } else null,
     };
+}
+
+/// /health and /metrics' KV parts (TF_GLM_KV_SHARD): rank 0's pool, on its engine thread (none before the attach).
+fn readKvParts(ctx: *anyopaque, out: *lanes.kv_parts.Stats) void {
+    const own: *Owned = @ptrCast(@alignCast(ctx));
+    const p = own.e.pages orelse return;
+    pages_mod.Pages.readStats(p, out);
 }
 
 // Each rank keeps a copy under rank 0's id, in the room rank 0 admitted by (the smallest over the ranks).
@@ -460,7 +472,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NotModelOpt, error.UnsupportedQuant => "GLM-5.3-Flash on CUDA reads ModelOpt NVFP4, MIXED_PRECISION and EXL3 mcg checkpoints (the log names what config.json has)",
         error.UnreadableExl3 => "an EXL3 routed expert is not an mcg trellis of 1 to 8 bits with its marker and fp16 scales (the log names the tensor)",
         error.UnreadableFormat => "a projection is stored in a format GLM-5.3-Flash on CUDA does not read (the log names its module, recipe and tensors)",
-        else => null,
+        else => @import("cuda_kv_shard.zig").why(err),
     };
 }
 

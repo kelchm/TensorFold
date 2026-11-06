@@ -1,4 +1,5 @@
-//! GLM-5.3-Flash's CUDA kept states on disk (--learn-conversations): every rank's part in rank 0's files.
+//! GLM-5.3-Flash's CUDA kept states on disk (--learn-conversations): every rank's part in rank 0's files. Under
+//! TF_GLM_KV_SHARD a state's latent rows come from and go to its home rank alone (cuda_disk_ranks).
 const std = @import("std");
 const cuda = @import("cuda");
 const api = @import("engine_api");
@@ -43,24 +44,31 @@ const Rest = struct {
     }
 };
 
+/// Each rank's image of one state, through rank 0's disk steps (cuda_disk_ranks.gatherWith, scatterWith).
+const RankIo = struct {
+    e: *Engine,
+    id: u64,
+
+    pub fn take(io: RankIo, rank: u32, off: u64, out: []u8) !void {
+        return ranks.take(io.e, rank, io.id, off, out);
+    }
+
+    pub fn put(io: RankIo, rank: u32, off: u64, bytes: []const u8) !void {
+        return ranks.put(io.e, rank, io.id, off, bytes);
+    }
+};
+
+/// The home part of rank 0's copy of a kept state (TF_GLM_KV_SHARD; null: unsharded).
+fn homeOf(e: *Engine, id: u64) !?u8 {
+    return ranks.homeOf(e, e.snaps.get(id) orelse return error.NoKeptState);
+}
+
 fn gather(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, out: []u8) anyerror!void {
     const e = engineOf(ptr);
     const k: *Kept = @ptrCast(@alignCast(saved));
     const rest = Rest.of(e);
     defer rest.done();
-    var pieces: std.ArrayList(img.Piece) = .empty;
-    defer pieces.deinit(e.gpa);
-    const sh = try ranks.shape(e);
-    var o: usize = 0;
-    for (ranges) |g| {
-        pieces.clearRetainingCapacity();
-        try img.route(sh, prefixes, k.at, g.off, g.len, &pieces, e.gpa);
-        for (pieces.items) |p| {
-            const n: usize = @intCast(p.len);
-            try ranks.take(e, p.rank, k.id, p.off, out[o..][0..n]);
-            o += n;
-        }
-    }
+    try ranks.gatherWith(RankIo{ .e = e, .id = k.id }, try ranks.shape(e), prefixes, k.at, try homeOf(e, k.id), ranges, out, e.gpa);
 }
 
 /// A new id leased at `at` on every rank, filled by `scatter` and sealed by the words in its last one.
@@ -82,26 +90,12 @@ fn scatter(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.
     defer rest.done();
     if (ranges.len > 0 and ranges[0].off == 0) {
         if (ranges[0].len < img.Words.bytes) return error.DiskWords;
-        var x: [6]u64 = undefined;
+        var x: [img.Words.count]u64 = undefined;
         @memcpy(std.mem.sliceAsBytes(&x), in[0..img.Words.bytes]);
         try ranks.seal(e, k.id, try img.Words.decode(x, k.at));
     }
-    var pieces: std.ArrayList(img.Piece) = .empty;
-    defer pieces.deinit(e.gpa);
-    const sh = try ranks.shape(e);
-    var o: usize = 0;
-    for (ranges) |g| {
-        pieces.clearRetainingCapacity();
-        try img.route(sh, prefixes, k.at, g.off, g.len, &pieces, e.gpa);
-        for (pieces.items) |p| {
-            const n: usize = @intCast(p.len);
-            const bytes = in[o..][0..n];
-            o += n;
-            if (p.rank == 0 and p.off < img.Words.bytes) continue; // the words went with the seal
-            try ranks.put(e, p.rank, k.id, p.off, bytes);
-            if (p.shared) for (prefixes[1..], 1..) |q, r| try ranks.put(e, @intCast(r), k.id, p.off - prefixes[0] + q, bytes);
-        }
-    }
+    // the blank's home (cuda_disk_ranks.readHome), not the words': a sharded state's latent rows to that rank alone
+    try ranks.scatterWith(RankIo{ .e = e, .id = k.id }, try ranks.shape(e), prefixes, k.at, try homeOf(e, k.id), ranges, in, e.gpa);
 }
 
 fn whole(ptr: *anyopaque, saved: api.prompt_cache.Saved) bool {
@@ -110,7 +104,7 @@ fn whole(ptr: *anyopaque, saved: api.prompt_cache.Saved) bool {
     return s.len != 0;
 }
 
-/// A fixed prompt's store image hashed, and each other rank's shared bytes checked equal to rank 0's (taken as theirs).
+/// A fixed prompt's store image hashed, and each other rank's shared bytes it holds checked equal to the image's.
 fn probe(a: Allocator, io: std.Io, backend: lanes.backend.Backend, e: *Engine) !struct { hash: u64, rate: f64 } {
     const mark: u32 = glm.native.prompt_rows;
     var toks: [glm.native.prompt_rows + 40]u32 = undefined;
@@ -149,9 +143,18 @@ fn probe(a: Allocator, io: std.Io, backend: lanes.backend.Backend, e: *Engine) !
     try gather(e, saved, &.{.{ .off = 0, .len = total }}, bytes);
     const shared = bytes[@intCast(img.Words.bytes + sh.prefix)..@intCast(own)];
     const theirs = try a.alloc(u8, shared.len);
+    // each rank's copy of what it holds (under TF_GLM_KV_SHARD the latent rows on the probe's home alone)
+    const home = try homeOf(e, k.id);
+    var held: std.ArrayList([2]u64) = .empty;
+    defer held.deinit(a);
     for (prefixes[1..], 1..) |q, r| {
-        try ranks.take(e, @intCast(r), k.id, img.Words.bytes + q, theirs);
-        if (!std.mem.eql(u8, shared, theirs)) return error.RanksDiffer;
+        held.clearRetainingCapacity();
+        try img.heldShared(sh, mark, if (home) |h| h == r else true, &held, a);
+        for (held.items) |x| {
+            const part = theirs[@intCast(x[0])..][0..@intCast(x[1])];
+            try ranks.take(e, @intCast(r), k.id, img.Words.bytes + q + x[0], part);
+            if (!std.mem.eql(u8, shared[@intCast(x[0])..][0..part.len], part)) return error.RanksDiffer;
+        }
     }
     try ranks.rest(e);
     return .{ .hash = std.hash.Wyhash.hash(0x676c6d, bytes), .rate = @as(f64, @floatFromInt(toks.len)) / (@as(f64, @floatFromInt(@max(ns, 1))) / 1e9) };

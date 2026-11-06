@@ -22,8 +22,9 @@ fn segsKind(r: fw.Rank, a: dsa_block.Layer, di: usize) ?dsa_block.SegsKind {
     var host_pos: [latent.max_segs]usize = undefined;
     var rows: [latent.max_segs]usize = undefined;
     const ps = r.segs[0].st.caches[di].ps;
+    const lps = r.segs[0].st.caches[di].latPs();
     for (r.segs, 0..) |g, i| {
-        if (g.rows > b.part_rows or g.st.caches[di].ps != ps) return null;
+        if (g.rows > b.part_rows or g.st.caches[di].ps != ps or g.st.caches[di].latPs() != lps) return null;
         caches[i] = g.st.caches[di];
         host_pos[i] = g.st.pos;
         rows[i] = g.rows;
@@ -122,21 +123,31 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
         },
         .mla => |a| {
+            if (@import("cuda_kv_shard_attn.zig").wanted(f, r)) { // TF_GLM_KV_SHARD: a segment one rank holds alone
+                try @import("cuda_kv_shard_attn.zig").shared(f, r, a, di, rows);
+                if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
+                return;
+            }
             var sparse_any = false;
             for (r.segs) |g| sparse_any = sparse_any or dsa_block.sparseRows(a, g.st.pos, g.rows);
             try dsa_block.prepare(f.set(), f.stream, a, b.dsa, b.normed, c.hidden, rows, sparse_any);
             const kk: dsa_block.Kernels = .{ .set = f.set(), .ops = f.m.ops() };
             if (if (f.m.shared_segs) segsKind(r, a, di) else null) |kind| { // every segment's latent attention in one launch
                 const ps = r.segs[0].st.caches[di].ps;
+                const lps = r.segs[0].st.caches[di].latPs(); // ps unsharded
                 if (f.m.shared_writes) { // and their cache writes, three launches for them all (dsa_block.writeSegs)
                     var wt: dsa_block.WriteSegs = undefined;
+                    var lt: dsa_block.WriteSegs = undefined; // the latent writes' entries (wt's unsharded)
                     wt.n = @intCast(r.segs.len);
+                    lt.n = wt.n;
                     var blocks: usize = 0;
                     for (r.segs, 0..) |g, i| {
-                        wt.s[i] = try dsa_block.writeSeg(a, g.st.caches[di], dsa_block.attendScratch(a, b.dsa, g.row0), g.st.pos_dev, g.rows, g.row0, blocks);
+                        const v = dsa_block.attendScratch(a, b.dsa, g.row0);
+                        wt.s[i] = try dsa_block.writeSeg(a, g.st.caches[di], v, g.st.pos_dev, g.rows, g.row0, blocks);
+                        lt.s[i] = try dsa_block.writeSegLatent(a, g.st.caches[di], v, g.st.pos_dev, g.rows, g.row0, blocks);
                         blocks += dsa_block.poolBlocks(g.rows);
                     }
-                    try dsa_block.writeSegs(kk, f.stream, a, &wt, rows, blocks, ps);
+                    try dsa_block.writeSegsLatent(kk, f.stream, a, &lt, &wt, rows, blocks, lps, ps);
                 }
                 var t: latent.AttnSegs = undefined;
                 t.n = @intCast(r.segs.len);
@@ -157,13 +168,13 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
                         .po = b.dsa.partials.po + at * a.lw * 4,
                         .pm = b.dsa.partials.pm + at * 4,
                         .pl = b.dsa.partials.pl + at * 4,
-                        .pt = cache.pt,
+                        .pt = cache.latPt(),
                         .rows = @intCast(g.rows),
                         .nch = @intCast(if (kind == .dense) @min(latent.chunksFor(g.st.pos + g.rows), b.nch) else latent.chunksFor(sparse.width)),
                         .row0 = @intCast(g.row0),
                     };
                 }
-                try dsa_block.attendSegs(kk, f.stream, a, b.dsa, &t, rows, ps, kind);
+                try dsa_block.attendSegs(kk, f.stream, a, b.dsa, &t, rows, lps, kind);
             } else for (r.segs) |g| {
                 const nch = @min(latent.chunksFor(g.st.pos + g.rows), b.nch);
                 try dsa_block.attend(kk, f.stream, a, g.st.caches[di], b.dsa, g.row0, g.rows, g.st.pos_dev, g.st.pos, nch, b.part_rows);

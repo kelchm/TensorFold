@@ -8,33 +8,47 @@ const pages = @import("cuda_snapshot_pages.zig");
 const State = st_mod.State;
 const window_rows = st_mod.window_rows;
 
-/// The image's first bytes: the format, the position, the head's rows, both ring bases and the KDA copy bits.
+/// The image's first bytes: the format, the position, the head's rows, both ring bases and the KDA copy bits. A
+/// KV-sharded state (TF_GLM_KV_SHARD) also names its home part and the parts its pool had in the format word; the
+/// image's bytes are the same either way, as its latent rows come from the home rank alone (`route`).
 pub const Words = struct {
     at: u64,
     mtp_len: u64,
     base: u64,
     mtp_base: u64,
     cur: u64,
+    home: ?u8 = null, // the part that held its latent rows when it was written (null: unsharded)
 
-    pub const bytes: u64 = 48;
+    pub const count = 6;
+    pub const bytes: u64 = count * 8;
     const format: u64 = 1;
+    const sharded: u64 = 3; // | home << 8 | kv_parts << 16
+    pub const kv_parts: u64 = 2; // a sharded pool's parts (TP=2 alone)
 
-    pub fn encode(w: Words) [6]u64 {
-        return .{ format, w.at, w.mtp_len, w.base, w.mtp_base, w.cur };
+    pub fn encode(w: Words) [count]u64 {
+        const f = if (w.home) |h| if (mut(.words_no_home)) format else sharded | @as(u64, h) << 8 | kv_parts << 16 else format;
+        return .{ f, w.at, w.mtp_len, w.base, w.mtp_base, w.cur };
     }
 
-    /// Words read back: refused unless the format is this one and the state stands at `at`.
-    pub fn decode(x: [6]u64, at: u32) !Words {
-        if (x[0] != format or x[1] != at) return error.DiskWords;
-        return .{ .at = x[1], .mtp_len = x[2], .base = x[3], .mtp_base = x[4], .cur = x[5] };
+    /// Words read back: refused unless the format is one of these and the state stands at `at`; a sharded state's
+    /// home within its parts, and those parts the two of TP=2.
+    pub fn decode(x: [count]u64, at: u32) !Words {
+        const home: ?u8 = switch (x[0] & 0xff) {
+            format => if (x[0] == format) null else return error.DiskWords,
+            sharded => if (x[0] >> 24 == 0 and (x[0] >> 16 & 0xff) == kv_parts and (x[0] >> 8 & 0xff) < kv_parts) @intCast(x[0] >> 8 & 0xff) else return error.DiskWords,
+            else => return error.DiskWords,
+        };
+        if (x[1] != at) return error.DiskWords;
+        return .{ .at = x[1], .mtp_len = x[2], .base = x[3], .mtp_base = x[4], .cur = x[5], .home = home };
     }
 };
 
 /// A part as the rows store takes it: `row` bytes for each `per` tokens from position 0, or the state's own (row 0).
 pub const Part = struct { bytes: u64, row: u32 = 0, per: u32 = 1 };
 
-/// `len` image bytes from `img`: the words, `lease` bytes into the state's lease, or zeros the lease does not hold.
-pub const Seg = struct { img: u64, len: u64, from: union(enum) { words, lease: u64, zeros } };
+/// `len` image bytes from `img`: the words, `lease` bytes into the state's lease, zeros the lease does not hold, or
+/// latent rows this rank's copy of a sharded state never held (`absent`: another rank's, never read or written here).
+pub const Seg = struct { img: u64, len: u64, from: union(enum) { words, lease: u64, zeros, absent } };
 
 /// What a rank's kept state holds, read from a sequence of the engine (its addresses are not used past here).
 pub const Shape = struct {
@@ -108,14 +122,35 @@ pub fn parts(sh: Shape, at: u32, out: *std.ArrayList(Part), a: std.mem.Allocator
 
 /// The image's segments in order for a state at `at` whose head holds `mtp_len` rows (0 without a head).
 pub fn segments(sh: Shape, at: u32, mtp_len: u64, out: *std.ArrayList(Seg), a: std.mem.Allocator) !void {
+    return segmentsFor(sh, at, mtp_len, true, out, a);
+}
+
+/// `segments` of a rank's copy with its latent rows or without them (`latent` false: a KV-sharded state off its home
+/// rank, whose lease packs every other part back to back, cuda_snapshots.keepAs): the image keeps their place, absent.
+pub fn segmentsFor(sh: Shape, at: u32, mtp_len: u64, latent: bool, out: *std.ArrayList(Seg), a: std.mem.Allocator) !void {
     if (sh.head and mtp_len > sh.headRows(at)) return error.SnapshotShape;
     var img: u64 = Words.bytes;
     var lease: u64 = 0;
     try out.append(a, .{ .img = 0, .len = Words.bytes, .from = .words });
-    const f = front(sh, at);
-    try out.append(a, .{ .img = img, .len = f, .from = .{ .lease = 0 } });
-    img += f;
-    lease += f;
+    if (latent or mut(.copy_keeps_latent)) {
+        const f = front(sh, at);
+        try out.append(a, .{ .img = img, .len = f, .from = .{ .lease = 0 } });
+        img += f;
+        lease += f;
+    } else {
+        if (sh.prefix > 0) try out.append(a, .{ .img = img, .len = sh.prefix, .from = .{ .lease = 0 } });
+        img += sh.prefix;
+        lease += sh.prefix;
+        const c = cache(sh, at);
+        for (0..sh.layers) |_| {
+            if (c[0] + c[1] > 0) try out.append(a, .{ .img = img, .len = c[0] + c[1], .from = .absent });
+            img += c[0] + c[1];
+            const rest = c[2] + c[3] + c[4];
+            if (rest > 0) try out.append(a, .{ .img = img, .len = rest, .from = .{ .lease = lease } });
+            img += rest;
+            lease += rest;
+        }
+    }
     if (sh.head) for (cache(sh, sh.headRows(at)), cache(sh, mtp_len)) |full, held| {
         if (held > 0) try out.append(a, .{ .img = img, .len = held, .from = .{ .lease = lease } });
         if (full > held) try out.append(a, .{ .img = img + held, .len = full - held, .from = .zeros });
@@ -164,9 +199,12 @@ pub fn storeParts(sh: Shape, prefixes: []const u64, at: u32, out: *std.ArrayList
     for (prefixes[1..]) |p| try out.append(a, .{ .bytes = p });
 }
 
-/// Store image bytes [off, off + len) split by rank: rank 0's image, then rank r's prefix after its words.
-pub fn route(sh: Shape, prefixes: []const u64, at: u32, off: u64, len: u64, out: *std.ArrayList(Piece), a: std.mem.Allocator) !void {
+/// Store image bytes [off, off + len) split by rank: rank 0's image, then rank r's prefix after its words. `home`: a
+/// KV-sharded state's home part (null: unsharded), whose rank alone holds the latent rows; their bytes are its own
+/// there (shared false), at the same place past its prefix as in rank 0's image.
+pub fn route(sh: Shape, prefixes: []const u64, at: u32, off: u64, len: u64, home: ?u8, out: *std.ArrayList(Piece), a: std.mem.Allocator) !void {
     const own = Words.bytes + sh.prefix; // rank 0's bytes no other rank holds
+    if (home) |h| if (h >= prefixes.len) return error.SnapshotShape;
     var start: u64 = 0; // the section's first store byte
     for (prefixes, 0..) |p, r| {
         const size = if (r == 0) imageBytes(sh, at) else p;
@@ -179,9 +217,60 @@ pub fn route(sh: Shape, prefixes: []const u64, at: u32, off: u64, len: u64, out:
             continue;
         }
         if (lo < own) try out.append(a, .{ .rank = 0, .off = lo, .len = @min(hi, own) - lo, .shared = false });
-        if (hi > own) try out.append(a, .{ .rank = 0, .off = @max(lo, own), .len = hi - @max(lo, own), .shared = true });
+        if (hi <= own) continue;
+        const h = (if (mut(.route_ignores_home)) null else home) orelse {
+            try out.append(a, .{ .rank = 0, .off = @max(lo, own), .len = hi - @max(lo, own), .shared = true });
+            continue;
+        };
+        var x = @max(lo, own);
+        while (x < hi) {
+            const run = latentRun(sh, at, x);
+            const end = @min(hi, run.end);
+            if (run.latent) {
+                try out.append(a, .{ .rank = h, .off = x - prefixes[0] + prefixes[h], .len = end - x, .shared = false });
+            } else try out.append(a, .{ .rank = 0, .off = x, .len = end - x, .shared = true });
+            x = end;
+        }
     }
     if (off + len > start) return error.SnapshotShape;
+}
+
+/// Whether rank 0's image byte `x` (past its prefix) lies in a DSA layer's latent codes or scales, and where that run
+/// of latent or other bytes ends.
+fn latentRun(sh: Shape, at: u32, x: u64) struct { latent: bool, end: u64 } {
+    const first = Words.bytes + sh.prefix;
+    const c = cache(sh, at);
+    const layer = c[0] + c[1] + c[2] + c[3] + c[4];
+    if (x < first or layer == 0 or x >= first + sh.layers * layer) return .{ .latent = false, .end = std.math.maxInt(u64) };
+    const j = (x - first) / layer;
+    const o = (x - first) % layer;
+    const lat = c[0] + c[1];
+    if (o < lat) return .{ .latent = true, .end = first + j * layer + lat };
+    return .{ .latent = false, .end = first + (j + 1) * layer };
+}
+
+/// The bytes past a rank's prefix that every rank's image shares and a rank's copy holds, as (offset past its prefix,
+/// length): all of them, or (`latent` false: a sharded state off its home rank) all but the latent codes and scales.
+pub fn heldShared(sh: Shape, at: u32, latent: bool, out: *std.ArrayList([2]u64), a: std.mem.Allocator) !void {
+    const end = imageBytes(sh, at) - Words.bytes - sh.prefix;
+    if (latent) return out.append(a, .{ 0, end });
+    const c = cache(sh, at);
+    var x: u64 = 0;
+    for (0..sh.layers) |_| {
+        x += c[0] + c[1];
+        const rest = c[2] + c[3] + c[4];
+        if (rest > 0) try out.append(a, .{ x, rest });
+        x += rest;
+    }
+    if (end > x) try out.append(a, .{ x, end - x });
+}
+
+/// Host test mutants, each caught by a disk image test (cuda_disk_shard_test).
+pub const Mutant = enum { none, words_no_home, copy_keeps_latent, route_ignores_home };
+pub var mutant: Mutant = .none;
+
+fn mut(comptime m: Mutant) bool {
+    return @import("builtin").is_test and mutant == m;
 }
 
 /// Copies between `host` and image bytes [off, off + host.len) of a lease: out (lease to host) or in.
@@ -190,7 +279,7 @@ pub const Copy = struct {
     pool: *const pages.Pool,
     lease: *const pages.Lease,
     segs: []const Seg,
-    words: *[6]u64,
+    words: *[Words.count]u64,
 
     pub fn run(c: Copy, off: u64, host: []u8, out: bool) !void {
         const end = off + host.len;
@@ -205,6 +294,7 @@ pub const Copy = struct {
                     if (out) @memcpy(h, w) else @memcpy(w, h);
                 },
                 .zeros => if (out) @memset(h, 0),
+                .absent => return error.KvShardAbsent, // another rank's latent rows (route sends none here)
                 .lease => |at| try c.leased(at + (lo - s.img), h, out),
             }
         }
