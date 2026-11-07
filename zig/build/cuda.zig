@@ -182,6 +182,7 @@ fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
 /// CPU tests for the CUDA runtime, shared core, lanes and CUDA family, on any host.
 pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *std.Build.Step.Options, all: *std.Build.Step, server_steps: bool) void {
     const step = b.step("test-cuda-host", "The CUDA side's host unit tests alone (no GPU work)");
+    @import("glm_replay.zig").host(b, step);
     all.dependOn(step);
     @import("release_version.zig").tests(b, step);
     const flags = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
@@ -357,6 +358,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     video_step.dependOn(&offer_tests.step);
     const compile_modules = engines(b, cuda_target, .debug, check_cuda, check_mods.core, check_mods.lanes, check_mods.nemotron, check_mods.heat, check_mods.qwen35, check_mods.qwen_vision);
     @import("glm_family_host.zig").compile(b, cuda_target, check_cuda, check_mods, glmCuda);
+    @import("glm_replay.zig").compileCommand(b, cuda_target, check_cuda, glmCuda(b, cuda_target, .debug, check_cuda, check_mods.core, check_mods.lanes, check_mods.heat));
     const open_object = b.addObject(.{ .name = "omni-video-native-compile", .root_module = b.createModule(.{ .root_source_file = b.path("zig/tests/omni_video_compile.zig"), .target = cuda_target, .link_libc = true, .imports = &.{.{ .name = "native", .module = compile_modules.engines }} }) });
     _ = open_object.getEmittedBin();
     b.step("compile-omni-video-host", "Compile actual native CUDA startup and offer for Linux without images or GPU execution").dependOn(&open_object.step);

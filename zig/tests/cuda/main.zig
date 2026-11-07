@@ -267,6 +267,9 @@ const usage =
     \\  kolibri-logits MODEL IDS OUT [PROMPTS]  Kolibri-1's teacher-forced fp32 logits of 2,048 prompt rows; each prompt's last
     \\  glm-synth <dir> [fp8pb|local]  a synthetic GLM-5.3-Flash checkpoint (2 layers, 16 experts) and its dc.json for the lane checks
     \\  glm-loader-gate <ckpt>   every rank's uploads at TP 1, 2 and 3 against the checkpoint cut on the host, byte for byte
+    \\  glm-replay-compare OFF ON [GATE_PREFIX]  compare logical validation evidence without CUDA
+    \\  glm-replay-check FIXTURE  validate fixed-work inputs without CUDA
+    \\  glm-replay MODE FIXTURE MODEL DRAFTER OUTPUT METADATA  local replay (MODE validate|measure)
     \\  glm-fp8g-shares          block-FP8 TP shares packed as GLM's loader packs them, on the lane, against FP64 of the cut
     \\  aot-fallback <dir>        a launch's 1 from the runtime-parameter variant: the folded variant's bits (#1003)
     \\
@@ -278,13 +281,15 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("{s}", .{usage});
         return 2;
     }
+    const cmd = args[1];
+    const rest = args[2..];
+    if (std.mem.eql(u8, cmd, "glm-replay") or std.mem.eql(u8, cmd, "glm-replay-check") or std.mem.eql(u8, cmd, "glm-replay-compare"))
+        return @import("glm_replay.zig").command(init, cmd, rest);
     var driver = try cuda.Driver.open();
     defer driver.close();
     var ctx = try cuda.Context.init(&driver, 0);
     defer ctx.deinit();
     const gpu: check.Gpu = .{ .d = &driver, .ctx = &ctx, .gpa = init.gpa, .io = init.io };
-    const cmd = args[1];
-    const rest = args[2..];
 
     try dump.begin(init.gpa, cmd);
     run(gpu, cmd, rest) catch |e| {
