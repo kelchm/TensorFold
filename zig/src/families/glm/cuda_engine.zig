@@ -577,6 +577,7 @@ pub const Engine = struct {
     pub const keepAs = snapshots.keepAs;
     /// Restoring copied snapshots is a real page write, including the Plan's two pooled lookahead rows.
     pub fn restoreState(e: *Engine, id: u64) !void {
+        if (!e.settings.page_write_guards) return snapshots.restore(e, id);
         if (e.partial != null) return page_write.refuse(e, error.SliceBusy);
         const s = e.snaps.get(id) orelse return page_write.refuse(e, error.NoKeptState);
         const at = @max(s.pos, if (e.mtp) s.mtp_len else 0);

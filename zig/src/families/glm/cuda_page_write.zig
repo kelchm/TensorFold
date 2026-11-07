@@ -25,6 +25,7 @@ pub fn guard(e: anytype, ranges: []const Range) !void {
 
 /// Batched forwards keep their already-bound segments; guarding a slot must not reactivate media or allocate State.
 pub fn at(e: anytype, slot: u32, ranges: []const Range) !void {
+    if (!e.settings.page_write_guards or e.pages == null) return;
     if (e.share.world == 1) return local(e, slot, ranges, true);
     var failed: bool = false;
     local(e, slot, ranges, false) catch {
@@ -36,7 +37,7 @@ pub fn at(e: anytype, slot: u32, ranges: []const Range) !void {
 
 /// A local failure computing the write range joins the SAME agreement as peers with a valid range.
 pub fn refuse(e: anytype, why: anyerror) anyerror!void {
-    if (e.share.world == 1) return why;
+    if (!e.settings.page_write_guards or e.share.world == 1) return why;
     _ = e.shared(1) catch |err| fatal(err);
     return error.PageWriteDeferred;
 }
@@ -44,6 +45,7 @@ pub fn refuse(e: anytype, why: anyerror) anyerror!void {
 /// Prepare-only sliced prefill uses this before its existing admission vote, not before a new collective.
 /// `copy=false` also checks rollback destinations without changing the undo capsule's canonical ids.
 pub fn local(e: anytype, slot: u32, ranges: []const Range, copy: bool) !void {
+    if (!e.settings.page_write_guards or e.pages == null) return;
     if (slot >= e.seqs.items.len) return error.PageWriteOwner;
     const st = &(e.seqs.items[slot] orelse return error.PageWriteOwner).st;
     if (st.table == 0 or (st.caches.len == 0 and !st.head)) return; // unpaged or no physical KV rows

@@ -9,6 +9,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 pub const Settings = struct {
     kv8: bool = false, // --kv-cache fp8, supplied by the native options rather than an environment override
     fill_slice_ms: f64 = 0, // native opt-in, agreed before load and allocated before room sampling
+    page_write_guards: bool = false, // TF_GLM_PAGE_WRITE_GUARDS: opt-in checkpoint/shared-page protection
     pages: bool = false, // TF_KV_PAGES as `open` resolves it (with the world and --kv-cache): every sequence on pages
     prompt_fixed_k: bool = false, // TF_GLM_PROMPT_K: one (default) or shape (experimental fixed K slices)
     tiled: bool = true, // TF_GLM_MM: 1 (the bf16 linears on glm_mm, tiled at load) or 0
@@ -27,6 +28,12 @@ pub const Settings = struct {
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
         var s: Settings = .{};
+        if (get("TF_GLM_PAGE_WRITE_GUARDS")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.page_write_guards = true else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = "TF_GLM_PAGE_WRITE_GUARDS: 0 or 1";
+                return error.BadSetting;
+            }
+        }
         if (get("TF_GLM_PROMPT_K")) |v| {
             if (std.mem.eql(u8, v, "shape")) s.prompt_fixed_k = true else if (!std.mem.eql(u8, v, "one")) {
                 problem.* = "TF_GLM_PROMPT_K: one or shape";
@@ -143,7 +150,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 15, // slicing workspace admission is part of the rank agreement
+    layout: u32 = 16, // page-write policy must agree before any guarded operation
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -164,6 +171,7 @@ pub const Fingerprint = extern struct {
     bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
     numerics: u32 = 0, // Settings.numerics: every rank's prompt kernels round alike
     fill_slice_ms: f64 = 0,
+    page_write_guards: u64 = 0, // aligned wire boolean; keeps the fingerprint free of padding
     capacity: u64, // tokens a sequence holds
     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
     heat_low: f64,
@@ -193,6 +201,7 @@ pub const Fingerprint = extern struct {
         bits,
         numerics,
         fill_slice_ms,
+        page_write_guards,
         capacity,
         heat_high,
         heat_low,
@@ -227,6 +236,7 @@ pub const Fingerprint = extern struct {
             .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
             .numerics = s.numerics.bits(),
             .fill_slice_ms = s.fill_slice_ms,
+            .page_write_guards = @intFromBool(s.page_write_guards),
             .capacity = capacity,
             .heat_high = if (s.heat) |b| b.high_c else 0,
             .heat_low = if (s.heat) |b| b.low_c else 0,
@@ -265,6 +275,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "bits",
             "numerics",
             "fill_slice_ms",
+            "page_write_guards",
             "capacity",
             "heat_high",
             "heat_low",
@@ -376,6 +387,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
         .numerics => "TF_GLM_ABSORB_MMA or TF_GLM_W8A8",
         .fill_slice_ms => "TF_GLM_FILL_SLICE_MS",
+        .page_write_guards => "TF_GLM_PAGE_WRITE_GUARDS",
         .capacity => "the sequence capacity (the context)",
         .heat_high => "TF_HEAT_HIGH",
         .heat_low => "TF_HEAT_LOW",

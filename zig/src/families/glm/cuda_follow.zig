@@ -281,6 +281,10 @@ pub const Leader = struct {
     pub fn chunkSliced(x: Leader, ids: []const u32, start: usize, pair: bool, from: ?engine.Resume, budget: f64, cancel: ?engine.Cancel, marks: ?engine.Marks) !Chunk {
         const fatal = @import("cuda_slice_undo.zig").fatal;
         if (x.e.partial == null) {
+            // Guarded restore includes a TP vote. Announce an ordinary chunk before restoring on
+            // any rank; subsequent chunks can slice normally. The disabled policy keeps its sliced path.
+            if (from != null and x.e.share.world > 1 and x.e.settings.page_write_guards)
+                return x.chunk(ids, start, pair, from, cancel, marks);
             if (x.e.images) |v| if (v.source.images.len != 0) return x.chunk(ids, start, pair, from, cancel, marks);
             if (start >= ids.len) return error.BadChunk;
             // Validate the setting before allocating or announcing anything.

@@ -52,7 +52,7 @@ pub fn prepare(e: *Engine, part: []const u32, start: usize, len: usize, from: ?e
     if (start >= len or start % engine.prompt_rows != 0 or !Engine.promptFits(len, e.cur.st.capacity)) return error.BadChunk;
     const rows = @min(len - start, engine.prompt_rows);
     if (part.len != @min(rows + 1, len - start)) return error.BadChunk;
-    if (from != null and e.share.world != 1) return error.SliceResumeNeedsPageAgreement;
+    if (from != null and e.share.world != 1 and e.settings.page_write_guards) return error.SliceResumeNeedsPageAgreement;
     if (from != null and try e.prefillStart(len, from) != start) return error.BadChunk;
     if (e.cur.st.pos != start) return error.BadChunk;
     const workspace = e.slice_workspace orelse return error.SlicingNotStarted;
