@@ -10,7 +10,8 @@ from tools.perf.glm_replay import ReplayError, load_fixture, next_anchor, offere
 from tools.perf.glm_replay.capacity import minimum_h, reservations, validate_pool
 from tools.perf.glm_replay.common import canonical_bytes, file_digest, parse_json, write_json
 from tools.perf.glm_replay.fixture import TARGET_REVISION, seal_fixture
-from tools.perf.glm_replay.generate import PinnedTokenizer, SyntheticTokenizer, build_fixture, main
+from tools.perf.glm_replay.generate import PinnedTokenizer, SyntheticTokenizer, build_fixture, main, template_messages
+from tools.perf.glm_replay.histories import source_material
 
 
 class FixtureTests(unittest.TestCase):
@@ -145,6 +146,17 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(encode.call_count, 8)
         self.assertEqual([call.args[0] for call in encode.call_args_list],
                          [s[k] for s in fixture["streams"] for k in ("rendered_prompt", "rendered_tape")])
+
+    def test_pi_tool_history_renders_object_arguments_without_mutating_source(self):
+        source = source_material("pi", 0, 2)
+        original = copy.deepcopy(source["messages"])
+        normalized = template_messages(source["messages"])
+        function = normalized[2]["tool_calls"][0]["function"]
+        self.assertEqual(function["arguments"], {"path": "examples/harbor/ledger.txt"})
+        self.assertEqual(source["messages"], original)
+        function["arguments"] = "[]"
+        with self.assertRaisesRegex(ReplayError, "must be JSON objects"):
+            template_messages(normalized)
 
     def test_true_generator_requires_local_hashed_assets_before_import(self):
         with tempfile.TemporaryDirectory() as temp:

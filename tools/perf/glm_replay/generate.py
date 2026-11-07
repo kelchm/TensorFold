@@ -1,13 +1,27 @@
 """Local-only one-time tokenization; synthetic byte fixtures are explicitly host-only."""
 import argparse
+import copy
 from pathlib import Path
 
 from .capacity import minimum_h, reservations
-from .common import canonical_bytes, fields, file_digest, hex_id, integer, read_json, require, text_digest, write_json
+from .common import canonical_bytes, fields, file_digest, hex_id, integer, parse_json, read_json, require, text_digest, write_json
 from .fixture import DRAFTER_REVISION, SCHEMA, TARGET_REVISION, seal_fixture, validate_fixture
 from .histories import source_material
 
 SYNTHETIC_TEMPLATE = "synthetic-byte-v1: canonical JSON of messages/tools, followed by newline assistant newline"
+
+
+def template_messages(messages):
+    normalized = copy.deepcopy(messages)
+    for message in normalized:
+        for call in message.get("tool_calls", []):
+            function = call["function"]
+            arguments = function["arguments"]
+            if isinstance(arguments, str):
+                arguments = parse_json(arguments)
+            require(isinstance(arguments, dict), "template tool arguments must be JSON objects")
+            function["arguments"] = arguments
+    return normalized
 
 
 class SyntheticTokenizer:
@@ -66,7 +80,8 @@ class PinnedTokenizer:
 
     def render(self, messages, tools):
         options = {"tools": tools} if tools else {}
-        return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, **options)
+        return self.tokenizer.apply_chat_template(template_messages(messages), tokenize=False,
+                                                  add_generation_prompt=True, **options)
 
     def encode(self, text):
         return self.tokenizer.encode(text, add_special_tokens=False)

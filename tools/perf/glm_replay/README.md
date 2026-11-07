@@ -10,6 +10,9 @@ The schemas and exact hash rules are in [SCHEMA.md](SCHEMA.md). Python 3.11+ is 
 for validation, generation of synthetic host fixtures, tests and analysis. Real tokenization
 also requires a locally installed `transformers` package and the pinned checkpoint's assets.
 Nothing downloads assets or executes remote tokenizer code.
+Real rendering parses serialized tool-call arguments into objects for the pinned template,
+while retaining the authored source unchanged. Tokenizer entries may be fewer than the model's
+padded 154880-row ID capacity; every tokenizer ID must fit that capacity.
 
 ## Host checks
 
