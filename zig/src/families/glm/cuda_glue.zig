@@ -67,6 +67,12 @@ pub const Kernels = struct {
     chunks_32_fp8: cuda.Function,
     chunks_16_fp8_paged: cuda.Function,
     chunks_32_fp8_paged: cuda.Function,
+    chunks_16_fused: cuda.Function, // a prompt chunk's sparse rows past the partials: the merge in the kernel
+    chunks_32_fused: cuda.Function,
+    chunks_16_fp8_fused: cuda.Function,
+    chunks_32_fp8_fused: cuda.Function,
+    chunks_16_fp8_paged_fused: cuda.Function,
+    chunks_32_fp8_paged_fused: cuda.Function,
     merge: cuda.Function,
     scores: cuda.Function,
     latent_mma_kn: cuda.Function, // TF_GLM_ABSORB_MMA (glm_glue_num.cuh): absorb_q's head-batched GEMM, B as [K][N]
@@ -83,6 +89,12 @@ pub const Kernels = struct {
         try k.chunks_32_fp8.allowDynamicShared(chunksSmem(32));
         try k.chunks_16_fp8_paged.allowDynamicShared(chunksSmem(16));
         try k.chunks_32_fp8_paged.allowDynamicShared(chunksSmem(32));
+        try k.chunks_16_fused.allowDynamicShared(chunksSmem(16));
+        try k.chunks_32_fused.allowDynamicShared(chunksSmem(32));
+        try k.chunks_16_fp8_fused.allowDynamicShared(chunksSmem(16));
+        try k.chunks_32_fp8_fused.allowDynamicShared(chunksSmem(32));
+        try k.chunks_16_fp8_paged_fused.allowDynamicShared(chunksSmem(16));
+        try k.chunks_32_fp8_paged_fused.allowDynamicShared(chunksSmem(32));
         try k.latent_mma_kn.allowDynamicShared(latent_mma_smem[0]);
         try k.latent_mma_nk.allowDynamicShared(latent_mma_smem[1]);
         return k;
