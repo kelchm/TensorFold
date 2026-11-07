@@ -107,6 +107,83 @@ extern "C" __global__ void __launch_bounds__(1024)
   }
 }
 
+// tf_glm_hc_partial8 spread over more blocks (decode rows): block (row, K block b, z) of 128 M threads makes M of the
+// 24 dots, z M .. z M + M - 1, each (dot, step) on one 16-lane half-warp with tf_glm_hc_partial8's lanes (c = lane %
+// 16 over the step's 128 inputs), loads, fma chain, butterfly (xor 8 .. 1) and step sum in order from 0.0f; the last
+// z makes the squares sum (out[24]) with its group 0's threads and order. So the same bits, from 24 / M + 1 blocks a
+// K block instead of one, each loading M rows of fn instead of all 24.
+namespace glm_hcp {
+template <int M>
+__device__ __forceinline__ void partial_split(const __nv_bfloat16* x, const __nv_bfloat16* fn, float* part,
+                                              int64_t wide, int nb) {
+  static_assert(24 % M == 0, "whole dots a block");
+  __shared__ float dots[M][8];
+  __shared__ float smem[4];
+  const int64_t r = blockIdx.x, b = blockIdx.y, kb = wide / nb;
+  const int steps = static_cast<int>(kb / 128);  // 8 (hcPre's shapes), as tf_glm_hc_partial8 holds at most
+  float* out = part + (r * nb + b) * 32;
+  const int t = threadIdx.x;
+  if (blockIdx.z == 24 / M) {  // tf_glm_hc_partial8's group 0: the squares
+    if (t < 128) {
+      float ss = 0.0f;
+      for (int s = 0; s < steps; ++s) {
+        const float xt = bf(x[r * wide + b * kb + s * 128 + t]);
+        ss = __fmaf_rn(xt, xt, ss);
+      }
+      for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+      if ((t & 31) == 0) smem[t >> 5] = ss;
+    }
+    __syncthreads();
+    if (t == 0) out[24] = (smem[0] + smem[2]) + (smem[1] + smem[3]);
+    return;
+  }
+  const int k = t >> 7, s = (t >> 4) & 7, c = t & 15;
+  const int64_t m = (int64_t)blockIdx.z * M + k;
+  const bool live = s < steps;  // a half-warp's own step: its warp-mate holds another, so every lane shuffles
+  float d = 0.0f;
+  if (live) {
+    const int64_t base = b * kb + s * 128;
+    float xv[8];
+    {
+      const uint4 u = *reinterpret_cast<const uint4*>(x + r * wide + base + c * 8);
+      const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&u);
+      for (int j = 0; j < 8; ++j) xv[j] = bf(h[j]);
+    }
+    const uint4 u = __ldg(reinterpret_cast<const uint4*>(fn + m * wide + base + c * 8));
+    const __nv_bfloat16* w = reinterpret_cast<const __nv_bfloat16*>(&u);
+    d = __fmul_rn(xv[1], bf(w[1]));
+    d = __fmaf_rn(xv[0], bf(w[0]), d);
+    for (int j = 2; j < 8; ++j) d = __fmaf_rn(xv[j], bf(w[j]), d);
+  }
+  for (int o = 8; o > 0; o >>= 1) d = d + __shfl_xor_sync(0xffffffffu, d, o);
+  if (live && c == 0) dots[k][s] = d;
+  __syncthreads();
+  if (t < M) {
+    float acc = 0.0f;
+    for (int st = 0; st < steps; ++st) acc = acc + dots[t][st];
+    out[(int64_t)blockIdx.z * M + t] = acc;
+  }
+}
+}  // namespace glm_hcp
+
+// grid (rows, 16, 24 / M + 1) of 128 M threads; cuda_glue.hcPre picks M by rows (Set.hc_part)
+extern "C" __global__ void __launch_bounds__(128)
+    tf_glm_hc_partial8_o1(const __nv_bfloat16* x, const __nv_bfloat16* fn, float* part, int64_t wide, int nb) {
+  glm_hcp::partial_split<1>(x, fn, part, wide, nb);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_hc_partial8_o2(const __nv_bfloat16* x, const __nv_bfloat16* fn, float* part, int64_t wide, int nb) {
+  glm_hcp::partial_split<2>(x, fn, part, wide, nb);
+}
+extern "C" __global__ void __launch_bounds__(512)
+    tf_glm_hc_partial8_o4(const __nv_bfloat16* x, const __nv_bfloat16* fn, float* part, int64_t wide, int nb) {
+  glm_hcp::partial_split<4>(x, fn, part, wide, nb);
+}
+extern "C" __global__ void __launch_bounds__(1024)
+    tf_glm_hc_partial8_o8(const __nv_bfloat16* x, const __nv_bfloat16* fn, float* part, int64_t wide, int nb) {
+  glm_hcp::partial_split<8>(x, fn, part, wide, nb);
+}
+
 namespace glm_hc {
 
 // The Sinkhorn sums of 4: lanes (i, j) = (lane / 4 % 4, lane % 4), rows over j (xor 2, 1), columns over i (xor 8, 4).
