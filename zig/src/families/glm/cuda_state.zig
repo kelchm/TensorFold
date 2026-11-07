@@ -132,6 +132,36 @@ fn b16Shapes(w: *const weights.Weights) [12][2]usize {
     };
 }
 
+/// The DSA layer's two-problem decode launches: [q_a | kv_a] with the indexer's kw, q_b with the indexer's qb (n, k each).
+fn twoShapes(w: *const weights.Weights) [2][4]usize {
+    const c = &w.config;
+    const s = &w.share;
+    return .{
+        .{ c.q_lora + c.kv_lora, c.hidden, c.i_dim + c.i_heads, c.hidden },
+        .{ s.mla.len() * c.nope, c.q_lora, c.i_heads * c.i_dim, c.q_lora },
+    };
+}
+
+test "GLM TP3: decode scratch holds both problems' K slices of the DSA two-problem launches, worlds 1 to 4" {
+    const c = @import("config.zig").Config{};
+    const Share = @import("cuda_shard.zig").Share;
+    const mm_mod = @import("cuda_mm.zig");
+    for ([_]usize{ 1, 2, 3, 4 }) |world| for (0..world) |rank| {
+        const w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = try Share.of(&c, rank, world) };
+        for ([_]usize{ 1, 2, 8, 16, 17, 32 }) |rows| {
+            var mm: usize = 4;
+            for (b16Shapes(&w)) |sh_| mm = @max(mm, b16.partBytes(@min(rows, b16.rows_from - 1), sh_[0], sh_[1]));
+            for (twoShapes(&w)) |t| mm = @max(mm, mm_mod.twoPartBytes(rows, t[0], t[1], t[2], t[3]));
+            for (twoShapes(&w)) |t| {
+                // each problem alone fits too (the fallback's two calls), and two problems' slices never overlap
+                try std.testing.expect(mm_mod.partBytes(rows, .{ .w = 0, .n = t[0], .k = t[1] }) <= mm);
+                try std.testing.expect(mm_mod.partBytes(rows, .{ .w = 0, .n = t[2], .k = t[3] }) <= mm);
+                try std.testing.expect(mm_mod.partBytes(rows, .{ .w = 0, .n = t[0], .k = t[1] }) + mm_mod.partBytes(rows, .{ .w = 0, .n = t[2], .k = t[3] }) <= mm_mod.twoPartBytes(rows, t[0], t[1], t[2], t[3]));
+            }
+        }
+    };
+}
+
 test "GLM TP3: existing scratch covers raw projections through the 127-row split-K boundary" {
     const c = @import("config.zig").Config{};
     const Share = @import("cuda_shard.zig").Share;
@@ -232,6 +262,10 @@ pub const Buffers = struct {
         var mm: usize = 4;
         // windows under rows_from rows keep their K slices apart (a prompt's tail chunk on the prefill buffers too)
         for (b16Shapes(w)) |sh_| mm = @max(mm, b16.partBytes(@min(rows, b16.rows_from - 1), sh_[0], sh_[1]));
+        // a decode window's two-problem DSA launches (cuda_mm.matmulTwo) hold both problems' slices at once
+        if (!prefill) for (twoShapes(w)) |t| {
+            mm = @max(mm, @import("cuda_mm.zig").twoPartBytes(rows, t[0], t[1], t[2], t[3]));
+        };
         var x3: [4]usize = @splat(4); // EXL3 experts: each layer's path (the prompt kernels', or the grouped one) sizes it
         for (w.layers) |l| if (l.ffn == .moe) if (l.ffn.moe.exl3) |x| exl3.mostScratch(&x3, rows, D, ew, prefill, x);
         if (w.mtp) |m| if (m.layer.ffn == .moe) if (m.layer.ffn.moe.exl3) |x| exl3.mostScratch(&x3, rows, D, ew, prefill, x);
@@ -320,6 +354,7 @@ pub const Buffers = struct {
                 .counts = p[41],
                 .mm_part = p[42],
                 .at = p[43],
+                .mm_part_bytes = mm,
             },
             .dense = .{ .tmp = p[44], .gu = p[45], .act = p[46], .xs_act = p[47], .mm_part = p[42] },
             .moe = .{ .mlog = p[48], .router_part = p[26], .pick = p[49], .wts = p[50], .plan = .{ .members = p[51], .items = p[52], .counts = p[53], .rank = p[54], .hist = p[55] }, .eact = p[56], .ey = p[57], .sgu = p[58], .sact = p[59], .sxs = p[60], .sy = p[61], .mm_part = p[42] },
