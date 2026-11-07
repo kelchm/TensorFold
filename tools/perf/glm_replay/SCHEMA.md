@@ -73,7 +73,10 @@ effective_config={engine:"native"|"python",speed:"standard",tp:2,slots:4,
 dense_bits,head_bits,kv:"fp8",kv_shard:bool,multi_lone:0,
 pool_h,page_argument,page_tokens,configured_capacity,dsa_layers,
 local_heads,latent_width,row_dtype_bytes,query_bytes_per_row,output_bytes_per_row,
-graph_rows:[positive total-row keys]}.
+graph_rows:[positive total-row keys],runtime_sha256}.
+runtime_sha256 binds normalized runtime settings, execution environment and actual loaded transport,
+combining both ranks in rank order. Only the sharding treatment is normalized away; native A/B
+must share this digest. Gate receipts bind it after startup and before replay preparation.
 A native q8 off; B native q8 on; P Python q4 off. Same source identities for native A/B.
 checks={correctness:true,timing_neutral:true,default_server_neutral:true,
 fresh_prefill:true,proposer_calls:0,lost:0,carries:0,twins:0}.

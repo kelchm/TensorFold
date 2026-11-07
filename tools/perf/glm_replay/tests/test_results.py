@@ -142,6 +142,21 @@ class ResultTests(unittest.TestCase):
         with self.assertRaisesRegex(ReplayError, "native build changed"):
             self.validate()
 
+    def test_runtime_and_transport_changes_cannot_pair_with_sharding(self):
+        for record in self.records[2:]:
+            record["effective_config"]["runtime_sha256"] = "a" * 64
+            record["effective_config_sha256"] = digest(record["effective_config"])
+        with self.assertRaisesRegex(ReplayError, "changed more than sharding"):
+            self.validate()
+
+    def test_both_ranks_must_bind_the_same_actual_runtime(self):
+        self.change_config("runtime_sha256", "a" * 64)
+        with self.assertRaisesRegex(ReplayError, "inconsistent process-start|rank disagreement"):
+            self.validate()
+        self.change_config("runtime_sha256", "unknown")
+        with self.assertRaisesRegex(ReplayError, "runtime_sha256"):
+            self.validate()
+
     def test_start_identity_and_counterbalanced_orders(self):
         self.records[2]["start_id"] = self.records[0]["start_id"]
         self.records[3]["start_id"] = self.records[0]["start_id"]

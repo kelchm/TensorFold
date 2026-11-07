@@ -10,7 +10,7 @@ SOURCE_FIELDS = ("engine_commit harness_commit binary_sha256 fatbin_sha256 compi
                  "kit_commit image_digest device_image_digest")
 CONFIG_FIELDS = ("engine speed tp slots dense_bits head_bits kv kv_shard multi_lone pool_h page_argument "
                  "page_tokens configured_capacity dsa_layers local_heads latent_width row_dtype_bytes "
-                 "query_bytes_per_row output_bytes_per_row graph_rows")
+                 "query_bytes_per_row output_bytes_per_row graph_rows runtime_sha256")
 RECORD_FIELDS = ("schema fixture_sha256 schedule_sha256 tokens_sha256 config_sha256 run_id pair_id start_id "
                  "start_order block_id cell_id arm rank status exclusion_reason source effective_config "
                  "effective_config_sha256 preparation_ns wall_ns completed_ranks forwards checks memory telemetry_sha256")
@@ -51,6 +51,7 @@ def _source(record):
 def _config(record, fixture):
     cfg, base, arm = record["effective_config"], fixture["config"], record["arm"]
     fields(cfg, CONFIG_FIELDS, "effective config")
+    hex_id(cfg["runtime_sha256"], "runtime_sha256")
     require(record["effective_config_sha256"] == digest(cfg), "effective config hash mismatch")
     for key in ("speed", "tp", "slots", "kv"):
         require(type(cfg[key]) is type(base[key]) and cfg[key] == base[key], f"effective {key} mismatch")

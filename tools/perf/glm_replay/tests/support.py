@@ -15,7 +15,7 @@ def receipt(fixture, arm="A", pair=0, block=0, rank=0, wall=1_000_000):
            "configured_capacity": fixture["config"]["pool"]["configured_capacity"],
            "dsa_layers": 11, "local_heads": 32, "latent_width": 512, "row_dtype_bytes": 2,
            "query_bytes_per_row": 32768, "output_bytes_per_row": 32768,
-           "graph_rows": [1, 4, 8, 16, 32] if arm == "P" else []}
+           "graph_rows": [1, 4, 8, 16, 32] if arm == "P" else [], "runtime_sha256": "9" * 64}
     source = {"engine_commit": PYTHON_BASE if arm == "P" else NATIVE_BASE, "harness_commit": "1" * 40,
               "binary_sha256": "2" * 64, "fatbin_sha256": "3" * 64, "compiler_sha256": "4" * 64,
               "kit_commit": "bf5f94523a8251029cedae86bf61f8ce37fac218" if arm == "P"
