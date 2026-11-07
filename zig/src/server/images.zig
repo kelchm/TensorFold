@@ -179,7 +179,7 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
     var bytes_total: usize = 0;
     // every URL's download inside one request's seconds (images.py total_timeout_seconds, videos.py's)
     const deadline: std.Io.Timestamp = if (io) |i| std.Io.Clock.awake.now(i).addDuration(.fromSeconds(if (v.image_limits) |l| l.prepare_seconds else media_fetch.total_s)) else .{ .nanoseconds = 0 };
-    var video_budget: videos.Budget = .{ .deadline = if (fetch) |f| std.Io.Clock.awake.now(f.io).addDuration(.fromSeconds(videos.total_s)) else .{ .nanoseconds = 0 } };
+    var video_budget: videos.Budget = .{ .deadline = if (io != null) started.addDuration(.fromSeconds(videos.total_s)) else .{ .nanoseconds = 0 } };
     var ii: usize = 0;
     var vi: usize = 0;
     var video_tokens_total: u64 = 0;
@@ -189,6 +189,9 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
             const cap = videoTokenBudget(o, n_videos);
             clips[vi] = try videos.prepare(cx, o, v.ctx, fetch, p.url, vi, cap, &video_budget);
             try accountVideo(cx, o, clips[vi], cap, &video_tokens_total);
+            if (o.lazy) if (io) |video_io| for (clips[vi].groups) |*g| {
+                g.deadline = .{ .io = video_io, .at = video_budget.deadline };
+            };
             vi += 1;
             continue;
         }
@@ -207,6 +210,7 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
         tokens_total += prepared[i].tokens;
         if (tokens_total > v.image_tokens) return cx.refuse("the request's images exceed the configured total visual-token budget");
         if (v.image_limits) |l| {
+            prepared[i].deadline = .{ .io = l.io, .at = deadline };
             pixels_total += prepared[i].source_pixels;
             if (pixels_total > l.max_request_pixels) return cx.refuse("the request's images exceed the configured decoded pixel limit");
             if (started.durationTo(std.Io.Clock.awake.now(l.io)).nanoseconds > @as(i96, l.prepare_seconds) * std.time.ns_per_s) return cx.refuse("image preparation exceeded the configured time limit");
@@ -297,7 +301,7 @@ pub fn both(a: std.mem.Allocator, ids: *std.ArrayList(u32), key: *std.ArrayList(
 /// Appends one image's rows, its engine entry and its cache words; `named`: the word before them is its marker's.
 fn placeImage(a: std.mem.Allocator, ids: *std.ArrayList(u32), key: *std.ArrayList(u32), imgs: *std.ArrayList(api.Image), token: u32, img: api.PreparedImage, named: bool) !void {
     if (named) key.items[key.items.len - 1] = image_key.open(img.hash);
-    try imgs.append(a, .{ .pixels = img.pixels, .deferred = img.deferred, .gh = img.gh, .gw = img.gw, .at = @intCast(ids.items.len), .tokens = img.tokens, .hash = img.hash });
+    try imgs.append(a, .{ .pixels = img.pixels, .deferred = img.deferred, .deadline = img.deadline, .gh = img.gh, .gw = img.gw, .at = @intCast(ids.items.len), .tokens = img.tokens, .hash = img.hash });
     for (0..img.tokens) |j| {
         try ids.append(a, token);
         try key.append(a, image_key.row(img.hash, j));

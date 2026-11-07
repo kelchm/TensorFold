@@ -355,12 +355,12 @@ pub const Lanes = struct {
         return p.fits(prompt, max_tokens);
     }
 
-    /// A prompt pass with images: rank 0's tower encodes those past `from`, then every rank holds their rows.
+    /// Borrow descriptors for this prompt; Leader.chunk prepares and broadcasts only the active window.
     fn images(self: *Lanes, s: *lanes.Stream, from: ?engine.Resume) !void {
         if (s.images.len == 0) return;
         const v = self.x.e.images orelse return error.NoVision;
         try v.begin(self.x.e.slot, s.images, if (from) |r| r.at else 0); // a refusal here leaves every rank as it was
-        try self.x.images(v);
+
     }
     const Sink = @import("cuda_prompt_sink.zig").Sink;
 
@@ -706,6 +706,7 @@ pub const Lanes = struct {
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
         const kv = self.lanes.fetchRemove(s) orelse return;
+        defer if (self.x.e.images) |v| v.forget(kv.value.slot);
         self.x.release(kv.value.slot) catch |err| std.log.err("releasing slot {d}: {s}", .{ kv.value.slot, @errorName(err) });
         if (self.lanes.count() == 0) self.x.idle() catch |err| std.log.err("the other ranks' idle step: {s}", .{@errorName(err)});
     }

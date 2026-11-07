@@ -1,4 +1,4 @@
-//! A prompt pass's image rows on every rank: rank 0's tower encodes them, the others receive them, all splice them.
+//! Chunk-scoped media rows on every rank: rank 0 encodes one image/group at a time; all ranks splice the window.
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -8,20 +8,16 @@ const image_core = @import("image_core.zig");
 const image = image_core.For(@import("core").picture);
 const video_mod = @import("video_core.zig").For(@import("core").picture);
 
-/// What a request may hold: image tokens in all (the rows buffer), and images.
+/// Request admission budgets, independent of the shared active-window scratch allocation.
 pub const Limits = struct { image_tokens: u32, max_images: u32, video_tokens: u32 = 0, max_videos: u32 = 0, max_frames: u32 = 0 };
 
 /// Prompt rows [at, at + n) take image rows [row, row + n).
 pub const Span = struct { at: u32, n: u32, row: u32 };
 
-const Saved = struct {
-    rows: cuda.DeviceBuffer,
-    spans: std.ArrayList(Span) = .empty,
-    fn deinit(s: *Saved, a: std.mem.Allocator) void {
-        s.rows.free();
-        s.spans.deinit(a);
-    }
-};
+// Only request-owned descriptors survive a prompt step. Device rows are shared scratch.
+const Saved = struct { images: []const lanes.stream.Image = &.{}, from: usize = 0 };
+pub const step_rows: u32 = 2 * @import("cuda_forward.zig").prefill_rows;
+pub const row_bytes: usize = vcfg.out_hidden * 2;
 
 pub const Images = struct {
     gpa: std.mem.Allocator,
@@ -31,12 +27,13 @@ pub const Images = struct {
     run: vision.Run,
     tower: ?vision.Tower = null, // rank 0's; the other ranks receive the rows
     cfg: ?vcfg.Config = null,
-    rows: cuda.DeviceBuffer, // bf16 [limits.image_tokens][out_hidden]
+    rows: cuda.DeviceBuffer, // shared bf16 [step_rows + one image/group][out_hidden]
     map: cuda.DeviceBuffer, // i32 [max_rows]: a splice's feature row per prompt row
     host_map: []i32,
     limits: Limits,
     spans: std.ArrayList(Span) = .empty,
     saved: std.AutoHashMapUnmanaged(u32, Saved) = .empty,
+    source: Saved = .{},
     slot: u32 = 0, // the sequence the spans belong to: another stream's rows at the same positions take none
     marks: struct { image: u32, open: u32, close: u32 } = .{ .image = 0, .open = 0, .close = 0 },
     mark_ids: [3]u32 = @splat(0), // begin, image, end: text that spells one stays text
@@ -45,6 +42,7 @@ pub const Images = struct {
     /// The chat template writes each image's begin and end itself (the server only expands the image token).
     pub const template_wraps = true;
     pub const fixed_image_tokens: u32 = 2048;
+    pub const lazy_video = true;
     /// A video's frames to patch pairs (Glm5NextVideoProcessor), over core's decoder: each pair goes in as an image.
     pub const video = video_mod;
 
@@ -66,7 +64,7 @@ pub const Images = struct {
         errdefer module.unload();
         v.* = .{ .gpa = gpa, .io = io, .d = d, .module = module, .run = .{ .stream = stream, .f = try vision.Funcs.load(module) }, .cfg = cfg, .rows = undefined, .map = undefined, .host_map = undefined, .limits = limits };
         v.video_ids = cfg.video;
-        v.rows = try cuda.DeviceBuffer.alloc(d, @as(usize, try v.rowLimit()) * vcfg.out_hidden * 2);
+        v.rows = try cuda.DeviceBuffer.alloc(d, v.scratchBytes());
         errdefer v.rows.free();
         v.map = try cuda.DeviceBuffer.alloc(d, max_rows * 4);
         errdefer v.map.free();
@@ -85,8 +83,6 @@ pub const Images = struct {
 
     pub fn deinit(v: *Images) void {
         @import("cuda_load_owner.zig").drain(v.run.stream, v.d);
-        var it = v.saved.valueIterator();
-        while (it.next()) |state| state.deinit(v.gpa);
         v.saved.deinit(v.gpa);
         v.spans.deinit(v.gpa);
         if (v.tower) |*t| t.deinit();
@@ -99,87 +95,140 @@ pub const Images = struct {
 
     /// Device bytes the tower and the buffers hold.
     pub fn bytes(v: *const Images) u64 {
-        var total: u64 = (if (v.tower) |t| t.bytes else 0) + v.rows.len + v.map.len;
-        var it = v.saved.valueIterator();
-        while (it.next()) |owner| total += owner.rows.len;
-        return total;
+        return (if (v.tower) |t| t.bytes else 0) + v.rows.len + v.map.len;
     }
 
-    // The tower and upload map are shared scratch. Feature rows and spans belong to each live sequence.
+    /// One global reservation before pool admission, independent of history length and live stream count.
+    /// The second region lets a whole image/group cross a chunk boundary without changing its tower inputs.
+    pub fn groupLimit(v: *const Images) u32 {
+        return @max(@min(v.limits.image_tokens, fixed_image_tokens), if (v.video_ids != null) @min(v.limits.video_tokens, 16384) else 0);
+    }
+
+    pub fn scratchBytes(v: *const Images) usize {
+        return (@as(usize, step_rows) + v.groupLimit()) * row_bytes;
+    }
+
+    pub fn streamBytes(_: *const Images) usize {
+        return 0; // the shared scratch was allocated before the pool/admission budget was measured
+    }
+
     pub fn activate(v: *Images, slot: u32) !void {
         if (v.slot == slot) return;
-        if (!v.saved.contains(slot)) try v.saved.ensureUnusedCapacity(v.gpa, 1);
-        const next = if (v.saved.fetchRemove(slot)) |entry| entry.value else Saved{
-            .rows = try cuda.DeviceBuffer.alloc(v.d, @as(usize, try v.rowLimit()) * vcfg.out_hidden * 2),
-        };
-        v.saved.putAssumeCapacity(v.slot, .{ .rows = v.rows, .spans = v.spans });
-        v.rows = next.rows;
-        v.spans = next.spans;
+        // Reserve before changing either owner, including when an idle slot has no source descriptors.
+        try v.saved.ensureUnusedCapacity(v.gpa, 1);
+        const next = if (v.saved.fetchRemove(slot)) |entry| entry.value else Saved{};
+        v.saved.putAssumeCapacity(v.slot, v.source);
+        v.finishWindow();
+        v.source = next;
         v.slot = slot;
+    }
+
+    /// Drop borrowed request descriptors even when a peer-link failure prevents a normal release step.
+    pub fn forget(v: *Images, slot: u32) void {
+        if (slot == v.slot) v.source = .{} else _ = v.saved.remove(slot);
     }
 
     pub fn release(v: *Images, slot: u32) void {
-        @import("cuda_load_owner.zig").drain(v.run.stream, v.d);
         if (slot != v.slot) {
-            if (v.saved.fetchRemove(slot)) |entry| {
-                var state = entry.value;
-                state.deinit(v.gpa);
-            }
+            _ = v.saved.remove(slot);
             return;
         }
-        if (slot == 0) {
-            v.clear();
-            return;
+        v.finishWindow();
+        v.source = .{};
+        if (slot != 0) {
+            if (v.saved.fetchRemove(0)) |zero| v.source = zero.value;
+            v.slot = 0;
         }
-        if (v.saved.fetchRemove(0)) |zero| { // slot 0's rows and spans as its stream left them
-            v.rows.free();
-            v.spans.deinit(v.gpa);
-            v.rows = zero.value.rows;
-            v.spans = zero.value.spans;
-        } else v.clear(); // slot 0's stream ended while this slot was bound: this buffer is slot 0's now
-        v.slot = 0;
     }
 
-    pub fn streamBytes(v: *const Images) usize {
-        return @as(usize, v.rowLimit() catch unreachable) * vcfg.out_hidden * 2;
-    }
-
-    /// No rows splice into any pass until another begins (each request's prompt pass starts here).
+    /// Reset the bound request; borrowed descriptors cannot outlive the request arena.
     pub fn clear(v: *Images) void {
+        v.finishWindow();
+        v.source = .{};
+    }
+
+    /// No feature rows survive a prompt step, a failure or a suspension. The shared allocation is retained.
+    pub fn finishWindow(v: *Images) void {
+        if (v.spans.items.len != 0) @import("cuda_load_owner.zig").drain(v.run.stream, v.d);
         v.spans.clearRetainingCapacity();
     }
 
-    /// Rank 0: a prompt pass on `slot` from row `from`: the images whose rows end past it, through the tower.
+    /// Register the request's descriptors only. A cached prefix never materializes here or at a later chunk.
     pub fn begin(v: *Images, slot: u32, images: []const lanes.stream.Image, from: usize) !void {
         try v.activate(slot);
         v.clear();
-        errdefer v.clear();
-        const t = &(v.tower orelse return error.NoVision);
-        var row: u32 = 0;
+        var end: u64 = 0;
+        var total: u64 = 0;
         for (images) |img| {
-            if (img.gh * img.gw != img.tokens * vcfg.patches_per_token) return error.ImageOutOfStep;
-            if (img.at + img.tokens <= from) continue; // in the kept state already
-            if (img.tokens > (try v.rowLimit()) -| row) return error.ImageRows; // the server holds a request to its limits
-            var scratch: std.heap.ArenaAllocator = .init(v.gpa);
-            defer scratch.deinit();
-            const pixels = try img.materialize(scratch.allocator());
-            try t.encode(&v.run, pixels, .{ 1, img.gh, img.gw }, v.rows.ptr + @as(u64, row) * vcfg.out_hidden * 2);
-            try v.spans.append(v.gpa, .{ .at = img.at, .n = img.tokens, .row = row });
-            row += img.tokens;
+            if (img.tokens == 0 or img.tokens > v.groupLimit() or @as(u64, img.gh) * img.gw != @as(u64, img.tokens) * vcfg.patches_per_token) return error.ImageOutOfStep;
+            if (img.at < end) return error.ImageOutOfStep;
+            end = @as(u64, img.at) + img.tokens;
+            if (end > std.math.maxInt(u32)) return error.ImageOutOfStep;
+            total += img.tokens;
+            if (total > try v.rowLimit()) return error.ImageRows;
         }
-        v.slot = slot;
+        v.source = .{ .images = images, .from = from };
     }
 
-    /// The other ranks: rank 0's spans (as `words`: at, n, row a span) on `slot`; the rows arrive into `rows` next.
+    pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) bool };
+
+    fn encode(v: *Images, pixels: []const f32, img: lanes.stream.Image, out: u64) !void {
+        const t = if (v.tower) |*tower| tower else return error.NoVision;
+        try t.encode(&v.run, pixels, .{ 1, img.gh, img.gw }, out);
+    }
+
+    pub fn window(v: *Images, lo: usize, hi: usize, cancel: ?Cancel) !void {
+        return v.windowWith(lo, hi, cancel, v, encode);
+    }
+
+    /// The production owner/selection/copy path, with the tower operation parameterized for recording drivers.
+    pub fn windowWith(v: *Images, lo: usize, hi: usize, cancel: ?Cancel, ctx: anytype, comptime encodeFn: anytype) !void {
+        v.finishWindow();
+        if (hi < lo or hi - lo > step_rows) return error.BadWindow;
+        // Drain even if the first encode/copy fails before a span is published.
+        errdefer {
+            @import("cuda_load_owner.zig").drain(v.run.stream, v.d);
+            v.spans.clearRetainingCapacity();
+        }
+        const from = @max(lo, v.source.from);
+        var row: u32 = 0;
+        for (v.source.images) |img| {
+            const end = @as(usize, img.at) + img.tokens;
+            const first = @max(from, img.at);
+            const last = @min(hi, end);
+            if (first >= last) continue;
+            var scratch: std.heap.ArenaAllocator = .init(v.gpa);
+            defer scratch.deinit();
+            const pixels = try img.materializeChecked(scratch.allocator(), if (cancel) |c| .{ .ptr = c.ptr, .check = c.check } else null);
+            const count: u32 = @intCast(last - first);
+            const dst = v.rows.ptr + @as(u64, row) * row_bytes;
+            const whole = first == img.at and count == img.tokens;
+            const out = if (whole) dst else v.rows.ptr + @as(u64, step_rows) * row_bytes;
+            // Inputs retain the original full grid, even when this chunk consumes only its middle.
+            try encodeFn(ctx, pixels, img, out);
+            try img.checkWork(if (cancel) |c| .{ .ptr = c.ptr, .check = c.check } else null);
+            if (!whole) try v.d.check(v.d.api.cuMemcpyDtoDAsync_v2(dst, out + (first - img.at) * row_bytes, @as(usize, count) * row_bytes, v.run.stream.handle), "cuMemcpyDtoDAsync media slice");
+            // One input's scoped CPU arena and pinned upload ownership end before the next input starts.
+            try v.run.stream.synchronize();
+            try v.spans.append(v.gpa, .{ .at = @intCast(first), .n = count, .row = row });
+            row += count;
+        }
+    }
+
+    /// Other ranks take the active window's spans (at, n, row), then receive exactly rowCount() rows.
     pub fn take(v: *Images, slot: u32, words: []const u32) !void {
         try v.activate(slot);
-        v.clear();
-        errdefer v.clear();
+        v.spans.clearRetainingCapacity();
+        errdefer v.spans.clearRetainingCapacity();
         if (words.len % 3 != 0) return error.BadStep;
         var i: usize = 0;
         while (i < words.len) : (i += 3) {
             const sp: Span = .{ .at = words[i], .n = words[i + 1], .row = words[i + 2] };
-            if (sp.row > try v.rowLimit() or sp.n > (try v.rowLimit()) - sp.row) return error.ImageRows;
+            if (sp.n == 0 or sp.row != v.rowCount() or sp.row > step_rows or sp.n > step_rows - sp.row or @as(u64, sp.at) + sp.n > std.math.maxInt(u32)) return error.ImageRows;
+            if (v.spans.items.len > 0) {
+                const prev = v.spans.items[v.spans.items.len - 1];
+                if (sp.at < @as(u64, prev.at) + prev.n) return error.ImageRows;
+            }
             try v.spans.append(v.gpa, sp);
         }
         v.slot = slot;
@@ -223,7 +272,7 @@ pub const Images = struct {
 
     /// A video's sampled frames as patch pairs within `max_tokens` and `max_frames` (the server's prepare).
     pub fn prepareVideo(v: *const Images, a: std.mem.Allocator, s: video.Source, max_tokens: u32, max_frames: u32) !video.Prepared {
-        return video.prepare(a, s, v.cfg.?, @min(max_tokens, 16384), @min(max_frames, 128));
+        return video.prepareLazy(a, s, v.cfg.?, @min(max_tokens, 16384), @min(max_frames, 128));
     }
 
     /// An image's bytes as the tower reads them, at most `max_tokens` tokens (the server's prepare).

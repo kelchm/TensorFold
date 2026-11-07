@@ -16,7 +16,7 @@ pub fn offer(v: anytype, open: ?api.VisionOpen) ?api.Vision {
             var out: api.PreparedImage = .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .tokens = p.tokens, .hash = p.hash };
             if (comptime @hasField(@TypeOf(p), "source_pixels")) out.source_pixels = p.source_pixels;
             if (comptime @hasField(@TypeOf(p), "deferred")) if (p.deferred) |lazy| {
-                out.deferred = .{ .ctx = lazy.ctx, .prepare = lazy.prepare };
+                out.deferred = .{ .ctx = lazy.ctx, .prepare = lazy.prepare, .checked = lazy.checked };
             };
             return out;
         }
@@ -52,6 +52,7 @@ pub fn offer(v: anytype, open: ?api.VisionOpen) ?api.Vision {
         out.video = .{ .prepare = Video(T).prepare, .video_token = vm[1], .group_open = x.marks.open, .group_close = x.marks.close, .markers = vm, .video_tokens = x.limits.video_tokens, .max_videos = x.limits.max_videos, .max_frames = x.limits.max_frames };
     };
     if (comptime @hasDecl(T, "fixed_image_tokens")) if (out.video) |*video| {
+        if (comptime @hasDecl(T, "lazy_video")) video.lazy = T.lazy_video;
         video.per_video_tokens = 16384;
         video.max_frames = @min(video.max_frames, 128);
     };
@@ -76,11 +77,19 @@ fn Video(comptime T: type) type {
 
         fn prepare(ctx: *anyopaque, a: Allocator, src: api.VideoSource, max_tokens: u32, max_frames: u32) anyerror!api.PreparedVideo {
             const t: *T = @ptrCast(@alignCast(ctx));
-            var ad: @This() = .{ .src = src };
-            const s: T.video.Source = .{ .frames = src.frames, .rate_num = src.rate_num, .rate_den = src.rate_den, .width = src.width, .height = src.height, .ctx = &ad, .decode = decode };
+            var local: @This() = .{ .src = src };
+            const ad = if (comptime @hasDecl(T, "lazy_video")) try a.create(@This()) else &local;
+            ad.* = .{ .src = src };
+            var s: T.video.Source = .{ .frames = src.frames, .rate_num = src.rate_num, .rate_den = src.rate_den, .width = src.width, .height = src.height, .ctx = ad, .decode = decode };
+            if (comptime @hasField(T.video.Source, "identity")) s.identity = src.identity;
             const p = try t.prepareVideo(a, s, max_tokens, max_frames);
             const groups = try a.alloc(api.PreparedImage, p.groups.len);
-            for (groups, p.groups) |*g, q| g.* = .{ .pixels = q.pixels, .gh = q.gh, .gw = q.gw, .tokens = q.tokens, .hash = q.hash };
+            for (groups, p.groups) |*g, q| {
+                g.* = .{ .pixels = q.pixels, .gh = q.gh, .gw = q.gw, .tokens = q.tokens, .hash = q.hash };
+                if (comptime @hasField(@TypeOf(q), "deferred")) if (q.deferred) |d| {
+                    g.deferred = .{ .ctx = d.ctx, .prepare = d.prepare, .checked = d.checked };
+                };
+            }
             return .{ .groups = groups, .times = p.times };
         }
     };

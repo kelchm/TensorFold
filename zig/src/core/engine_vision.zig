@@ -11,6 +11,7 @@ pub const PreparedImage = struct {
     hash: u64,
     source_pixels: u64 = 0,
     deferred: ?@import("lanes").stream.Image.Deferred = null,
+    deadline: @FieldType(@import("lanes").stream.Image, "deadline") = null,
     /// The image as tower inputs in order, each image tokens between `before` and `after`; empty: `pixels` alone.
     pieces: []const Piece = &.{},
 };
@@ -50,6 +51,7 @@ pub const Vision = struct {
 
 /// A video's facts as the server's decoder reads them, and its frames on request.
 pub const VideoSource = struct {
+    identity: ?u64 = null, // encoded bytes of a replayable request-owned source
     frames: u64, // the stream's frame count
     rate_num: u64, // its average frame rate, num / den
     rate_den: u64,
@@ -71,6 +73,7 @@ pub const PreparedVideo = struct { groups: []PreparedImage, times: []f64, labels
 
 /// Video input an engine serves (``Vision.video``): how a decoded video becomes images and how the prompt holds them.
 pub const VideoOffer = struct {
+    lazy: bool = false, // prepare retains a replayable source instead of the caller's open decoder
     /// ``src`` at most ``max_tokens`` tokens and ``max_frames`` sampled frames; allocated in ``a``.
     prepare: *const fn (ctx: *anyopaque, a: Allocator, src: VideoSource, max_tokens: u32, max_frames: u32) anyerror!PreparedVideo,
     /// The token the chat template writes once per video, expanded to its groups.

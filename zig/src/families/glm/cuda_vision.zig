@@ -418,6 +418,7 @@ pub const Tower = struct {
         }
         var scratch = try cuda.DeviceBuffer.alloc(d, scratchBytes(N, seg));
         defer scratch.free();
+        errdefer @import("cuda_load_owner.zig").drain(ru.stream, d);
         var at: u64 = scratch.ptr;
         const take = struct {
             fn f(p: *u64, n: i64) u64 {

@@ -6,6 +6,7 @@ const vision = @import("vision_config.zig");
 pub const Deferred = struct {
     ctx: *const anyopaque,
     prepare: *const fn (ctx: *const anyopaque, a: std.mem.Allocator) anyerror![]const f32,
+    checked: ?*const fn (ctx: *const anyopaque, a: std.mem.Allocator, check_ctx: ?*anyopaque, check: *const fn (?*anyopaque) anyerror!void) anyerror![]const f32 = null,
 };
 
 pub const Prepared = struct {
@@ -112,6 +113,22 @@ pub fn For(comptime picture: type) type {
                 const self: *const Lazy = @ptrCast(@alignCast(ctx));
                 return (try prepare(self.io, a, self.bytes, self.config, self.max_tokens)).pixels;
             }
+
+            fn checked(ctx: *const anyopaque, a: std.mem.Allocator, check_ctx: ?*anyopaque, check: *const fn (?*anyopaque) anyerror!void) anyerror![]const f32 {
+                const self: *const Lazy = @ptrCast(@alignCast(ctx));
+                try check(check_ctx);
+                var img = try picture.decode(self.io, a, self.bytes);
+                defer img.deinit(a);
+                try check(check_ctx);
+                const c = self.config;
+                const g = try geometry(@intCast(img.height), @intCast(img.width), @min(c.min_tokens, self.max_tokens), self.max_tokens);
+                const resized = try picture.resample.resize(a, .torch, .of(img.pixels, img.width, img.height), g.content_w, g.content_h);
+                defer a.free(resized);
+                try check(check_ctx);
+                const pixels = try patchify(a, .{ .width = g.content_w, .height = g.content_h, .pixels = resized }, g, c.mean, c.std);
+                try check(check_ctx);
+                return pixels;
+            }
         };
 
         /// Validate in temporary memory, retaining encoded bytes and geometry rather than all float patches.
@@ -124,7 +141,7 @@ pub fn For(comptime picture: type) type {
             const grid = [2]u32{ g.target_h / vision.patch, g.target_w / vision.patch };
             const lazy = try a.create(Lazy);
             lazy.* = .{ .io = io, .bytes = bytes, .config = c, .max_tokens = max_tokens };
-            return .{ .pixels = &.{}, .source_pixels = @as(u64, img.width) * img.height, .gh = grid[0], .gw = grid[1], .tokens = grid[0] * grid[1] / vision.patches_per_token, .hash = preparedHash(picture.identity.ofBytes(0x1a6e, bytes), c, g), .deferred = .{ .ctx = lazy, .prepare = Lazy.materialize } };
+            return .{ .pixels = &.{}, .source_pixels = @as(u64, img.width) * img.height, .gh = grid[0], .gw = grid[1], .tokens = grid[0] * grid[1] / vision.patches_per_token, .hash = preparedHash(picture.identity.ofBytes(0x1a6e, bytes), c, g), .deferred = .{ .ctx = lazy, .prepare = Lazy.materialize, .checked = Lazy.checked } };
         }
 
         /// Bytes to patches: decoded, fitted with Torch's uint8 bicubic resize, padded and cut.

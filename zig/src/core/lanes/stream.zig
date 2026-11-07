@@ -106,10 +106,12 @@ pub const Image = struct {
     pub const Deferred = struct {
         ctx: *const anyopaque,
         prepare: *const fn (ctx: *const anyopaque, a: Allocator) anyerror![]const f32,
+        checked: ?*const fn (ctx: *const anyopaque, a: Allocator, check_ctx: ?*anyopaque, check: *const fn (?*anyopaque) anyerror!void) anyerror![]const f32 = null,
     };
 
     pixels: []const f32,
     deferred: ?Deferred = null,
+    deadline: ?struct { io: std.Io, at: std.Io.Timestamp } = null,
 
     gh: u32,
     gw: u32,
@@ -119,7 +121,33 @@ pub const Image = struct {
 
     /// Patches live only in the caller's scoped allocator; encoded input lives with the request.
     pub fn materialize(img: Image, a: Allocator) ![]const f32 {
-        return if (img.deferred) |d| try d.prepare(d.ctx, a) else img.pixels;
+        return img.materializeChecked(a, null);
+    }
+
+    pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) bool };
+
+    pub fn checkWork(img: Image, cancel: ?Cancel) !void {
+        if (cancel) |c| if (c.check(c.ptr)) return error.Cancelled;
+        if (img.deadline) |d| if (std.Io.Clock.awake.now(d.io).nanoseconds >= d.at.nanoseconds) return error.MediaDeadline;
+    }
+
+    pub fn materializeChecked(img: Image, a: Allocator, cancel: ?Cancel) ![]const f32 {
+        const Check = struct {
+            image: Image,
+            cancel: ?Cancel,
+            fn run(ptr: ?*anyopaque) anyerror!void {
+                const c: *@This() = @ptrCast(@alignCast(ptr.?));
+                try c.image.checkWork(c.cancel);
+            }
+        };
+        var c: Check = .{ .image = img, .cancel = cancel };
+        try Check.run(&c);
+        const pixels = if (img.deferred) |d|
+            if (d.checked) |f| try f(d.ctx, a, &c, Check.run) else try d.prepare(d.ctx, a)
+        else
+            img.pixels;
+        try Check.run(&c);
+        return pixels;
     }
 };
 

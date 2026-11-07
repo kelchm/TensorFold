@@ -70,6 +70,21 @@ const Decoder = struct {
     }
 };
 
+const LazyDecoder = struct {
+    bytes: []const u8,
+
+    fn decode(ctx: *anyopaque, indices: []const u32, sink: api.FrameSink) anyerror!void {
+        const self: *const LazyDecoder = @ptrCast(@alignCast(ctx));
+        return self.decodeWith(indices, sink, api.tfvideo.Video);
+    }
+
+    fn decodeWith(self: *const LazyDecoder, indices: []const u32, sink: api.FrameSink, comptime Video: type) !void {
+        const video = try Video.open(self.bytes);
+        defer video.close();
+        try video.frames(indices, Decoder.Into{ .sink = sink });
+    }
+};
+
 /// Video `i` (0-based) of the request at `url`, prepared within `max_tokens` tokens.
 pub fn prepare(
     cx: *Cx,
@@ -114,7 +129,7 @@ pub fn prepare(
         "video {d}: videos are limited to {d} minutes",
         .{ i + 1, max_seconds / 60 },
     ));
-    const src: api.VideoSource = .{
+    var src: api.VideoSource = .{
         .frames = @intCast(info.frames),
         .rate_num = @intCast(info.rate_num),
         .rate_den = @intCast(info.rate_den),
@@ -123,6 +138,13 @@ pub fn prepare(
         .ctx = &d,
         .decode = Decoder.decode,
     };
+    if (offer.lazy) {
+        const lazy = try cx.a.create(LazyDecoder);
+        lazy.* = .{ .bytes = bytes };
+        src.ctx = lazy;
+        src.decode = LazyDecoder.decode;
+        src.identity = std.hash.Wyhash.hash(0x7466766964656f03, bytes);
+    }
     return offer.prepare(ctx, cx.a, src, max_tokens, offer.max_frames) catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.VideoTooShort => cx.refuse(try std.fmt.allocPrint(
@@ -257,4 +279,49 @@ test "a template that writes no image placeholder is named as the cause, a misco
     cx = .{ .a = a };
     try std.testing.expectError(error.Refused, images.expand(v, null, images.MarkText.text(), &cx, two, &[_]u32{ 1, 9 }, 0));
     try std.testing.expectEqualStrings("the chat template wrote 1 image placeholders for 2 image parts", cx.message);
+}
+
+test "media lifecycle: server lazy decoder closes each group on success decode failure and cancellation" {
+    const Recorder = struct {
+        var active: usize = 0;
+        var opens: usize = 0;
+        var failed = false;
+        fn open(bytes: []const u8) !@This() {
+            try std.testing.expectEqualStrings("request-owned bytes", bytes);
+            active += 1;
+            opens += 1;
+            return .{};
+        }
+        fn close(_: @This()) void {
+            active -= 1;
+        }
+        fn frames(_: @This(), indices: []const u32, sink: anytype) !void {
+            try std.testing.expectEqualSlices(u32, &.{ 7, 9 }, indices);
+            if (failed) return error.RecordedDecodeFailure;
+            try sink.take(0, &.{ 1, 2, 3 }, 1, 1, 3);
+        }
+        fn take(ctx: *anyopaque, _: usize, _: []const u8, _: u32, _: u32, _: usize) anyerror!void {
+            const cancelled: *bool = @ptrCast(@alignCast(ctx));
+            if (cancelled.*) return error.Cancelled;
+        }
+    };
+    Recorder.active = 0;
+    Recorder.opens = 0;
+    Recorder.failed = false;
+    const decoder: LazyDecoder = .{ .bytes = "request-owned bytes" };
+    var cancelled = false;
+    const sink: api.FrameSink = .{ .ctx = &cancelled, .take = Recorder.take };
+    try decoder.decodeWith(&.{ 7, 9 }, sink, Recorder);
+    try std.testing.expectEqual(@as(usize, 0), Recorder.active);
+    Recorder.failed = true;
+    try std.testing.expectError(error.RecordedDecodeFailure, decoder.decodeWith(&.{ 7, 9 }, sink, Recorder));
+    try std.testing.expectEqual(@as(usize, 0), Recorder.active);
+    Recorder.failed = false;
+    cancelled = true;
+    try std.testing.expectError(error.Cancelled, decoder.decodeWith(&.{ 7, 9 }, sink, Recorder));
+    try std.testing.expectEqual(@as(usize, 0), Recorder.active);
+    cancelled = false;
+    try decoder.decodeWith(&.{ 7, 9 }, sink, Recorder);
+    try std.testing.expectEqual(@as(usize, 4), Recorder.opens);
+    try std.testing.expectEqual(@as(usize, 0), Recorder.active);
 }

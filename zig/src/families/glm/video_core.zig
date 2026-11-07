@@ -12,6 +12,7 @@ pub fn For(comptime picture: type) type {
 
         /// A decoded video's facts (the PyAV loader's VideoMetadata) and its frames on request.
         pub const Source = struct {
+            identity: ?u64 = null, // non-null only for a replayable, request-owned encoded source
             frames: u64, // the stream's frame count
             rate_num: u64, // its average frame rate, num / den
             rate_den: u64,
@@ -37,15 +38,19 @@ pub fn For(comptime picture: type) type {
             frames: []u8, // [n, content_h, content_w, 3]
             scratch: std.mem.Allocator,
             got: usize = 0,
+            check_ctx: ?*anyopaque = null,
+            check: ?*const fn (?*anyopaque) anyerror!void = null,
 
             /// Frame `k` of the plan, `w` x `h` RGB rows `stride` bytes apart.
-            pub fn take(s: *Sink, k: usize, rgb: []const u8, w: u32, h: u32, stride: usize) Error!void {
+            pub fn take(s: *Sink, k: usize, rgb: []const u8, w: u32, h: u32, stride: usize) anyerror!void {
+                if (s.check) |check| try check(s.check_ctx);
                 const p = s.plan;
                 if (k != s.got or k >= p.indices.len or w != p.width or h != p.height) return error.BadVideo;
                 const dst = s.frames[k * p.frameBytes() ..][0..p.frameBytes()];
                 const frame: picture.resample.View = .{ .pixels = rgb, .width = w, .height = h, .stride = stride };
                 // torchvision's uint8 resize
                 try picture.resample.into(s.scratch, .torch, frame, p.content_w, p.content_h, dst);
+                if (s.check) |check| try check(s.check_ctx);
                 s.got += 1;
             }
         };
@@ -217,8 +222,62 @@ pub fn For(comptime picture: type) type {
         }
 
         /// One pair of frames ready for the tower, and the video's.
-        pub const Pair = struct { pixels: []f32, gh: u32, gw: u32, tokens: u32, hash: u64 };
+        pub const Pair = struct { pixels: []f32, deferred: ?@import("image_core.zig").Deferred = null, gh: u32, gw: u32, tokens: u32, hash: u64 };
         pub const Prepared = struct { groups: []Pair, times: []f64 };
+
+        const LazyGroup = struct {
+            source: Source,
+            plan: Plan, // one pair's indices, borrowed from the request's sampling plan
+            config: vision.Config,
+
+            fn noop(_: ?*anyopaque) anyerror!void {}
+
+            fn materialize(ctx: *const anyopaque, a: std.mem.Allocator) anyerror![]const f32 {
+                return checked(ctx, a, null, noop);
+            }
+
+            fn checked(ctx: *const anyopaque, a: std.mem.Allocator, check_ctx: ?*anyopaque, check: *const fn (?*anyopaque) anyerror!void) anyerror![]const f32 {
+                const self: *const LazyGroup = @ptrCast(@alignCast(ctx));
+                try check(check_ctx);
+                const p = self.plan;
+                const frames = try a.alloc(u8, p.indices.len * p.frameBytes());
+                defer a.free(frames);
+                // Resampler scratch is group-owned as well; no frame or float patches live with the request.
+                var arena: std.heap.ArenaAllocator = .init(a);
+                defer arena.deinit();
+                var sink: Sink = .{ .plan = &p, .frames = frames, .scratch = arena.allocator(), .check_ctx = check_ctx, .check = check };
+                try self.source.decode(self.source.ctx, p.indices, &sink);
+                try check(check_ctx);
+                if (sink.got != p.indices.len) return error.BadVideo;
+                const groups = try patchify(a, p, frames, self.config.mean, self.config.std);
+                defer a.free(groups);
+                try check(check_ctx);
+                return groups[0].pixels;
+            }
+        };
+
+        /// Preserve the sampling, grid and all groups; defer decoding/float patches to a single active pair.
+        /// Encoded-byte + processor + plan identity intentionally cannot match the old eager-pixel namespace.
+        pub fn prepareLazy(a: std.mem.Allocator, s: Source, c: vision.Config, max_tokens: u32, max_frames: u32) anyerror!Prepared {
+            const id = s.identity orelse return prepare(a, s, c, max_tokens, max_frames);
+            const p = try plan(a, s, c, max_tokens, max_frames);
+            const groups = try a.alloc(Pair, p.pairs());
+            for (groups, 0..) |*g, index| {
+                var pair = p;
+                pair.indices = p.indices[2 * index .. @min(p.indices.len, 2 * index + 2)];
+                pair.times = p.times[index..][0..1];
+                const lazy = try a.create(LazyGroup);
+                lazy.* = .{ .source = s, .plan = pair, .config = c };
+                var hash = std.hash.Wyhash.init(0x676c6d76696403);
+                hash.update(std.mem.asBytes(&id));
+                hash.update(std.mem.asBytes(&c.mean));
+                hash.update(std.mem.asBytes(&c.std));
+                hash.update(std.mem.sliceAsBytes(&[_]u32{ p.width, p.height, p.target_h, p.target_w, p.content_h, p.content_w }));
+                hash.update(std.mem.sliceAsBytes(pair.indices));
+                g.* = .{ .pixels = &.{}, .deferred = .{ .ctx = lazy, .prepare = LazyGroup.materialize, .checked = LazyGroup.checked }, .gh = p.target_h / vision.patch, .gw = p.target_w / vision.patch, .tokens = p.tokensPerPair(), .hash = hash.final() };
+            }
+            return .{ .groups = groups, .times = p.times };
+        }
 
         /// `s` decoded, resized as it decodes, then normalized and cut into pairs (allocated in `a`).
         pub fn prepare(a: std.mem.Allocator, s: Source, c: vision.Config, max_tokens: u32, max_frames: u32) anyerror!Prepared {

@@ -241,6 +241,17 @@ pub const Leader = struct {
 
     /// `cancel` (rank 0's), asked before each chunk, decides for every rank; `from` every rank holds; `marks` rank 0's.
     pub fn prefill(x: Leader, ids: []const u32, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !u32 {
+        // Whole-prompt mode must use the same bounded media protocol as stepped prefill. Text keeps its path.
+        if (x.e.images) |v| if (v.source.images.len != 0) {
+            var at: usize = if (from) |r| r.at else 0;
+            var resumed = from;
+            while (true) {
+                const step = try x.chunk(ids, at, false, resumed, cancel, marks);
+                if (step.first) |first| return first;
+                at += step.rows;
+                resumed = null;
+            }
+        };
         try x.flush();
         try x.send(.{ .kind = @backingInt(Kind.prefill), .flags = x.rows(), .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0 }, ids);
         return x.e.prefill(ids, from, cancel, marks);
@@ -253,10 +264,36 @@ pub const Leader = struct {
         const n: usize = if (pair and x.e.pairedAt(start, ids.len, from, marks)) 2 else 1;
         const part = ids[start..@min(ids.len, start + n * engine.prompt_rows + 1)];
         const split = sparse.splitAt(start, x.e.settings.index_split, x.e.share.world); // a paired step's chunks share it
-        try x.send(.{ .kind = @backingInt(Kind.chunk), .flags = x.rows() | @as(u32, @intFromBool(split)) << 1, .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
+        const cancelled_media = try x.announceChunk(part, start, ids.len, n, from, cancel, split);
+        defer if (x.e.images) |v| v.finishWindow();
         x.e.index_split = split;
-        const first = try x.e.prefillChunk(part, start, ids.len, from, cancel, marks);
+        const first = try x.e.prefillChunk(part, start, ids.len, from, if (cancelled_media) .{ .ptr = null, .check = cancelMedia } else cancel, marks);
         return .{ .first = first, .rows = @min(ids.len - start, n * engine.prompt_rows) };
+    }
+
+    fn cancelMedia(_: ?*anyopaque) bool {
+        return true;
+    }
+
+    /// Prepare before telling peers to enter forward collectives. A lazy cancellation still sends the chunk:
+    /// its ordinary gate broadcasts cancellation and keeps the interrupted prefix on every rank.
+    /// Exposed separately so recording drivers exercise the real header/rows/header order without a model.
+    pub fn announceChunk(x: Leader, part: []const u32, start: usize, len: usize, chunks: usize, from: ?engine.Resume, cancel: ?engine.Cancel, split: bool) !bool {
+        return x.announceChunkWith(part, start, len, chunks, from, cancel, split, images_mod.Images.window);
+    }
+
+    pub fn announceChunkWith(x: Leader, part: []const u32, start: usize, len: usize, chunks: usize, from: ?engine.Resume, cancel: ?engine.Cancel, split: bool, comptime prepare: anytype) !bool {
+        errdefer if (x.e.images) |v| v.finishWindow();
+        var cancelled_media = false;
+        if (x.e.images) |v| if (v.source.images.len != 0) {
+            prepare(v, start, @min(len, start + chunks * engine.prompt_rows), if (cancel) |c| .{ .ptr = c.ptr, .check = c.check } else null) catch |err| switch (err) {
+                error.Cancelled => cancelled_media = true,
+                else => return err,
+            };
+            try x.images(v);
+        };
+        try x.send(.{ .kind = @backingInt(Kind.chunk), .flags = x.rows() | @as(u32, @intFromBool(split)) << 1, .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(len) }, part);
+        return cancelled_media;
     }
 
     /// `bits`: the rows' grammar words (structured output, with Engine.structured), else 0.
@@ -407,6 +444,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
             };
         },
         .chunk => {
+            defer if (e.images) |v| v.finishWindow();
             const ids = try e.gpa.dupe(u32, ids_in);
             defer e.gpa.free(ids);
             const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
