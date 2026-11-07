@@ -620,6 +620,20 @@ pub const Engine = struct {
         const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .taps = if (e.drafter) |dr| dr.taps(false) else null, .side = e.side, .moe_fuse = e.moe_fuse };
         try f.run(@ptrCast(ids[0..rows]));
         if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
+        // every part greedy (no grammar, no sampled stream; the same on every rank): all rows in one pick, one launch,
+        // one gather, one sync and one read, each row's token as its part's own draw picks it
+        var all_greedy = !e.structured;
+        for (parts) |p| all_greedy = all_greedy and e.seqs.items[p.slot].?.sampling == null;
+        if (all_greedy) {
+            var outs: [shared_rows]u32 = undefined;
+            for (parts, segs[0..parts.len]) |p, g| {
+                try e.bind(p.slot);
+                e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;
+            }
+            try @import("cuda_engine_pick.zig").greedyRows(e, b.logits, rows, outs[0..rows]);
+            for (parts, segs[0..parts.len]) |p, g| @memcpy(p.out[0..g.rows], outs[g.row0..][0..g.rows]);
+            return;
+        }
         for (parts, segs[0..parts.len]) |p, g| {
             try e.bind(p.slot);
             e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;

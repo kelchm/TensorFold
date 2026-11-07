@@ -246,6 +246,12 @@ extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1_sums(const unsign
                                                                      unsigned lo, unsigned* out) {
   glm_top1<true>(logits, n, lo, out);
 }
+// A window's greedy picks in one launch: block r runs tf_glm_top1 on row r (rows `ld` logits apart, words 4 apart),
+// so each row's words are a per-row launch's bit for bit.
+extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1_rows(const unsigned short* logits, int64_t n,
+                                                                     int64_t ld, unsigned lo, unsigned* out) {
+  glm_top1<false>(logits + static_cast<int64_t>(blockIdx.x) * ld, n, lo, out + static_cast<int64_t>(blockIdx.x) * 4);
+}
 
 // The leader's step for the other ranks, written to the link's buffer from launch arguments (cuda_follow's Link.send).
 struct tf_glm_words {
