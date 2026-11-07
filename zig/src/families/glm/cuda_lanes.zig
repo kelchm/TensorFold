@@ -20,9 +20,13 @@ pub const max_rows = fw.window_rows;
 const mtp_rows = 1 + engine.max_drafts;
 const max_held = dflash.BLOCK - 1; // a DFlash2 block's drafts (the MTP head's chains stop at max_drafts)
 
-/// With DFlash2: a window's ms by rows on two GB10s (EXL3, TF_GLM_PROF: 86 to 107 ms at 5 to 8), shared as glm_cuda's.
-const gb10_window_costs = costTable(max_rows, 52.0, 6.8);
-const gb10_shared_costs = costTable(engine.shared_rows, 76.0, 4.1);
+/// With DFlash2: a verify forward's ms by rows on two GB10s, fitted on this pair from 587 TF_GLM_DFLASH2_TRACE
+/// records over forced widths 1..8 (lone: 38.73 + 5.68 a row, r2 0.9983; shared forwards by total rows:
+/// 47.38 + 5.05, r2 0.9934). The earlier 52.0/6.8 and 76.0/4.1 over-priced a forward by 34% and 60% at one row,
+/// which starved depth.zig's overhead learner (ms - forward, clamped at zero): of 139 measured two-lane forwards
+/// only 4 could have fired it, against 133 at these prices, where it learns 3 to 8 ms.
+const gb10_window_costs = costTable(max_rows, 38.73, 5.68);
+const gb10_shared_costs = costTable(engine.shared_rows, 47.38, 5.05);
 
 fn costTable(comptime n: usize, comptime one: f64, comptime row: f64) [n]lanes.config.Cost {
     var c: [n]lanes.config.Cost = undefined;
