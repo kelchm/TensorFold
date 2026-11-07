@@ -237,6 +237,153 @@ __device__ __forceinline__ void finish(const __nv_bfloat16* x, const float* part
 
 }  // namespace glm_hc
 
+namespace glm_hc {
+
+// finish's collapse of one thread's columns (column thread `ct`): its 16 collapsed values and their sum of squares,
+// finish's ops in finish's order.
+__device__ __forceinline__ void collapse(const uint4 (&xu)[2][4], float p0, float p1, float p2, float p3, float (&c)[16],
+                                         float& acc) {
+  for (int k = 0; k < 16; ++k) {
+    const __nv_bfloat16* h0 = reinterpret_cast<const __nv_bfloat16*>(&xu[k / 8][0]);
+    const __nv_bfloat16* h1 = reinterpret_cast<const __nv_bfloat16*>(&xu[k / 8][1]);
+    const __nv_bfloat16* h2 = reinterpret_cast<const __nv_bfloat16*>(&xu[k / 8][2]);
+    const __nv_bfloat16* h3 = reinterpret_cast<const __nv_bfloat16*>(&xu[k / 8][3]);
+    const float x0 = bf(h0[k % 8]), x1 = bf(h1[k % 8]), x2 = bf(h2[k % 8]), x3 = bf(h3[k % 8]);
+    float m = k % 2 == 0 ? __fmaf_rn(p1, x1, __fmul_rn(p0, x0)) : __fmaf_rn(p0, x0, __fmul_rn(p1, x1));
+    m = __fmaf_rn(p2, x2, m);
+    c[k] = rbf(__fmaf_rn(p3, x3, m));
+  }
+  acc = __fmaf_rn(c[0], c[0], __fmul_rn(c[1], c[1]));
+  for (int k = 2; k < 16; ++k) acc = k % 2 == 0 ? __fmaf_rn(c[k], c[k], acc) : fadd(fmul(c[k], c[k]), acc);
+}
+
+// finish's normed output and 64-sums of column thread `ct`'s values (the 8-lane groups of its warp).
+template <typename W>
+__device__ __forceinline__ void emit(const float (&c)[16], const Weights<W>& wu, float rinv, __nv_bfloat16* out,
+                                     float* xs, int64_t r, int ct) {
+  constexpr int D = 4096;
+  for (int rep = 0; rep < 2; ++rep) {
+    float y[8];
+    uint4 ou;
+    __nv_bfloat16* oh = reinterpret_cast<__nv_bfloat16*>(&ou);
+    for (int j = 0; j < 8; ++j) {
+      const __nv_bfloat16 o = __float2bfloat16_rn(__fmul_rn(wu.at(rep, j), rbf(__fmul_rn(rinv, c[rep * 8 + j]))));
+      oh[j] = o;
+      y[j] = bf(o);
+    }
+    *reinterpret_cast<uint4*>(out + r * D + rep * 2048 + ct * 8) = ou;
+    float g = y[0] + y[1];
+    for (int j = 2; j < 8; ++j) g = y[j] + g;
+    for (int o = 4; o > 0; o >>= 1) g = g + __shfl_xor_sync(0xffffffffu, g, o);
+    if ((ct & 7) == 0) xs[r * (D / 64) + rep * 32 + ct / 8] = g;
+  }
+}
+
+__device__ __forceinline__ void bar_sync(int id, int n) { asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(n) : "memory"); }
+__device__ __forceinline__ void bar_arrive(int id, int n) { asm volatile("bar.arrive %0, %1;" ::"r"(id), "r"(n) : "memory"); }
+
+// finish with warp 0's Sinkhorn beside the collapse: warp 0 sums the K blocks (NB of them, unrolled), publishes the
+// pre and post weights, then runs Sinkhorn alone, while warps 1..7 collapse, norm and store, warp 1 also for warp 0's
+// columns (loaded by it with the same lane mapping, its sums through the same butterflies). block_sum<8>'s two
+// butterflies run on the same values in the same lanes, so every output is finish's bit for bit.
+template <typename W, int NB>
+__device__ __forceinline__ void finish_split(const __nv_bfloat16* x, const float* part, const float* base,
+                                             const float* scale, const W* nw, __nv_bfloat16* out, float* xs,
+                                             float* post, float* comb, float eps, float hc_eps, int iters) {
+  constexpr int D = 4096, S = 4;
+  __shared__ float smem[8];
+  __shared__ float pre[4];
+  __shared__ float tot;
+  const int64_t r = blockIdx.x;
+  const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+  const __nv_bfloat16* row = x + r * S * D;
+  if (warp == 0) {
+    const float* p = part + r * NB * 32;
+    float mix = 0.0f, ss = 0.0f;
+#pragma unroll
+    for (int b = 0; b < NB; ++b) {
+      mix = mix + p[b * 32 + lane];
+      ss = ss + p[b * 32 + 24];
+    }
+    const float rinv = div_full(1.0f, sqrt_approx(eps + div_full(ss, (float)(S * D))));
+    mix = __fmul_rn(mix, rinv);
+    const int k = lane & 3, idx = lane & 15;
+    const float bpre = base[k], bpost = base[4 + k], bcomb = base[8 + idx];
+    const float mpre = __shfl_sync(0xffffffffu, mix, k), mpost = __shfl_sync(0xffffffffu, mix, 4 + k);
+    const float mcomb = __shfl_sync(0xffffffffu, mix, 8 + idx);
+    const float pr = hc_eps + glm_hc::sigmoid(__fmaf_rn(mpre, scale[0], bpre));
+    const float sp = glm_hc::sigmoid(__fmaf_rn(mpost, scale[1], bpost));
+    if (lane < 4) {
+      post[r * S + lane] = sp + sp;
+      pre[lane] = pr;
+    }
+    bar_arrive(1, 256);  // the pre weights: warps 1..7 collapse while this warp runs Sinkhorn
+    const float cl = __fmaf_rn(mcomb, scale[2], bcomb);
+    float cmax = fmaxf(cl, __shfl_xor_sync(0xffffffffu, cl, 2));
+    cmax = fmaxf(cmax, __shfl_xor_sync(0xffffffffu, cmax, 1));
+    const float ce = exp_approx(cl - cmax);
+    float cm = fadd(hc_eps, div_full(ce, glm_hc::row4(ce)));
+    cm = div_full(cm, hc_eps + glm_hc::col4(cm));
+    for (int it = 1; it < iters; ++it) {
+      cm = div_full(cm, hc_eps + glm_hc::row4(cm));
+      cm = div_full(cm, hc_eps + glm_hc::col4(cm));
+    }
+    if (lane < 16) comb[r * 16 + lane] = cm;
+    return;
+  }
+  // warps 1..7: this thread's columns, and warp 1 warp 0's (thread `lane`'s)
+  uint4 xu[2][S], xz[2][S];
+  Weights<W> wu, wz;
+  for (int rep = 0; rep < 2; ++rep) {
+    for (int st = 0; st < S; ++st) xu[rep][st] = *reinterpret_cast<const uint4*>(row + st * D + rep * 2048 + t * 8);
+    wu.load(nw, rep, t);
+    if (warp == 1) {
+      for (int st = 0; st < S; ++st) xz[rep][st] = *reinterpret_cast<const uint4*>(row + st * D + rep * 2048 + lane * 8);
+      wz.load(nw, rep, lane);
+    }
+  }
+  bar_sync(1, 256);
+  const float p0 = pre[0], p1 = pre[1], p2 = pre[2], p3 = pre[3];
+  float c[16], cz[16], acc, accz = 0.0f;
+  collapse(xu, p0, p1, p2, p3, c, acc);
+  if (warp == 1) collapse(xz, p0, p1, p2, p3, cz, accz);
+  // block_sum<8>: each warp's butterfly, then lanes 0..7's
+  for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+  if (lane == 0) smem[warp] = acc;
+  if (warp == 1) {
+    for (int o = 16; o > 0; o >>= 1) accz += __shfl_xor_sync(0xffffffffu, accz, o);
+    if (lane == 0) smem[0] = accz;
+  }
+  bar_sync(2, 224);
+  if (warp == 1) {
+    float v = lane < 8 ? smem[lane] : 0.0f;
+    for (int o = 4; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if (lane == 0) tot = v;
+  }
+  bar_sync(2, 224);
+  const float rinv = div_full(1.0f, sqrt_approx(eps + div_full(tot, (float)D)));
+  emit(c, wu, rinv, out, xs, r, t);
+  if (warp == 1) emit(cz, wz, rinv, out, xs, r, lane);
+}
+
+}  // namespace glm_hc
+
+// tf_glm_hc_finish with the split schedule (glm_hc::finish_split): the same outputs bit for bit; 16 K blocks.
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_hc_finish_split(const __nv_bfloat16* x, const float* part, const float* base, const float* scale,
+                           const __nv_bfloat16* nw, __nv_bfloat16* out, float* xs, float* post, float* comb, float eps,
+                           float hc_eps, int nb, int iters) {
+  if (nb != 16) __trap();  // the host launches it with glue.hc_blocks only
+  glm_hc::finish_split<__nv_bfloat16, 16>(x, part, base, scale, nw, out, xs, post, comb, eps, hc_eps, iters);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_hc_finish_f32w_split(const __nv_bfloat16* x, const float* part, const float* base, const float* scale,
+                                const float* nw, __nv_bfloat16* out, float* xs, float* post, float* comb, float eps,
+                                float hc_eps, int nb, int iters) {
+  if (nb != 16) __trap();
+  glm_hc::finish_split<float, 16>(x, part, base, scale, nw, out, xs, post, comb, eps, hc_eps, iters);
+}
+
 extern "C" __global__ void __launch_bounds__(256)
     tf_glm_hc_finish(const __nv_bfloat16* x, const float* part, const float* base, const float* scale,
                      const __nv_bfloat16* nw, __nv_bfloat16* out, float* xs, float* post, float* comb, float eps,

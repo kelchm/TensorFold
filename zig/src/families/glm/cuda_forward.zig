@@ -52,6 +52,7 @@ pub const Modules = struct {
     q4: q4.Kernels,
     topk_sum: bool = true, // TF_GLM_TOPK_SUM=0: a decode window's grouped select reads the summed logits (the same bits)
     shared_segs: bool = true, // TF_GLM_SHARED_SEGS=0: a shared window's segments take their own launches (the same bits)
+    hc_split: bool = true, // TF_GLM_HC_SPLIT=0: hc_pre's finish on the one-warp schedule (the same bits)
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
         const k = cuda.kernels;
@@ -91,6 +92,7 @@ pub const Modules = struct {
         m.packs = null; // `m` starts undefined: the field default does not apply
         m.topk_sum = if (std.c.getenv("TF_GLM_TOPK_SUM")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         m.shared_segs = if (std.c.getenv("TF_GLM_SHARED_SEGS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+        m.hc_split = if (std.c.getenv("TF_GLM_HC_SPLIT")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         return m;
     }
 
@@ -220,7 +222,7 @@ pub const Forward = struct {
     absorb_mma: bool = false, // TF_GLM_ABSORB_MMA=1: a prompt pass's absorb_q and expand_v on tensor cores
 
     pub fn set(f: *const Forward) glue.Set {
-        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel, .pdl_hc = f.m.mm.chain.hc and !f.ranks[0].b.prefill, .pdl_moe = f.m.mm.chain.moe and !f.ranks[0].b.prefill };
+        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel, .pdl_hc = f.m.mm.chain.hc and !f.ranks[0].b.prefill, .pdl_moe = f.m.mm.chain.moe and !f.ranks[0].b.prefill, .hc_split = f.m.hc_split };
     }
 
     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.
