@@ -158,19 +158,27 @@ fn attnScale(l: Layer) f32 {
     return @floatCast(std.math.pow(f64, @floatFromInt(l.qk), -0.5));
 }
 
-/// attend's first part: the scratch from row r0 (its rows' latents, index keys and gates, queries, outputs), and the
-/// rows' latents and index keys written into the sequence's caches at pos.
-pub fn attendWrite(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, r0: usize, rows: usize, pos: u64) !Scratch {
-    const set = k.set;
+/// The scratch from row r0: its rows' latents, index keys and gates, queries, outputs.
+pub fn attendScratch(l: Layer, s: Scratch, r0: usize) Scratch {
     const ix = l.index;
     const kw_rows = ix.d + ix.heads;
-    var v = s; // the scratch from row r0
+    var v = s;
     v.lat += r0 * l.lw * 2;
     v.ikr += r0 * kw_rows * 2;
     v.igr += r0 * ix.d * 4;
     v.qa += r0 * l.heads * l.lw * 2;
     v.ol += r0 * l.heads * l.lw * 2;
     v.qi += r0 * ix.heads * ix.d * 2;
+    return v;
+}
+
+/// attend's first part: the scratch from row r0 (attendScratch), and the rows' latents and index keys written into
+/// the sequence's caches at pos.
+pub fn attendWrite(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, r0: usize, rows: usize, pos: u64) !Scratch {
+    const set = k.set;
+    const ix = l.index;
+    const kw_rows = ix.d + ix.heads;
+    const v = attendScratch(l, s, r0);
     if (c.ps % (l.lw * 2) != 0) return error.LatentShape; // pages whole latent rows apart (the token lists' unit)
     const t = table(l, c);
     var stamp = prof.span(k.prof, stream, .cache_write);
@@ -194,6 +202,60 @@ pub fn segsKind(l: Layer, caches: []const Caches, host_pos: []const usize, rows:
         kind = k;
     }
     return kind;
+}
+
+/// One segment of a shared window's cache writes, as glm_glue_index.cuh's glm_wsegs::Seg: its rows' latents, raw
+/// index keys and gates, the stream's E4M3 latent pages and index caches, position and table, its first row and its
+/// first pool block (a segment takes rows / 4 + 2 of them, as indexUpdate launches).
+pub const WriteSeg = extern struct { lat: u64, cache: u64, scales: u64, kr: u64, gr: u64, ik: u64, ig: u64, pk: u64, pos: u64, pt: u64, rows: c_int, row0: c_int, b0: c_int, pad: c_int = 0 };
+pub const WriteSegs = extern struct { s: [latent.max_segs]WriteSeg, n: c_int, pad: c_int = 0 };
+
+/// A segment's entry from its scratch `v` (attendScratch), the stream's caches `c` (E4M3 on pages, as segsKind
+/// requires) and its device position; attendWrite's shape checks.
+pub fn writeSeg(l: Layer, c: Caches, v: Scratch, pos: u64, rows: usize, row0: usize, b0: usize) !WriteSeg {
+    if (c.ps % (l.lw * 2) != 0 or l.lw != 512) return error.LatentShape;
+    if (c.ls == 0 or c.pt == 0) return error.LatentShape;
+    return .{ .lat = v.lat, .cache = c.lc, .scales = c.ls, .kr = v.ikr, .gr = v.igr, .ik = c.ik, .ig = c.ig, .pk = c.pk, .pos = pos, .pt = c.pt, .rows = @intCast(rows), .row0 = @intCast(row0), .b0 = @intCast(b0) };
+}
+
+/// The pool blocks indexUpdate launches for `rows` rows (tf_glm_pool_keys' grid).
+pub fn poolBlocks(rows: usize) usize {
+    return rows / 4 + 2;
+}
+
+/// A shared window's cache writes with every segment in one launch each (tf_glm_lat_write_fp8_paged_segs,
+/// tf_glm_index_write_segs, tf_glm_pool_keys_segs): each block is the block its segment's own attendWrite launch
+/// runs, so the same bytes; `rows` the window's, `blocks` every segment's pool blocks, `ps` the pages' stride.
+pub fn writeSegs(k: Kernels, stream: cuda.Stream, l: Layer, t: *const WriteSegs, rows: usize, blocks: usize, ps: u64) !void {
+    const set = k.set;
+    const ix = l.index;
+    var stamp = prof.span(k.prof, stream, .cache_write);
+    var a: cuda.Args = .{};
+    a.add(@as(i64, @intCast(l.lw)));
+    a.add(@as(i64, @intCast(ps)));
+    a.add(t.*);
+    try cuda.launch.launch(set.glue.lat_write_fp8_paged_segs, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 512 } }, stream, &a);
+    stamp.end();
+    stamp = prof.span(k.prof, stream, .index_update);
+    defer stamp.end();
+    var b: cuda.Args = .{};
+    b.add(@as(i64, @intCast(ix.d + ix.heads)));
+    b.add(ix.ln_w);
+    b.add(ix.ln_b);
+    b.add(@as(f32, 1e-6)); // indexUpdate's
+    b.add(t.*);
+    try cuda.launch.launch(set.glue.index_write_segs, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &b);
+    var p: cuda.Args = .{};
+    p.add(ix.ape);
+    p.add(@as(i64, @intCast(ps)));
+    p.add(t.*);
+    try cuda.launch.launch(set.glue.pool_keys_segs, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = 32 } }, stream, &p);
+}
+
+test "a shared window's cache-write segments fit glm_glue_index.cuh's table and one launch's arguments" {
+    try std.testing.expectEqual(@as(usize, 96), @sizeOf(WriteSeg));
+    try std.testing.expectEqual(@as(usize, 16 * 96 + 8), @sizeOf(WriteSegs));
+    try std.testing.expect(32 + @sizeOf(WriteSegs) <= cuda.launch.Args.max_bytes);
 }
 
 /// A batched segment's sparse selection (attend's): its token lists and counts at `tokens` and `counts`.

@@ -53,6 +53,7 @@ pub const Modules = struct {
     topk_sum: bool = true, // TF_GLM_TOPK_SUM=0: a decode window's grouped select reads the summed logits (the same bits)
     shared_segs: bool = true, // TF_GLM_SHARED_SEGS=0: a shared window's segments take their own launches (the same bits)
     hc_split: bool = true, // TF_GLM_HC_SPLIT=0: hc_pre's finish on the one-warp schedule (the same bits)
+    shared_writes: bool = true, // TF_GLM_SHARED_WRITES=0: a batched shared window's cache writes and KDA row copies per segment (the same bits)
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
         const k = cuda.kernels;
@@ -93,6 +94,7 @@ pub const Modules = struct {
         m.topk_sum = if (std.c.getenv("TF_GLM_TOPK_SUM")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         m.shared_segs = if (std.c.getenv("TF_GLM_SHARED_SEGS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         m.hc_split = if (std.c.getenv("TF_GLM_HC_SPLIT")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+        m.shared_writes = if (std.c.getenv("TF_GLM_SHARED_WRITES")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         return m;
     }
 

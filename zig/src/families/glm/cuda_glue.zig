@@ -83,6 +83,10 @@ pub const Kernels = struct {
     merge: cuda.Function,
     chunks_16_fp8_paged_segs: cuda.Function, // a shared window's segments in one launch (latent.attentionSegs)
     merge_segs: cuda.Function,
+    lat_write_fp8_paged_segs: cuda.Function, // and its cache writes (dsa_block.writeSegs)
+    index_write_segs: cuda.Function,
+    pool_keys_segs: cuda.Function,
+    copy_segs: cuda.Function, // several 16-byte-aligned copies a launch (a shared window's KDA projection rows)
     scores: cuda.Function,
     latent_mma_kn: cuda.Function, // TF_GLM_ABSORB_MMA (glm_glue_num.cuh): absorb_q's head-batched GEMM, B as [K][N]
     latent_mma_nk: cuda.Function, // and expand_v's, B as [N][K]
@@ -342,6 +346,36 @@ pub fn embedB16(set: Set, stream: cuda.Stream, ids: u64, table: u64, out: u64, r
     var a: cuda.Args = .{};
     inline for (.{ ids, table, out, i64of(d), cint(copies) }) |v| a.add(v);
     try rowsLaunch(set.glue.embed_b16, stream, &a, rows, d);
+}
+
+/// One of copySegs' copies: `n` 16-byte units from src to dst (glm_glue_index.cuh's tf_glm_copy), and the table.
+pub const max_copies = 16;
+pub const Copy = extern struct { src: u64, dst: u64, n: i64 };
+pub const Copies = extern struct { c: [max_copies]Copy };
+
+/// Whether a copy of `bytes` bytes from src to dst can go in copySegs: all three whole 16-byte units.
+pub fn copyFits(src: u64, dst: u64, bytes: usize) bool {
+    return (src | dst | @as(u64, bytes)) % 16 == 0;
+}
+
+/// The table's first `n` copies in one launch (tf_glm_copy_segs, grid y the copy): the bytes cuMemcpyDtoDAsync
+/// would copy, each copy's own (copyFits each).
+pub fn copySegs(set: Set, stream: cuda.Stream, t: *const Copies, n: usize) !void {
+    if (n == 0 or n > max_copies) return error.TooManySegments;
+    var most: i64 = 1;
+    for (t.c[0..n]) |c| most = @max(most, c.n);
+    const blocks: u32 = @intCast(@min(@as(i64, 128), @divFloor(most + 255, 256)));
+    var a: cuda.Args = .{};
+    a.add(t.*);
+    try cuda.launch.launch(set.glue.copy_segs, .{ .grid = .{ .x = blocks, .y = @intCast(n) }, .block = .{ .x = 256 } }, stream, &a);
+}
+
+test "copySegs' table is glm_glue_index.cuh's tf_glm_copies" {
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(Copy));
+    try std.testing.expectEqual(@as(usize, 16 * 24), @sizeOf(Copies));
+    try std.testing.expect(copyFits(256, 4096, 48));
+    try std.testing.expect(!copyFits(256, 4096 + 8, 48));
+    try std.testing.expect(!copyFits(256, 4096, 40));
 }
 
 /// forward._shift_conv: each layer's 3-row conv window becomes rows keep .. keep + 2 of [window; projection rows].
