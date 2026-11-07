@@ -226,7 +226,8 @@ pub const Buffers = struct {
         const lw: usize = c.kv_lora;
         const part_rows = if (prefill) @min(rows, dsa_block.prompt_att_rows) else seg;
         const nch = latent.chunksFor(@min(capacity, dense_reach) + seg);
-        const partial_rows = @max(nch * part_rows, latent.chunksFor(sparse.width) * seg); // dense calls, or one sparse
+        // dense calls, or one sparse; a prompt chunk's sparse calls past them merge in the kernel (latent.fuses)
+        const partial_rows = if (prefill) nch * part_rows else @max(nch * part_rows, latent.chunksFor(sparse.width) * seg);
         const np_max = capacity / sparse.pool;
         var mm: usize = 4;
         // windows under rows_from rows keep their K slices apart (a prompt's tail chunk on the prefill buffers too)
@@ -312,7 +313,7 @@ pub const Buffers = struct {
                 .ol = p[28],
                 .vn = p[29],
                 .qi = p[30],
-                .partials = .{ .po = p[31], .pm = p[32], .pl = p[33] },
+                .partials = .{ .po = p[31], .pm = p[32], .pl = p[33], .rows = partial_rows },
                 .dummy = p[34],
                 .select = .{ .scores = p[35], .ls = p[36], .li = p[37], .pools = p[38], .at = p[39], .bits_rows = if (prefill) 0 else @min(seg, sparse.wide_rows) },
                 .tokens = p[40],
