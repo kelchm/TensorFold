@@ -90,7 +90,7 @@ fn detokenize(srv: *Server, cx: *Cx, body: Value) errors.Refused!Value {
 pub fn post(srv: *Server, conn: *Conn, a: Allocator, detok: bool) void {
     var cx: Cx = .{ .a = a };
     const reply = blk: {
-        const body = http_body.readJson(conn, &cx) catch break :blk null;
+        const body = http_body.readJsonLimit(conn, &cx, srv.config.request_body_bytes) catch break :blk null;
         break :blk (if (detok) detokenize(srv, &cx, body) else tokenize(srv, &cx, body)) catch null;
     };
     if (reply) |r| return routes.sendValue(conn, a, 200, r);

@@ -51,6 +51,8 @@ pub const Config = struct {
     /// Ids a request may name for background priority by default (--name-priority); each is in model_ids.
     background_ids: []const []const u8 = &.{},
     default_max_tokens: i64 = 4096,
+    /// Explicit profile limit; the ordinary native default stays 32 MiB.
+    request_body_bytes: usize = @import("http_body.zig").limit,
     enable_thinking: bool = true,
     reasoning_effort: ?[]const u8 = null,
     thinking_budget: i64 = 0,

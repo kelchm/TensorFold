@@ -65,7 +65,7 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
     const count = std.mem.endsWith(u8, auth.routePath(conn.path), "/count_tokens");
     var cx: Cx = .{ .a = a };
     const prepared = blk: {
-        const raw = switch (http_body.read(conn, a, http_body.limit) catch return) {
+        const raw = switch (http_body.read(conn, a, srv.config.request_body_bytes) catch return) {
             .ok => |b| b,
             .refused => |m| return sendError(conn, a, m, 400),
         };

@@ -146,7 +146,11 @@ fn trailerName(line: []const u8) bool {
 
 /// The body as JSON (an empty body reads as ``{}``): a framing refusal, or the decoder's message as another exception.
 pub fn readJson(conn: *Conn, cx: *errors.Cx) errors.Refused!json.Value {
-    const raw = switch (try read(conn, cx.a, limit)) {
+    return readJsonLimit(conn, cx, limit);
+}
+
+pub fn readJsonLimit(conn: *Conn, cx: *errors.Cx, max: usize) errors.Refused!json.Value {
+    const raw = switch (try read(conn, cx.a, max)) {
         .ok => |b| b,
         .refused => |message| return cx.refuse(message),
     };

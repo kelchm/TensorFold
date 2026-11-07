@@ -162,7 +162,7 @@ pub fn delete(srv: *Server, conn: *Conn, a: Allocator, rid: ?[]const u8) void {
 pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
     var cx: Cx = .{ .a = a };
     const request = blk: {
-        const raw = switch (http_body.read(conn, a, http_body.limit) catch return) {
+        const raw = switch (http_body.read(conn, a, srv.config.request_body_bytes) catch return) {
             .ok => |b| b,
             .refused => |m| return refuse(conn, a, m, 400, null),
         };

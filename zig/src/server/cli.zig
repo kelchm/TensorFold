@@ -43,6 +43,7 @@ pub const flags = [_]Flag{
     .{ .name = "--allowed-origin", .kind = .append, .native = true },
     .{ .name = "--allowed-controls", .native = true },
     .{ .name = "--port", .native = true },
+    .{ .name = "--request-body-mib", .native = true },
     .{ .name = "--name", .native = true },
     .{ .name = "--chat-template", .native = true },
     .{ .name = "--voices", .native = true },
@@ -162,6 +163,7 @@ pub const Args = struct {
     model: []const u8 = "",
     host: []const u8 = "127.0.0.1",
     port: u16 = 8080,
+    request_body_mib: u32 = 32,
     name: []const u8 = "",
     chat_template: ?[]const u8 = null,
     voices: ?[]const u8 = null,
@@ -401,6 +403,12 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
         const n = try int(u, a, name, v);
         if (n < 1 or n > 8190) return fail(u, a, "argument --max-frames: expected 1 through 8190: '{s}'", .{v});
         out.max_frames = @intCast(n);
+        return;
+    }
+    if (is(name, "--request-body-mib")) {
+        const n = try int(u, a, name, v);
+        if (n < 1 or n > 96) return fail(u, a, "argument --request-body-mib: expected 1 through 96: '{s}'", .{v});
+        out.request_body_mib = @intCast(n);
         return;
     }
     if (try @import("admission_cli.zig").apply(a, &out.admission, name, v, u)) return;

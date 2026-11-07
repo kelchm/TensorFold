@@ -7,6 +7,87 @@ const server = @import("server.zig");
 const admission = @import("http_admission.zig");
 const testing = std.testing;
 
+test "HTTP body profile: explicit bounded CLI policy preserves the ordinary default" {
+    const cli = @import("cli.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var usage: cli.Usage = .{};
+    try testing.expectEqual(@as(u32, 32), (try cli.parse(arena.allocator(), &.{"model"}, &usage)).request_body_mib);
+    for ([_][]const u8{ "1", "32", "96" }) |value| {
+        const args = try cli.parse(arena.allocator(), &.{ "model", "--request-body-mib", value }, &usage);
+        try testing.expectEqual(try std.fmt.parseInt(u32, value, 10), args.request_body_mib);
+    }
+    for ([_][]const u8{ "0", "-1", "97", "4294967296", "1.5", "nan" }) |value|
+        try testing.expectError(error.Usage, cli.parse(arena.allocator(), &.{ "model", "--request-body-mib", value }, &usage));
+}
+
+test "HTTP body profile: all generation and counting routes use the configured ceiling" {
+    const fixture = @import("late_system_test.zig");
+    const routes = @import("routes.zig");
+    var engine: fixture.Capture = .{};
+    defer testing.allocator.free(engine.prompt);
+    defer testing.allocator.free(engine.background_prompt);
+    var text: fixture.DropLate = .{};
+    const srv = try server.Server.init(testing.allocator, testing.io, engine.engine(), text.text(), .{
+        .served_name = "test",
+        .model_ids = &.{"test"},
+        .request_body_bytes = 1,
+    }, null);
+    defer srv.deinit();
+    const Wire = struct {
+        bytes: std.ArrayList(u8) = .empty,
+        fn write(ctx: *anyopaque, data: []const u8) error{Closed}!void {
+            const w: *@This() = @ptrCast(@alignCast(ctx));
+            w.bytes.appendSlice(testing.allocator, data) catch return error.Closed;
+        }
+    };
+    for ([_][]const u8{ "/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/messages", "/v1/messages/count_tokens", "/tokenize", "/detokenize" }) |path| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var wire: Wire = .{};
+        defer wire.bytes.deinit(testing.allocator);
+        var conn = try http.Conn.init(testing.allocator, -1, "body profile");
+        defer conn.deinit();
+        conn.quiet_log = true;
+        conn.method = "POST";
+        conn.path = path;
+        conn.version = "HTTP/1.1";
+        conn.write_hooks = .{ .ctx = &wire, .write = Wire.write };
+        var headers = [_]http.Header{.{ .name = "Content-Length", .value = "2" }};
+        conn.headers = &headers;
+        @memcpy(conn.buf[0..2], "{}");
+        conn.end = 2;
+        routes.dispatch(srv, &conn, arena.allocator());
+        try testing.expect(std.mem.startsWith(u8, wire.bytes.items, "HTTP/1.1 400 "));
+        try testing.expect(std.mem.indexOf(u8, wire.bytes.items, "request body exceeds") != null);
+        try testing.expect(conn.close);
+        try testing.expectEqual(@as(usize, 0), engine.prompt.len);
+    }
+}
+
+test "HTTP body profile: fixed and chunked bodies accept the exact limit and refuse excess" {
+    for ([_]bool{ false, true }) |chunked| {
+        for ([_]usize{ 1, 2, 3 }) |ceiling| {
+            var slow: Slow = .{ .fragments = if (chunked) &.{"2\r\n{}\r\n0\r\n\r\n"} else &.{"{}"}, .delays = &.{0} };
+            var conn = try slow.conn();
+            defer conn.deinit();
+            conn.version = "HTTP/1.1";
+            var headers = [_]http.Header{if (chunked) .{ .name = "Transfer-Encoding", .value = "chunked" } else .{ .name = "Content-Length", .value = "2" }};
+            conn.headers = &headers;
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            var cx: @import("errors.zig").Cx = .{ .a = arena.allocator() };
+            if (ceiling < 2) {
+                try testing.expectError(error.Refused, body.readJsonLimit(&conn, &cx, ceiling));
+                try testing.expect(conn.close);
+            } else {
+                const value = try body.readJsonLimit(&conn, &cx, ceiling);
+                try testing.expect(value == .object);
+            }
+        }
+    }
+}
+
 const Slow = struct {
     fragments: []const []const u8,
     delays: []const i32,
