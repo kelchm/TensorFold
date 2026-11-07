@@ -1,5 +1,4 @@
 //! GLM-5.3-Flash's TP forward on CUDA (the Python family's forward.compute and commit), partials over NCCL or copied.
-
 const std = @import("std");
 const cuda = @import("cuda");
 const cfg = @import("config.zig");
@@ -26,12 +25,10 @@ const exl3 = @import("cuda_exl3.zig");
 const shared = @import("cuda_shared.zig");
 const index_mod = @import("cuda_index.zig");
 const kv_attn = @import("cuda_kv_shard_attn.zig");
-
 pub const prefill_rows = state.prefill_rows;
 pub const window_rows = state.window_rows;
 pub const State = state.State;
 pub const Buffers = state.Buffers;
-
 /// The modules a forward launches from: our fatbins.
 pub const Modules = struct {
     glue: glue.Kernels,
@@ -57,7 +54,6 @@ pub const Modules = struct {
     hc_split: bool = true, // TF_GLM_HC_SPLIT=0: hc_pre's finish on the one-warp schedule (the same bits)
     shared_writes: bool = true, // TF_GLM_SHARED_WRITES=0: a batched shared window's cache writes and KDA row copies per segment (the same bits)
     hc_part: glue.PartTable = .{}, // TF_GLM_HC_PART: hc_pre's decode-dot blocks by rows (default 2:16); 0: tf_glm_hc_partial8's 16 a row (the same bits)
-
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
         const k = cuda.kernels;
         var m: Modules = undefined;
@@ -109,12 +105,10 @@ pub const Modules = struct {
         m.hc_part = try glue.PartTable.parse(if (std.c.getenv("TF_GLM_HC_PART")) |v| std.mem.span(v) else null);
         return m;
     }
-
     /// What weights.load runs: the dense packing, the FP8 lane, and the MTP head's quantizers and 4-bit tiling.
     pub fn tools(m: *const Modules) weights.Tools {
         return .{ .pack_dense = m.pack_dense, .lane = &m.lane, .quant = &m.quant, .q4 = &m.q4 };
     }
-
     pub fn ops(m: *const Modules) cuda.Module {
         return m.mods[1];
     }
@@ -228,6 +222,7 @@ pub const Forward = struct {
     split: bool = true, // TF_GLM_PREFILL_REDUCE=split (the default with send/recv): each rank glues its own rows
     ring: bool = false, // TF_GLM_PREFILL_REDUCE=ring: split, its exchanges passed along the ring (cuda_relay)
     images: ?ImageRows = null, // a prompt pass's image rows over their placeholders' embeddings (its sequence only)
+    replay_timing: ?*@import("cuda_replay_timing.zig").Trace = null,
     prof: ?*prof_mod.Prof = null, // TF_GLM_PROF=1: events between the sections
     taps: ?taps_mod.Taps = null, // DFlash2 (--drafter): the tapped layers' rows, after each such layer
     ce: ?*cuda.ce_push.Push = null, // split exchanges by copy-engine pushes into the peer's registered rows (cuda_ce.zig)
@@ -463,6 +458,7 @@ pub const Forward = struct {
             } else try shared.begin(r, R, f.stream);
             try cuda.copy_source.enqueue(f.d, r.b.ids, std.mem.sliceAsBytes(ids), f.stream);
         }
+        try @import("cuda_replay_timing.zig").mark(f.replay_timing, f.stream, .target);
         const c = &f.ranks[0].w.config;
         const embed_stamp = prof_mod.span(f.prof, f.stream, .embed);
         for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
