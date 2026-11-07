@@ -12,7 +12,8 @@ const index_mod = @import("cuda_index.zig");
 /// `pdl_moe`: a decode window's slice_sum, topk_group and topk_group_sum launch as dependents (TF_GLM_PDL_CHAIN's moe).
 /// `hc_split`: hc_pre's finish on the split schedule (TF_GLM_HC_SPLIT=0: off), the same bits.
 /// `hc_part`: hc_pre's decode dots over more blocks by rows (partSplit; TF_GLM_HC_PART), the same bits.
-pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false, pdl_hc: bool = false, pdl_moe: bool = false, hc_split: bool = false, hc_part: PartTable = .{ .n = 0 } };
+/// `dscore`: a decode window's index scores on glm_index_scores (tf_glm_scores' bytes; TF_GLM_DSCORES, default on).
+pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false, pdl_hc: bool = false, pdl_moe: bool = false, hc_split: bool = false, hc_part: PartTable = .{ .n = 0 }, dscore: ?*const index_mod.Kernels = null };
 
 /// A hidden-size norm's weight: bf16, or float32 (FP4-Local's) read as float32 by the _f32w kernels.
 pub const Norm = union(enum) { bf16: u64, f32: u64 };
