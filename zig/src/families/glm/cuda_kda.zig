@@ -15,17 +15,37 @@ pub const Kernels = struct {
     replay_layers: cuda.Function,
     prep: cuda.Function,
     step: cuda.Function,
+    step4: cuda.Function, // the step with 4 and 2 warps a block: the same bits, more blocks for small windows
+    step2: cuda.Function,
     out: cuda.Function,
     prep_segs: cuda.Function, // a shared window's segments in one launch each (chainSegs)
     step_segs: cuda.Function,
     out_segs: cuda.Function,
+    step_warps: u32 = 0, // TF_GLM_KDA_STEP_WARPS: 0 (unset or auto) by rows (stepWarps); 8, 4 or 2 at every row count
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
-        inline for (.{ "chain", "replay", "replay_layers", "prep", "step", "out", "prep_segs", "step_segs", "out_segs" }) |name| @field(k, name) = try m.function("tf_glm_kda_" ++ name);
+        inline for (.{ "chain", "replay", "replay_layers", "prep", "step", "step4", "step2", "out", "prep_segs", "step_segs", "out_segs" }) |name| @field(k, name) = try m.function("tf_glm_kda_" ++ name);
+        k.step_warps = stepWarpsSetting(if (std.c.getenv("TF_GLM_KDA_STEP_WARPS")) |v| std.mem.span(v) else null);
         return k;
     }
 };
+
+/// Warps a lone chain's step block by its rows (measured on GPU0, prep + step + out): 2 for one row, 4 to 8 rows,
+/// 8 past that and for prompt chunks. Each warp keeps its 4 value rows, so every choice gives the same bits.
+pub fn stepWarps(rows: usize) u32 {
+    return if (rows == 1) 2 else if (rows <= 8) 4 else 8;
+}
+
+/// TF_GLM_KDA_STEP_WARPS: unset or "auto" 0 (stepWarps), "8" today's kernel at every row count (the control), "4" or
+/// "2" fixed (diagnostic); anything else is logged and taken as auto. No bit depends on it, so not in the fingerprint.
+pub fn stepWarpsSetting(v: ?[]const u8) u32 {
+    const s = v orelse return 0;
+    if (std.mem.eql(u8, s, "auto")) return 0;
+    for ([_]u32{ 8, 4, 2 }) |w| if (std.mem.eql(u8, s, &[_]u8{'0' + @as(u8, @intCast(w))})) return w;
+    std.log.err("TF_GLM_KDA_STEP_WARPS: auto, 8, 4 or 2 (not '{s}'): auto", .{s});
+    return 0;
+}
 
 /// The most segments one chainSegs launch takes (glm_kda.cu's KDA_SEGS: Engine.max_shared).
 pub const max_segs = 16;
@@ -120,7 +140,13 @@ pub fn chain(ks: *const Kernels, stream: cuda.Stream, c: Chain, rows: usize, s: 
         b.add(@as(c_int, @intCast(rows)));
         b.add(w.y);
         b.add(s.state_out);
-        try cuda.launch.launch(ks.step, .{ .grid = .{ .x = @intCast(c.heads), .y = dv / 4 / 8 }, .block = .{ .x = 8 * 32 } }, stream, &b);
+        const wp: u32 = if (ks.step_warps != 0) ks.step_warps else stepWarps(rows);
+        const f = switch (wp) {
+            2 => ks.step2,
+            4 => ks.step4,
+            else => ks.step,
+        };
+        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(c.heads), .y = dv / 4 / wp }, .block = .{ .x = wp * 32 } }, stream, &b);
         var o: cuda.Args = .{};
         o.add(h);
         o.add(w.y);
@@ -160,4 +186,20 @@ pub fn replay(ks: *const Kernels, stream: cuda.Stream, state_in: u64, k: u64, v:
 
 test "the three-kernel chain's step grid is the Python family's" {
     try std.testing.expectEqual(@as(u32, 4), dv / 4 / 8); // DV / 4 / WARPS value rows a block, 8 warps of 4 rows
+}
+
+test "a lone chain's step warps by rows: 2 for one row, 4 to 8 rows, 8 past that; every grid covers the value rows" {
+    try std.testing.expectEqual(@as(u32, 2), stepWarps(1));
+    for ([_]usize{ 2, 3, 4, 8 }) |r| try std.testing.expectEqual(@as(u32, 4), stepWarps(r));
+    for ([_]usize{ 9, 16, 32, 2048 }) |r| try std.testing.expectEqual(@as(u32, 8), stepWarps(r));
+    for ([_]u32{ 2, 4, 8 }) |wp| try std.testing.expectEqual(@as(u32, dv), dv / 4 / wp * wp * 4);
+}
+
+test "TF_GLM_KDA_STEP_WARPS: auto by default, 8/4/2 fixed, anything else auto" {
+    try std.testing.expectEqual(@as(u32, 0), stepWarpsSetting(null));
+    try std.testing.expectEqual(@as(u32, 0), stepWarpsSetting("auto"));
+    try std.testing.expectEqual(@as(u32, 8), stepWarpsSetting("8"));
+    try std.testing.expectEqual(@as(u32, 4), stepWarpsSetting("4"));
+    try std.testing.expectEqual(@as(u32, 2), stepWarpsSetting("2"));
+    try std.testing.expectEqual(@as(u32, 0), stepWarpsSetting("16"));
 }
