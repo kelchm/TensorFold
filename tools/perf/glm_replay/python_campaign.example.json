@@ -1,0 +1,58 @@
+{
+  "arm": "P",
+  "cases": [
+    {
+      "blocks": [
+        {
+          "block_id": "prose-solo-000",
+          "telemetry": {
+            "path": "telemetry/prose-solo-000.json",
+            "sha256": null
+          }
+        },
+        {
+          "block_id": "prose-solo-001",
+          "telemetry": {
+            "path": "telemetry/prose-solo-001.json",
+            "sha256": null
+          }
+        },
+        {
+          "block_id": "prose-solo-002",
+          "telemetry": {
+            "path": "telemetry/prose-solo-002.json",
+            "sha256": null
+          }
+        },
+        {
+          "block_id": "prose-solo-003",
+          "telemetry": {
+            "path": "telemetry/prose-solo-003.json",
+            "sha256": null
+          }
+        },
+        {
+          "block_id": "prose-solo-004",
+          "telemetry": {
+            "path": "telemetry/prose-solo-004.json",
+            "sha256": null
+          }
+        }
+      ],
+      "fixture": {
+        "path": "case-inputs/campaign-prose-solo.json",
+        "sha256": null
+      },
+      "metadata": {
+        "path": "case-inputs/python-prose-solo.json",
+        "sha256": null
+      }
+    }
+  ],
+  "pair_id": "context-unrun",
+  "run_id": "context-unrun",
+  "schema": "glm-replay-python-campaign-v1",
+  "start_id": "context-start-unrun",
+  "start_order": 0,
+  "status": "unrun"
+}

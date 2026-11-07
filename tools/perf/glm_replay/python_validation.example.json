@@ -1,0 +1,29 @@
+{
+  "bindings": {
+    "arm": "P",
+    "checkpoints_sha256": null,
+    "config_sha256": null,
+    "fixture_sha256": null,
+    "runtime_sha256": null,
+    "schedule_sha256": null,
+    "source_sha256": null,
+    "source_tree_sha256": "10a64f7cdd007c23410d4d9f5630ab0c8b4c4522c8ceff91b3d28bb4150c1c34",
+    "tokens_sha256": null
+  },
+  "checks": {
+    "correctness": "unrun",
+    "default_server_neutral": "unrun",
+    "fresh_prefill": "unrun",
+    "hardware_qualification": "unrun",
+    "timing_neutral": "unrun"
+  },
+  "completed_ranks": [],
+  "evidence": [],
+  "execution": "unrun",
+  "logical_evidence": null,
+  "logical_evidence_sha256": null,
+  "performance": "unrun",
+  "ranks": [],
+  "schema": "glm-replay-python-validation-v1",
+  "status": "unrun"
+}

@@ -1,0 +1,32 @@
+{
+  "bindings": {
+    "arm": "P",
+    "checkpoints_sha256": null,
+    "config_sha256": null,
+    "fixture_sha256": null,
+    "runtime_sha256": null,
+    "schedule_sha256": null,
+    "source_sha256": null,
+    "source_tree_sha256": "10a64f7cdd007c23410d4d9f5630ab0c8b4c4522c8ceff91b3d28bb4150c1c34",
+    "tokens_sha256": null
+  },
+  "checks": {
+    "default_server_neutral": "unrun",
+    "full_commit": "unrun",
+    "hardware_qualification": "unrun",
+    "loaded_kernel_bundle": "unrun",
+    "owner_swap": "unrun",
+    "page_edge": "unrun",
+    "partial_commit": "unrun",
+    "permutation": "unrun",
+    "production_transport": "unrun",
+    "repeat_reset": "unrun",
+    "shared": "unrun",
+    "solo": "unrun"
+  },
+  "completed_ranks": [],
+  "evidence": [],
+  "execution": "unrun",
+  "schema": "glm-replay-python-external-gate-v1",
+  "status": "unrun"
+}

@@ -1,0 +1,112 @@
+{
+  "arm": "P",
+  "artifacts": {
+    "compiler": {
+      "bytes": null,
+      "path": "toolchain/nvcc",
+      "sha256": null
+    },
+    "fatbin": {
+      "bytes": null,
+      "path": "compiled/kernels.json",
+      "sha256": null
+    },
+    "interpreter": {
+      "bytes": null,
+      "path": "toolchain/python3",
+      "sha256": null
+    }
+  },
+  "bindings": {
+    "config_sha256": null,
+    "fixture_sha256": null,
+    "schedule_sha256": null,
+    "tokens_sha256": null
+  },
+  "checkpoints": {
+    "drafter": {
+      "ranks": [
+        [
+          {
+            "bytes": null,
+            "path": "config.json",
+            "sha256": null
+          }
+        ],
+        [
+          {
+            "bytes": null,
+            "path": "config.json",
+            "sha256": null
+          }
+        ]
+      ],
+      "revision": "bf582e4eacc1810f76656d1811693ff6c6737d2a"
+    },
+    "target": {
+      "ranks": [
+        [
+          {
+            "bytes": null,
+            "path": "config.json",
+            "sha256": null
+          }
+        ],
+        [
+          {
+            "bytes": null,
+            "path": "config.json",
+            "sha256": null
+          }
+        ]
+      ],
+      "revision": "078455ffe6472f9a52fbc1139f58b9db2881b25c"
+    }
+  },
+  "external_gate": {
+    "path": "hardware.json",
+    "sha256": null
+  },
+  "ids": {
+    "block_id": "block-unrun",
+    "cell_id": "cell-unrun",
+    "pair_id": "context-unrun",
+    "run_id": "context-unrun",
+    "start_id": "context-start-unrun",
+    "start_order": 0
+  },
+  "launch": {
+    "draft_ring": true,
+    "environment_sha256": [
+      null,
+      null
+    ],
+    "grid": 0,
+    "prefill_rows": 2048
+  },
+  "schema": "glm-replay-python-metadata-v1",
+  "server_gate": {
+    "path": "server-neutrality.json",
+    "sha256": null
+  },
+  "source": {
+    "binary_sha256": null,
+    "compiler_sha256": null,
+    "device_image_digest": "sha256:b925352f3515caddc1dde8abf33a621afad8133d2964a091184ad4842bfff7b6",
+    "engine_commit": "c4646171139ee8a3c38103eaa1699dad226ec12b",
+    "fatbin_sha256": null,
+    "harness_commit": null,
+    "image_digest": null,
+    "kit_commit": "bf5f94523a8251029cedae86bf61f8ce37fac218"
+  },
+  "source_tree_sha256": "10a64f7cdd007c23410d4d9f5630ab0c8b4c4522c8ceff91b3d28bb4150c1c34",
+  "status": "unrun",
+  "telemetry": {
+    "path": "telemetry.json",
+    "sha256": null
+  },
+  "validation_gate": {
+    "path": "validation.json",
+    "sha256": null
+  }
+}
