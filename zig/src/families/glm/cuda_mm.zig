@@ -366,7 +366,8 @@ pub fn matmulTwo(k: *const Kernels, s: cuda.Stream, p: [2]Two, part: u64, part_b
     r.f32 = 0;
     var b: cuda.Args = .{};
     b.add(r);
-    try cuda.launch.launch(red, .{ .grid = .{ .x = @intCast(r.blocks0 + @divTrunc(r.total[1] + 255, 256)) }, .block = .{ .x = 256 } }, s, &b);
+    // with chain.reduce it may start while the matmul runs: it waits for it before reading `part` (as matmul's reduce)
+    try cuda.launch.launch(red, .{ .grid = .{ .x = @intCast(r.blocks0 + @divTrunc(r.total[1] + 255, 256)) }, .block = .{ .x = 256 }, .pdl = k.chain.reduce }, s, &b);
     return true;
 }
 

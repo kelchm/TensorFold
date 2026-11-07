@@ -141,7 +141,7 @@ test "decode two-problem launches keep each problem's split K, one reduce for bo
         try std.testing.expect(cuda.configs[0].pdl);
         try std.testing.expectEqual(@as(u32, 20000), cuda.symbols[1]);
         try std.testing.expectEqual(@as(u32, @intCast((rows * sh[0] + 255) / 256 + (rows * sh[2] + 255) / 256)), cuda.configs[1].grid.x);
-        try std.testing.expect(!cuda.configs[1].pdl); // as glm_mm_reduce: an ordinary launch
+        try std.testing.expect(!cuda.configs[1].pdl); // k.chain is off here: an ordinary launch (chain.reduce: below)
         // the two problems' slices never overlap, and the scratch they need is no less than both calls' own
         try std.testing.expect(mm.partBytes(rows, p[0].w) + mm.partBytes(rows, p[1].w) <= need);
         // refusals: nothing launched
@@ -175,4 +175,28 @@ test "decode two-problem launches keep each problem's split K, one reduce for bo
     try std.testing.expect(try mm.matmulTwo(&k, .{}, wide, 1 << 24, 4, 4));
     try std.testing.expectEqual(@as(usize, 1), cuda.count);
     try std.testing.expectEqual(@as(u32, 192 + 197), cuda.configs[0].grid.x);
+}
+
+test "TF_GLM_PDL_CHAIN: a two-problem call's reduce launches as the matmul's dependent only with chain.reduce" {
+    var two: [4][3]cuda.Function = undefined;
+    for (&two, 0..) |*ws, wi| for (ws, 0..) |*f, i| {
+        f.* = .{ .id = @intCast(10000 + wi * 10 + i) };
+    };
+    const p = [2]mm.Two{
+        .{ .x = 4096, .ldx = 4096, .w = .{ .w = 8192, .s = 12288, .n = 2048, .k = 4096, .bits = 8 }, .out = 1 << 20 },
+        .{ .x = 4096, .ldx = 4096, .w = .{ .w = 16384, .s = 20480, .n = 160, .k = 4096, .bits = 8 }, .out = 1 << 21 },
+    };
+    for ([_]bool{ false, true }) |on| for ([_]usize{ 1, 8, 32 }) |rows| {
+        var k = kernels;
+        k.two = two;
+        k.reduce_two = .{ .id = 20000 };
+        k.pdl = true;
+        k.chain.reduce = on;
+        cuda.count = 0;
+        try std.testing.expect(try mm.matmulTwo(&k, .{}, p, 1 << 24, 1 << 30, rows));
+        try std.testing.expectEqual(@as(usize, 2), cuda.count);
+        try std.testing.expect(cuda.configs[0].pdl); // the matmul's own, as glm_mm's
+        try std.testing.expectEqual(@as(u32, 20000), cuda.symbols[1]);
+        try std.testing.expectEqual(on, cuda.configs[1].pdl);
+    };
 }
