@@ -75,7 +75,7 @@ const Result = struct {
     pair_id: []const u8,
     start_id: []const u8,
     start_order: u8,
-    block_id: u64,
+    block_id: []const u8,
     cell_id: []const u8,
     arm: []const u8,
     rank: usize,

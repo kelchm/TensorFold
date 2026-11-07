@@ -19,7 +19,7 @@ pub const Metadata = struct {
     pair_id: []const u8,
     start_id: []const u8,
     start_order: u8,
-    block_id: u64,
+    block_id: []const u8,
     cell_id: []const u8,
     fixture_sha256: []const u8,
     config_sha256: []const u8,
@@ -48,7 +48,7 @@ pub const Gate = struct {
 pub fn read(a: std.mem.Allocator, io: std.Io, path: []const u8, f: fixture.Fixture, measure: bool, sharded: bool) !Metadata {
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
     const m = try std.json.parseFromSliceLeaky(Metadata, a, raw, .{ .allocate = .alloc_always });
-    if (!eq(m.schema, "glm-replay-native-metadata-v1") or m.start_order > 1 or m.run_id.len == 0 or m.pair_id.len == 0 or m.start_id.len == 0 or m.cell_id.len == 0) return error.Metadata;
+    if (!eq(m.schema, "glm-replay-native-metadata-v1") or m.start_order > 1 or m.run_id.len == 0 or m.pair_id.len == 0 or m.start_id.len == 0 or m.block_id.len == 0 or m.cell_id.len == 0) return error.Metadata;
     if (!eq(m.fixture_sha256, f.fixture_sha256) or !eq(m.config_sha256, f.config_sha256)) return error.MetadataFixture;
     if (!eq(m.source.engine_commit, fixture.base_commit)) return error.HistoricalBase;
     if (!eq(m.source.kit_commit, "13f2464ee84ab2b5dabf0bb264d1144b02cf5fb7") or
@@ -151,4 +151,14 @@ test "replay gates reject unrun, wrong arm and changed runtime evidence" {
     g.completed_ranks = .{ 0, 1 };
     g.binary_sha256 = "other binary";
     try std.testing.expectError(error.GateIdentity, checkGate(g, m, "correctness", false, "runtime"));
+}
+
+test "replay native metadata emits string block identities for the common JSONL schema" {
+    var m = std.mem.zeroes(Metadata);
+    m.block_id = "block-7";
+    const raw = try std.json.Stringify.valueAlloc(std.testing.allocator, m, .{});
+    defer std.testing.allocator.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("block-7", parsed.value.object.get("block_id").?.string);
 }
