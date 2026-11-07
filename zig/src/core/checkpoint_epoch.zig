@@ -6,7 +6,7 @@ const rank_file = @import("checkpoint_file.zig");
 pub const wire = @import("checkpoint_wire.zig");
 const Sha = std.crypto.hash.sha2.Sha256;
 pub const max_ranks = 64;
-pub const max_metadata = 8192;
+pub const max_metadata = 32 << 10;
 pub const max_chunk = 2 << 20;
 
 pub const Binding = struct {

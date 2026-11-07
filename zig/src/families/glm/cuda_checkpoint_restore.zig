@@ -14,7 +14,9 @@ const df = @import("dflash.zig");
 const sparse = @import("cuda_sparse.zig");
 const Sha = std.crypto.hash.sha2.Sha256;
 
-pub const max_images = 64;
+// Production permits 50 pictures plus four clips of 128 frames, grouped two frames per tower input.
+// Every accepted group needs its own persisted identity even when its pixel/token geometry is tiny.
+pub const max_images = 50 + 4 * ((128 + 1) / 2);
 pub const Image = struct {
     digest: [32]u8 = @splat(0), // canonical prepared-image identity; not a URL or a cache id
     at: u32 = 0,
@@ -86,8 +88,8 @@ pub const Shape = struct {
 };
 
 pub const Metadata = struct {
-    magic: u64 = 0x31534b4346474c4d,
-    version: u32 = 1,
+    magic: u64 = 0x32534b4346474c4d,
+    version: u32 = 2,
     shape: Shape,
     mark: u64,
     mtp_len: u64,
@@ -110,7 +112,7 @@ pub const Metadata = struct {
         return m;
     }
     pub fn validate(m: *const Metadata) !void {
-        if (m.magic != 0x31534b4346474c4d or m.version != 1 or m.shape.version != 1 or m.shape.flags & ~@as(u32, 3) != 0 or m.cur_count > max_layers or m.cur_count != m.shape.kda_layers or m.mark > std.math.maxInt(i32) or m.mtp_len > std.math.maxInt(i32) or m.mtp_len > m.mark + state.window_rows) return error.CheckpointMetadata;
+        if (m.magic != 0x32534b4346474c4d or m.version != 2 or m.shape.version != 1 or m.shape.flags & ~@as(u32, 3) != 0 or m.cur_count > max_layers or m.cur_count != m.shape.kda_layers or m.mark > std.math.maxInt(i32) or m.mtp_len > std.math.maxInt(i32) or m.mtp_len > m.mark + state.window_rows) return error.CheckpointMetadata;
         const head = m.shape.flags & 2 != 0;
         if (!head and (m.mtp_len != 0 or m.bases[1] != 0)) return error.CheckpointMetadata;
         if (head and m.mark / state.page_rows > m.mtp_len / state.page_rows + 1) return error.UnsupportedHeadLag;

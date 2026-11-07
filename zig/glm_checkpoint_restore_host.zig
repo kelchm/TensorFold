@@ -552,3 +552,49 @@ test "checkpoint restore: uneven TP rank arenas bind one global layout while ret
     try t.expect(!std.meta.eql(a, b));
     try t.expectEqualSlices(u8, &a.layoutIdentity(), &b.layoutIdentity());
 }
+
+test "checkpoint restore: full 50-picture and four-clip group history survives bounded rank files" {
+    var f: Fixture = undefined;
+    try f.init(true, false, false, 1024);
+    defer f.deinit();
+    var media: restore.Media = .{ .processor = @splat(19), .count = 50 + 4 * 64 };
+    try t.expectEqual(@as(usize, 306), restore.max_images);
+    for (media.images[0..media.count], 0..) |*image, i| {
+        image.* = .{ .digest = @splat(20), .at = @intCast(i), .tokens = 1, .gh = 2, .gw = 2 };
+        std.mem.writeInt(u32, image.digest[0..4], @intCast(i + 1), .little);
+    }
+    f.metadata = try restore.Metadata.fromCapture(&f.saved.?, &f.st, &f.w.config, media);
+    f.agreement.binding = f.metadata.bind(f.agreement.binding);
+    var dir = try Directory.init("all-media");
+    defer dir.deinit();
+    _ = try f.persist(dir.name());
+    try f.finishCapture();
+    var target = try f.destination();
+    defer target.deinit();
+    var lease: core.kv_pool.Lease = .{};
+    defer f.pool.finish(&lease);
+    try f.pool.promise(&lease, 4);
+    var inactive = try restore.Inactive.init(&f.pool, &lease, &target, f.stream(), null);
+    defer inactive.release();
+    var slab = try cuda.HostBuffer.alloc(&f.d, 65537);
+    defer slab.free();
+    const store: Store = .{ .dir = dir.name(), .validate_detail = restore.validateEnvelope };
+    const recovered = (try store.recover(f.agreement.binding, 2, slab.slice(u8))).?;
+    var reader = try recovered.openRank(1);
+    defer reader.close();
+    const metadata = try epoch.wire.decode(restore.Metadata, reader.detail());
+    try t.expectEqual(@as(u32, 306), metadata.media.count);
+    try t.expectEqualDeep(media, metadata.media);
+    _ = try inactive.load(&reader, &f.w.config, slab.slice(u8));
+    try t.expectEqual(.ready, inactive.phase);
+    // Exact count and consumed-span checks remain enforced at the larger wire bound.
+    var invalid = media;
+    invalid.count = 307;
+    try t.expectError(error.CheckpointMedia, invalid.validate(1024));
+    invalid = media;
+    invalid.images[305].at = 1024;
+    try t.expectError(error.CheckpointMedia, invalid.validate(1024));
+    var old = f.metadata;
+    old.version = 1;
+    try t.expectError(error.CheckpointMetadata, old.validate());
+}
