@@ -315,7 +315,9 @@ GLM_MM_TWO(8)
 GLM_MM_TWO(16)
 
 // Both problems' K slices added in slice order, then rounded once: glm_mm_reduce's sums for each (x: problem 0's
-// blocks, then problem 1's; a problem of one slice has none).
+// blocks, then problem 1's; a problem of one slice has none). Dependent launch (TF_GLM_PDL_CHAIN's reduce, as
+// glm_mm_reduce): it may start while the two-problem matmul that writes `part` runs, so every thread waits for that
+// grid before it reads `part` or writes `out` (or exits).
 struct MmReduceTwo {
     const float* part[2];
     void* out[2];
@@ -325,6 +327,7 @@ struct MmReduceTwo {
 };
 extern "C" __global__ void glm_mm_reduce_two(const MmReduceTwo r) {
     qmm_frag::grid_launch();
+    qmm_frag::grid_wait();
     const int z = (int)blockIdx.x >= r.blocks0 ? 1 : 0;
     const long long i = (long long)((int)blockIdx.x - (z ? r.blocks0 : 0)) * blockDim.x + threadIdx.x;
     const long long total = r.total[z];
