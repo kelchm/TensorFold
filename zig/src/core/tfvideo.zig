@@ -110,6 +110,11 @@ pub const Video = struct {
 
     /// The frames at `indices` (ascending, distinct), each to `sink.take(k, rgb, width, height, stride)` in order.
     pub fn frames(v: Video, indices: []const u32, sink: anytype) anyerror!void {
+        return v.framesWithScratch(std.heap.page_allocator, indices, sink);
+    }
+
+    /// The C index adapter uses the caller's transient allocator; FFmpeg owns and releases its internal buffers.
+    pub fn framesWithScratch(v: Video, scratch: std.mem.Allocator, indices: []const u32, sink: anytype) anyerror!void {
         const S = @TypeOf(sink);
         const Ctx = struct { sink: S, failure: ?anyerror = null };
         var ctx: Ctx = .{ .sink = sink };
@@ -132,8 +137,8 @@ pub const Video = struct {
                 return 0;
             }
         }.take;
-        const idx = try std.heap.page_allocator.alloc(c_int, indices.len);
-        defer std.heap.page_allocator.free(idx);
+        const idx = try scratch.alloc(c_int, indices.len);
+        defer scratch.free(idx);
         for (idx, indices) |*d, s| d.* = @intCast(s);
         const rc = v.fns.frames(v.handle, idx.ptr, @intCast(idx.len), cb, &ctx);
         if (ctx.failure) |e| return e;

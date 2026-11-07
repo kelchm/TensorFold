@@ -272,7 +272,11 @@ pub const Images = struct {
 
     /// A video's sampled frames as patch pairs within `max_tokens` and `max_frames` (the server's prepare).
     pub fn prepareVideo(v: *const Images, a: std.mem.Allocator, s: video.Source, max_tokens: u32, max_frames: u32) !video.Prepared {
-        return video.prepareLazy(a, s, v.cfg.?, @min(max_tokens, 16384), @min(max_frames, 128));
+        return v.prepareVideoWithScratch(a, std.heap.page_allocator, s, max_tokens, max_frames);
+    }
+
+    pub fn prepareVideoWithScratch(v: *const Images, a: std.mem.Allocator, scratch: std.mem.Allocator, s: video.Source, max_tokens: u32, max_frames: u32) !video.Prepared {
+        return video.prepareLazyWithScratch(a, scratch, s, v.cfg.?, @min(max_tokens, 16384), @min(max_frames, 128));
     }
 
     /// An image's bytes as the tower reads them, at most `max_tokens` tokens (the server's prepare).

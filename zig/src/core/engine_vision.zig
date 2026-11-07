@@ -53,7 +53,7 @@ pub const Vision = struct {
 
 /// A video's facts as the server's decoder reads them, and its frames on request.
 pub const VideoSource = struct {
-    identity: ?u64 = null, // encoded bytes of a replayable request-owned source
+    identity: ?u64 = null, // optional encoded-content identity; the source is borrowed during preparation only
     frames: u64, // the stream's frame count
     rate_num: u64, // its average frame rate, num / den
     rate_den: u64,
@@ -75,9 +75,11 @@ pub const PreparedVideo = struct { groups: []PreparedImage, times: []f64, labels
 
 /// Video input an engine serves (``Vision.video``): how a decoded video becomes images and how the prompt holds them.
 pub const VideoOffer = struct {
-    lazy: bool = false, // prepare retains a replayable source instead of the caller's open decoder
+    lazy: bool = false, // float patchification is deferred; the source must be consumed before prepare returns
     /// ``src`` at most ``max_tokens`` tokens and ``max_frames`` sampled frames; allocated in ``a``.
     prepare: *const fn (ctx: *anyopaque, a: Allocator, src: VideoSource, max_tokens: u32, max_frames: u32) anyerror!PreparedVideo,
+    /// Separate transient storage for eager frame decoding/resampling; retained uint8 canvases belong to `a`.
+    prepare_scratch: ?*const fn (ctx: *anyopaque, a: Allocator, scratch: Allocator, src: VideoSource, max_tokens: u32, max_frames: u32) anyerror!PreparedVideo = null,
     /// The token the chat template writes once per video, expanded to its groups.
     video_token: u32,
     /// The text the template writes for a video, swapped for ``video_token``'s text before encoding (Omni's `<video>`).

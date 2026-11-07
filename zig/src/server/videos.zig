@@ -20,6 +20,13 @@ pub const total_s = 120;
 pub const Budget = struct {
     used: usize = 0,
     deadline: std.Io.Timestamp,
+    io: ?std.Io = null,
+    scratch: std.mem.Allocator = std.heap.page_allocator,
+
+    fn check(b: *const Budget) !void {
+        if (b.io) |io| if (std.Io.Clock.awake.now(io).nanoseconds >= b.deadline.nanoseconds)
+            return error.MediaDeadline;
+    }
 };
 
 /// A video part's bytes: a data URL's, or with --vision-urls (`fetch`) a public HTTPS URL's.
@@ -56,32 +63,23 @@ fn bytesOf(cx: *Cx, fetch: ?images.Fetch, url: []const u8, b: *Budget) errors.Re
 /// libtfvideo's frames into the engine's sink.
 const Decoder = struct {
     v: api.tfvideo.Video,
+    budget: *const Budget,
 
     const Into = struct {
         sink: api.FrameSink,
+        budget: *const Budget,
         pub fn take(s: Into, k: usize, rgb: []const u8, w: u32, h: u32, stride: usize) anyerror!void {
+            try s.budget.check();
             try s.sink.take(s.sink.ctx, k, rgb, w, h, stride);
+            try s.budget.check();
         }
     };
 
     fn decode(ctx: *anyopaque, indices: []const u32, sink: api.FrameSink) anyerror!void {
         const d: *Decoder = @ptrCast(@alignCast(ctx));
-        try d.v.frames(indices, Into{ .sink = sink });
-    }
-};
-
-const LazyDecoder = struct {
-    bytes: []const u8,
-
-    fn decode(ctx: *anyopaque, indices: []const u32, sink: api.FrameSink) anyerror!void {
-        const self: *const LazyDecoder = @ptrCast(@alignCast(ctx));
-        return self.decodeWith(indices, sink, api.tfvideo.Video);
-    }
-
-    fn decodeWith(self: *const LazyDecoder, indices: []const u32, sink: api.FrameSink, comptime Video: type) !void {
-        const video = try Video.open(self.bytes);
-        defer video.close();
-        try video.frames(indices, Decoder.Into{ .sink = sink });
+        try d.budget.check();
+        try d.v.framesWithScratch(d.budget.scratch, indices, Into{ .sink = sink, .budget = d.budget });
+        try d.budget.check();
     }
 };
 
@@ -96,8 +94,18 @@ pub fn prepare(
     max_tokens: u32,
     b: *Budget,
 ) errors.Refused!api.PreparedVideo {
-    const bytes = try bytesOf(cx, fetch, url, b);
-    var d: Decoder = .{ .v = api.tfvideo.Video.open(bytes) catch |e| return switch (e) {
+    b.check() catch return cx.refuse("video preparation exceeded the configured time limit");
+    var arena: std.heap.ArenaAllocator = .init(b.scratch);
+    defer arena.deinit();
+    var temporary = cx.*;
+    temporary.a = arena.allocator();
+    const bytes = bytesOf(&temporary, fetch, url, b) catch |e| {
+        cx.kind = temporary.kind;
+        cx.message = try cx.a.dupe(u8, temporary.message);
+        return e;
+    };
+    b.check() catch return cx.refuse("video preparation exceeded the configured time limit");
+    var d: Decoder = .{ .budget = b, .v = api.tfvideo.Video.open(bytes) catch |e| return switch (e) {
         error.NoLibrary => cx.fail(.server, "{s}", .{@import("sys").optional_libraries.spec(.video).message}),
         error.NoStream => cx.refuse(try std.fmt.allocPrint(cx.a, "video {d}: the video has no video stream", .{i + 1})),
         error.OutOfMemory => error.OutOfMemory,
@@ -138,15 +146,15 @@ pub fn prepare(
         .ctx = &d,
         .decode = Decoder.decode,
     };
-    if (offer.lazy) {
-        const lazy = try cx.a.create(LazyDecoder);
-        lazy.* = .{ .bytes = bytes };
-        src.ctx = lazy;
-        src.decode = LazyDecoder.decode;
-        src.identity = std.hash.Wyhash.hash(0x7466766964656f03, bytes);
-    }
-    return offer.prepare(ctx, cx.a, src, max_tokens, offer.max_frames) catch |e| switch (e) {
+    // The open decoder and encoded source are borrowed only for this synchronous preparation call.
+    if (offer.lazy) src.identity = std.hash.Wyhash.hash(0x7466766964656f03, bytes);
+    b.check() catch return cx.refuse("video preparation exceeded the configured time limit");
+    const prepared = (if (offer.prepare_scratch) |prepare_frames|
+        prepare_frames(ctx, cx.a, b.scratch, src, max_tokens, offer.max_frames)
+    else
+        offer.prepare(ctx, cx.a, src, max_tokens, offer.max_frames)) catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
+        error.MediaDeadline => cx.refuse("video preparation exceeded the configured time limit"),
         error.VideoTooShort => cx.refuse(try std.fmt.allocPrint(
             cx.a,
             "video {d} is too short: sampled at 2 frames a second it gives no frame; send at least half a second",
@@ -164,6 +172,8 @@ pub fn prepare(
             .{i + 1},
         )),
     };
+    b.check() catch return cx.refuse("video preparation exceeded the configured time limit");
+    return prepared;
 }
 
 test "video bytes: data URLs within the limits; URLs only with --vision-urls" {
@@ -281,47 +291,9 @@ test "a template that writes no image placeholder is named as the cause, a misco
     try std.testing.expectEqualStrings("the chat template wrote 1 image placeholders for 2 image parts", cx.message);
 }
 
-test "media lifecycle: server lazy decoder closes each group on success decode failure and cancellation" {
-    const Recorder = struct {
-        var active: usize = 0;
-        var opens: usize = 0;
-        var failed = false;
-        fn open(bytes: []const u8) !@This() {
-            try std.testing.expectEqualStrings("request-owned bytes", bytes);
-            active += 1;
-            opens += 1;
-            return .{};
-        }
-        fn close(_: @This()) void {
-            active -= 1;
-        }
-        fn frames(_: @This(), indices: []const u32, sink: anytype) !void {
-            try std.testing.expectEqualSlices(u32, &.{ 7, 9 }, indices);
-            if (failed) return error.RecordedDecodeFailure;
-            try sink.take(0, &.{ 1, 2, 3 }, 1, 1, 3);
-        }
-        fn take(ctx: *anyopaque, _: usize, _: []const u8, _: u32, _: u32, _: usize) anyerror!void {
-            const cancelled: *bool = @ptrCast(@alignCast(ctx));
-            if (cancelled.*) return error.Cancelled;
-        }
-    };
-    Recorder.active = 0;
-    Recorder.opens = 0;
-    Recorder.failed = false;
-    const decoder: LazyDecoder = .{ .bytes = "request-owned bytes" };
-    var cancelled = false;
-    const sink: api.FrameSink = .{ .ctx = &cancelled, .take = Recorder.take };
-    try decoder.decodeWith(&.{ 7, 9 }, sink, Recorder);
-    try std.testing.expectEqual(@as(usize, 0), Recorder.active);
-    Recorder.failed = true;
-    try std.testing.expectError(error.RecordedDecodeFailure, decoder.decodeWith(&.{ 7, 9 }, sink, Recorder));
-    try std.testing.expectEqual(@as(usize, 0), Recorder.active);
-    Recorder.failed = false;
-    cancelled = true;
-    try std.testing.expectError(error.Cancelled, decoder.decodeWith(&.{ 7, 9 }, sink, Recorder));
-    try std.testing.expectEqual(@as(usize, 0), Recorder.active);
-    cancelled = false;
-    try decoder.decodeWith(&.{ 7, 9 }, sink, Recorder);
-    try std.testing.expectEqual(@as(usize, 4), Recorder.opens);
-    try std.testing.expectEqual(@as(usize, 0), Recorder.active);
+test "video preparation checks its shared deadline before decoding" {
+    var b: Budget = .{ .deadline = .{ .nanoseconds = 0 }, .io = std.testing.io };
+    try std.testing.expectError(error.MediaDeadline, b.check());
+    b.deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(total_s));
+    try b.check();
 }

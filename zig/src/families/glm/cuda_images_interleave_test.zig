@@ -470,7 +470,7 @@ test "media lifecycle: native lazy video groups exactly match eager pixels inclu
     var src = frames.source(5);
     src.rate_num = 1;
     const lazy = try video.prepareLazy(a, src, config, 16384, 128);
-    try t.expectEqual(@as(usize, 0), frames.calls);
+    try t.expectEqual(@as(usize, 1), frames.calls);
     try t.expectEqual(@as(usize, 3), lazy.groups.len);
     const eager = try video.prepare(a, src, config, 16384, 128);
     frames = .{};
@@ -485,8 +485,9 @@ test "media lifecycle: native lazy video groups exactly match eager pixels inclu
         try t.expectEqualSlices(f32, e.pixels, pixels);
     }
     try t.expectEqualSlices(f64, eager.times, lazy.times);
-    try t.expectEqual(@as(usize, 2), frames.max_indices);
-    try t.expectEqual(@as(usize, 1), frames.max_active);
+    try t.expectEqual(@as(usize, 0), frames.calls);
+    try t.expectEqual(@as(usize, 0), frames.max_indices);
+    try t.expectEqual(@as(usize, 0), frames.max_active);
     try t.expectEqual(@as(usize, 0), frames.active);
     try t.expect(lazy.groups[0].hash != lazy.groups[1].hash);
     const replay = try video.prepareLazy(a, src, config, 16384, 128);
@@ -496,7 +497,7 @@ test "media lifecycle: native lazy video groups exactly match eager pixels inclu
     try t.expect(lazy.groups[0].hash != (try video.prepareLazy(a, different, config, 16384, 128)).groups[0].hash);
 }
 
-test "media lifecycle: 128-frame video owns one decoded pair with cancellation failure retry and deadline" {
+test "media lifecycle: 128-frame video decodes once before admission; active pairs support cancellation retry and deadline" {
     var plan_arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer plan_arena.deinit();
     var frames: Frames = .{};
@@ -513,25 +514,29 @@ test "media lifecycle: 128-frame video owns one decoded pair with cancellation f
         scratch.deinit();
         try t.expectEqual(@as(usize, 0), cpu.live);
     }
-    try t.expectEqual(@as(usize, 64), frames.calls);
-    try t.expectEqual(@as(usize, 2), frames.max_indices);
+    try t.expectEqual(@as(usize, 1), frames.calls);
+    try t.expectEqual(@as(usize, 128), frames.max_indices);
     try t.expect(cpu.peak < 4 * max_payload);
     std.debug.print("media receipt: video groups={d} decoder inputs peak={d} CPU arena peak={d} group payload={d}\n", .{ lazy.groups.len, frames.max_indices, cpu.peak, max_payload });
-    for (0..3) |mode| {
+    // Decoder failures are preparation failures, even when only the last selected frame is invalid.
+    frames = .{ .fail_after = 127 };
+    try t.expectError(error.RecordedDecodeFailure, video.prepareLazy(plan_arena.allocator(), frames.source(128), config, 16384, 128));
+    try t.expectEqual(@as(usize, 1), frames.calls);
+    try t.expectEqual(@as(usize, 0), frames.active);
+    for (0..2) |mode| {
         var scratch: std.heap.ArenaAllocator = .init(cpu.allocator());
-        frames = .{};
-        if (mode == 0) frames.fail_after = 1;
-        if (mode == 1) frames.cancel_after = 1;
+        frames = .{ .cancelled = mode == 0 };
         var img = pairImage(lazy.groups[0]);
-        if (mode == 2) img.deadline = .{ .io = t.io, .at = .{ .nanoseconds = 0 } };
-        try t.expectError(if (mode == 0) error.RecordedDecodeFailure else if (mode == 1) error.Cancelled else error.MediaDeadline, img.materializeChecked(scratch.allocator(), .{ .ptr = &frames, .check = Frames.cancel }));
-        try t.expectEqual(@as(usize, 0), frames.active);
+        if (mode == 1) img.deadline = .{ .io = t.io, .at = .{ .nanoseconds = 0 } };
+        try t.expectError(if (mode == 0) error.Cancelled else error.MediaDeadline, img.materializeChecked(scratch.allocator(), .{ .ptr = &frames, .check = Frames.cancel }));
+        try t.expectEqual(@as(usize, 0), frames.calls);
         scratch.deinit();
         try t.expectEqual(@as(usize, 0), cpu.live);
     }
     frames = .{};
     var scratch: std.heap.ArenaAllocator = .init(cpu.allocator());
     _ = try pairImage(lazy.groups[0]).materialize(scratch.allocator());
+    try t.expectEqual(@as(usize, 0), frames.calls);
     scratch.deinit();
     try t.expectEqual(@as(usize, 0), cpu.live);
 }
@@ -570,7 +575,7 @@ fn failingVideoPlan(allocator: std.mem.Allocator) !void {
     defer arena.deinit();
     var frames: Frames = .{};
     _ = try video.prepareLazy(arena.allocator(), frames.source(128), config, 16384, 128);
-    try t.expectEqual(@as(usize, 0), frames.calls);
+    try t.expectEqual(@as(usize, 1), frames.calls);
 }
 test "media lifecycle: every lazy plan allocation failure releases the request arena before retry" {
     try std.testing.checkAllAllocationFailures(t.allocator, failingVideoPlan, .{});

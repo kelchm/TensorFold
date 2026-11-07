@@ -189,7 +189,7 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
     var bytes_total: usize = 0;
     // every URL's download inside one request's seconds (images.py total_timeout_seconds, videos.py's)
     const deadline: std.Io.Timestamp = if (io) |i| std.Io.Clock.awake.now(i).addDuration(.fromSeconds(if (v.image_limits) |l| l.prepare_seconds else media_fetch.total_s)) else .{ .nanoseconds = 0 };
-    var video_budget: videos.Budget = .{ .deadline = if (io != null) started.addDuration(.fromSeconds(videos.total_s)) else .{ .nanoseconds = 0 } };
+    var video_budget: videos.Budget = .{ .io = io, .scratch = @import("prepare_memory.zig").scratch(.media), .deadline = if (io != null) started.addDuration(.fromSeconds(videos.total_s)) else .{ .nanoseconds = 0 } };
     var ii: usize = 0;
     var vi: usize = 0;
     var video_tokens_total: u64 = 0;
@@ -204,7 +204,9 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
             try accountVideo(cx, o, clips[vi], cap, &video_tokens_total);
             if (video_work) |b| {
                 b.check(phase.?) catch return cx.refuse("video preparation exceeded the configured time limit");
-                for (clips[vi].groups) |*g| g.preparation_budget = b;
+                if (o.prepare_scratch == null) for (clips[vi].groups) |*g| {
+                    g.preparation_budget = b;
+                };
             }
             vi += 1;
             continue;

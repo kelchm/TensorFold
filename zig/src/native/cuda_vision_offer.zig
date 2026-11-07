@@ -53,6 +53,7 @@ pub fn offer(v: anytype, open: ?api.VisionOpen) ?api.Vision {
     };
     if (comptime @hasDecl(T, "fixed_image_tokens")) if (out.video) |*video| {
         if (comptime @hasDecl(T, "lazy_video")) video.lazy = T.lazy_video;
+        if (comptime @hasDecl(T, "prepareVideoWithScratch")) video.prepare_scratch = Video(T).prepareScratch;
         video.per_video_tokens = 16384;
         video.max_frames = @min(video.max_frames, 128);
     };
@@ -76,13 +77,18 @@ fn Video(comptime T: type) type {
         }
 
         fn prepare(ctx: *anyopaque, a: Allocator, src: api.VideoSource, max_tokens: u32, max_frames: u32) anyerror!api.PreparedVideo {
+            return prepareScratch(ctx, a, std.heap.page_allocator, src, max_tokens, max_frames);
+        }
+
+        fn prepareScratch(ctx: *anyopaque, a: Allocator, scratch: Allocator, src: api.VideoSource, max_tokens: u32, max_frames: u32) anyerror!api.PreparedVideo {
             const t: *T = @ptrCast(@alignCast(ctx));
-            var local: @This() = .{ .src = src };
-            const ad = if (comptime @hasDecl(T, "lazy_video")) try a.create(@This()) else &local;
-            ad.* = .{ .src = src };
-            var s: T.video.Source = .{ .frames = src.frames, .rate_num = src.rate_num, .rate_den = src.rate_den, .width = src.width, .height = src.height, .ctx = ad, .decode = decode };
+            var ad: @This() = .{ .src = src };
+            var s: T.video.Source = .{ .frames = src.frames, .rate_num = src.rate_num, .rate_den = src.rate_den, .width = src.width, .height = src.height, .ctx = &ad, .decode = decode };
             if (comptime @hasField(T.video.Source, "identity")) s.identity = src.identity;
-            const p = try t.prepareVideo(a, s, max_tokens, max_frames);
+            const p = if (comptime @hasDecl(T, "prepareVideoWithScratch"))
+                try t.prepareVideoWithScratch(a, scratch, s, max_tokens, max_frames)
+            else
+                try t.prepareVideo(a, s, max_tokens, max_frames);
             const groups = try a.alloc(api.PreparedImage, p.groups.len);
             for (groups, p.groups) |*g, q| {
                 g.* = .{ .pixels = q.pixels, .gh = q.gh, .gw = q.gw, .tokens = q.tokens, .hash = q.hash };
