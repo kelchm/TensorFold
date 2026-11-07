@@ -87,6 +87,26 @@ The generator refuses to overwrite existing fixtures. Preserve frozen fixtures a
 with the campaign. Pilot block lengths, repetitions and exclusions must be frozen before
 interpreting paired native results.
 
+For the complete screening/follow-up matrix and partial/owner controls, use the bundle generator.
+It tokenizes each family's prompt/tape once per context, then reuses those arrays across shapes.
+The manifest is written only after every fixture passes validation; a failed directory is retained
+without a completion manifest. Use a new output directory for a corrected attempt.
+
+```sh
+python3 -m tools.perf.glm_replay.bundle NEW_BUNDLE \
+  --tokenizer-dir TOKENIZER_DIR --tokenizer-manifest ASSETS.json \
+  --asset-provenance VERIFIED_ASSET_RECEIPT.json \
+  --pool-h 1280 --configured-capacity 262144 --rounds FROZEN_ROUNDS
+```
+
+This produces 51 fixtures: the 42 screening/follow-up cells plus nine partial, reversed-owner
+and solo-owner controls. The template comes from the hashed tokenizer directory. To reproduce
+the retained deployment, explicitly stage its serving override as `chat_template.jinja` and
+include that file's hash in ASSETS.json; do not silently substitute the different HF template.
+The chosen pool satisfies host reservation checks for short diagnostic schedules. Revalidate
+headroom after the pilot fixes longer blocks; host admission calculations do not establish
+physical fit. Native command and gate boundaries are described in [NATIVE.md](NATIVE.md).
+
 ## Offline receipts and paired-start analysis
 
 ```sh
