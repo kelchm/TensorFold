@@ -8,7 +8,8 @@ const index_mod = @import("cuda_index.zig");
 /// What the forward's kernels launch from: our glue's, glm_mm's when tiled, qlinear's lane for FP8 kinds, copy_rows.
 /// `absorb_mma`: TF_GLM_ABSORB_MMA=1 on a prompt pass (absorb_q and expand_v on tensor cores, cuda_latent).
 /// `dsel`: a decode window's DSA select on many CTAs (tf_glm_dsel_*, cuda_sparse; TF_GLM_DSEL, default on).
-pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false };
+/// `pdl_hc`: a decode window's hc_post, hc_partial8 and hc_finish launch as dependents (TF_GLM_PDL_CHAIN's hc).
+pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false, pdl_hc: bool = false };
 
 /// A hidden-size norm's weight: bf16, or float32 (FP4-Local's) read as float32 by the _f32w kernels.
 pub const Norm = union(enum) { bf16: u64, f32: u64 };
@@ -243,8 +244,10 @@ pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale:
     var a: cuda.Args = .{};
     inline for (.{ x, fn_w, part, i64of(s * d), @as(c_int, hc_blocks) }) |v| a.add(v);
     // Decode windows (16 blocks a row) take each block's 8 steps at once; prompt rows 4 rows a 128-thread block.
+    // `pdl_hc`: partial8 and finish launch as dependents (each waits before it reads x or the partials; the prompt
+    // kernel tf_glm_hc_partial has no wait and never does).
     if (rows < 64) {
-        try cuda.launch.launch(set.glue.hc_partial8, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks }, .block = .{ .x = 1024 } }, stream, &a);
+        try cuda.launch.launch(set.glue.hc_partial8, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks }, .block = .{ .x = 1024 }, .pdl = set.pdl_hc }, stream, &a);
     } else {
         a.add(i64of(rows));
         try cuda.launch.launch(set.glue.hc_partial, .{ .grid = .{ .x = cdiv(rows, 4), .y = hc_blocks }, .block = .{ .x = 128 } }, stream, &a);
@@ -255,15 +258,19 @@ pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale:
     };
     var b: cuda.Args = .{};
     inline for (.{ x, part, base, scale, w, out, xs, post, comb, eps, hc_eps, @as(c_int, hc_blocks), cint(iters) }) |v| b.add(v);
-    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &b);
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 }, .pdl = set.pdl_hc and rows < 64 }, stream, &b);
 }
 
 /// glue.hc_post: branch = bf16(`g`, rank 0 first); xout[s] = bf16(post[s] branch + sum_t comb[t][s] x[t]); x may alias.
+/// `pdl_hc`: it launches as a dependent and waits before it reads anything.
 pub fn hcPost(set: Set, stream: cuda.Stream, x: u64, xout: u64, g: u64, post: u64, comb: u64, rows: usize, d: usize, s: usize, world: usize) !void {
     if (s != 4) return error.StreamsNotFour;
     var a: cuda.Args = .{};
     inline for (.{ x, xout, g, post, comb, i64of(rows * d), i64of(d), cint(world) }) |v| a.add(v);
-    try rows8Launch(set.glue.hc_post, stream, &a, rows, d, .{ x, xout, g });
+    if (!set.pdl_hc) return rows8Launch(set.glue.hc_post, stream, &a, rows, d, .{ x, xout, g });
+    if (d % 8 != 0) return error.WidthNotEights;
+    inline for (.{ x, xout, g }) |p| if (p % 16 != 0) return error.RowsUnaligned;
+    try cuda.launch.launch(set.glue.hc_post, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(d, 1024) }, .block = .{ .x = 128 }, .pdl = true }, stream, &a);
 }
 
 /// glm_glue_num.cuh's latent_mma dynamic shared bytes, three stages: [kn (absorb), nk (expand)].

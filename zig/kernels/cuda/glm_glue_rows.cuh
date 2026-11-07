@@ -89,8 +89,12 @@ extern "C" __global__ void tf_glm_rank_sum(const float* own, const float* peers,
 }
 
 // glue._hc_post: stream s = bf16(post[s] branch + sum_t comb[t][s] x[t]) in LLVM's fma order; x may be xout.
+// Dependent launch (decode windows): every input is an earlier grid's, so the wait comes first; hc_pre's partials
+// may then launch and load their weights while this runs.
 extern "C" __global__ void tf_glm_hc_post(const __nv_bfloat16* x, __nv_bfloat16* xout, const float* g,
                                           const float* post, const float* comb, int64_t rs, int64_t d, int world) {
+  pdl_wait();
+  pdl_trigger();
   const int64_t c = glm_glue::col8();
   if (c >= d) return;
   const int64_t r = blockIdx.x;
