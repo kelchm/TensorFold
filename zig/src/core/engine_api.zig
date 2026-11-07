@@ -145,7 +145,7 @@ pub const SpeechResult = @import("speech_api.zig").SpeechResult;
 pub const SpeechInfo = @import("speech_api.zig").SpeechInfo;
 pub const SpeechSubmitError = error{ Closed, Busy, InvalidRequest, Unsupported };
 
-pub const Reason = enum { stop, length, cancelled, failed, silence };
+pub const Reason = enum { stop, length, cancelled, failed, silence, refused };
 pub const speech_guard = @import("speech_guard.zig");
 
 /// What a finished reply's rounds did, for its runtime fields and /metrics.
@@ -386,6 +386,8 @@ pub const Memory = struct { active: u64 = 0, cache: u64 = 0, peak: u64 = 0, pinn
 pub const Explain = struct {
     ctx: ?*anyopaque = null,
     text: *const fn (ctx: ?*anyopaque, err: anyerror) ?[]const u8,
+    /// A known request-data failure during prefill; null leaves an ordinary server failure.
+    request: ?*const fn (ctx: ?*anyopaque, err: anyerror) ?[]const u8 = null,
 };
 
 /// A backend's own memory counts for LaneHost; read from HTTP threads, so it must not touch the GPU.

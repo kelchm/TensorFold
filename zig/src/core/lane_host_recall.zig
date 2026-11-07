@@ -44,7 +44,7 @@ pub fn prompted(h: *LaneHost, job: *Job) void {
 pub fn finished(h: *LaneHost, job: *Job, reason: api.Reason, stats: api.Stats) api.Stats {
     var told = stats;
     const store = h.recall orelse return told;
-    if (reason != .failed and writes(job)) store.readReply(job.request.prompt, job.stream.emitted());
+    if (reason != .failed and reason != .refused and writes(job)) store.readReply(job.request.prompt, job.stream.emitted());
     if (job.recall.reading) told.telemetry_json = job.recall.reader.telemetry(&job.recall.telemetry);
     return told;
 }

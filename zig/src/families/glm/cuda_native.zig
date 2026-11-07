@@ -440,8 +440,19 @@ fn release(own: *Owned) void {
     own.gpa.destroy(own);
 }
 
+/// Request-owned media can exceed its preparation budget after a queued pass begins.
+/// CUDA, allocation, rank/protocol and unknown errors deliberately keep server-failure semantics.
+pub fn requestProblem(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.MediaDeadline => "image or video preparation exceeded its time budget",
+        error.BadVideo, error.Short, error.Decode => "the video's bytes are invalid or unsupported; use MP4 or WebM (H.264, HEVC, VP8, VP9 or MPEG-4)",
+        else => null,
+    };
+}
+
 /// The server's words for this family's refusals.
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+    if (requestProblem(null, err)) |message| return message;
     return switch (err) {
         error.BadRoceCap => "TF_ROCE_MAX_KB: give an integer from 1 through 4194303 KiB, or unset it for 4096 KiB",
         error.BadHostCache => "TF_GLM_HOST_CACHE_GIB: give GiB of pinned host memory over all the ranks (0 turns the host tier off), or unset it or set auto for a quarter of what the host has available (at most 16 GiB)",
@@ -528,4 +539,12 @@ pub fn linkCapacity(cap: usize, media: ?images_mod.Limits) !usize {
 }
 test "a small text context still sizes the link for every offered media span" {
     try std.testing.expectEqual(@as(usize, 792), try linkCapacity(64, .{ .image_tokens = 2048, .max_images = 8, .video_tokens = 4096, .max_videos = 2, .max_frames = 256 }));
+}
+
+test "media request errors: GLM classifies only known media input failures" {
+    const t = std.testing;
+    for ([_]anyerror{ error.MediaDeadline, error.BadVideo, error.Short, error.Decode }) |err|
+        try t.expect(requestProblem(null, err) != null);
+    for ([_]anyerror{ error.OutOfMemory, error.CudaError, error.RankMismatch, error.BadStep, error.BadChunk }) |err|
+        try t.expect(requestProblem(null, err) == null);
 }

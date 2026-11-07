@@ -490,7 +490,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .vision = if (@hasField(@TypeOf(loaded), "vision")) vision_offer.offer(loaded.vision, o.vision) else null,
         .admit = admit,
         .slide_conversations = conversations,
-    }, .{ .ctx = loaded.ctx, .text = F.explain });
+    }, .{ .ctx = loaded.ctx, .text = F.explain, .request = if (@hasDecl(F, "requestProblem")) F.requestProblem else null });
     opened = true;
     kv_pages.warnCapacity(cache_capacity, o.keep == 0 or o.prompt_cache_gib == 0, std.log);
     if (@hasField(@TypeOf(loaded), "follow")) if (loaded.follow) |f| {

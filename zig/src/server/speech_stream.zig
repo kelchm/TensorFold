@@ -27,7 +27,7 @@ pub fn why(box: *const Mailbox, samples: usize, capacity: usize) ?[]const u8 {
     return switch (box.reason) {
         .stop, .length, .silence => if (samples > capacity) "the engine wrote more audio than the reply holds" else null,
         .cancelled => "speech synthesis was cancelled",
-        .failed => if (box.message.len > 0) box.message else "speech synthesis failed",
+        .failed, .refused => if (box.message.len > 0) box.message else "speech synthesis failed",
     };
 }
 

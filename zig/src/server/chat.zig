@@ -483,6 +483,7 @@ const Generation = struct {
             .silence => return cx.other("the text engine returned a speech-only finish reason"),
             .cancelled => "cancelled",
             .failed => return cx.other(if (m.message.len > 0) try a.dupe(u8, m.message) else "the reply failed"),
+            .refused => return cx.refuse(if (m.message.len > 0) try a.dupe(u8, m.message) else "the request could not be prepared"),
         };
         const stopped: ?u32 = if (g.loop_stop) m.stats.loop_period else null;
         const reason = if (stopped != null) @import("loop_stop.zig").finish_reason else ended;

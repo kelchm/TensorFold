@@ -368,7 +368,7 @@ pub const LaneHost = struct {
         return switch (e) {
             error.Cancelled => h.cancel(job),
             error.LaneMemory => h.requeue(job),
-            else => h.drop(job, h.words(e)),
+            else => h.passFailure(job, e),
         };
     }
 
@@ -384,7 +384,7 @@ pub const LaneHost = struct {
                     fill.unfill(h, job);
                     break :blk h.requeue(job);
                 },
-                else => h.drop(job, h.words(e)),
+                else => h.passFailure(job, e),
             };
             return;
         };
@@ -444,7 +444,7 @@ pub const LaneHost = struct {
         const be = h.core.backend;
         if (h.cache) |store| if (job.marks.len == 0 and (job.request.untaught or store.rules.lookahead > 0)) return h.cancel(job); // it would keep nothing
         be.prefill(&job.stream) catch |e| { // a yield ends it like a cancel: what it prefilled is kept
-            if (e != error.Cancelled and e != error.Yielded) return h.drop(job, h.words(e));
+            if (e != error.Cancelled and e != error.Yielded) return h.passFailure(job, e);
             be.release(&job.stream);
             return h.cancel(job);
         };
@@ -461,10 +461,21 @@ pub const LaneHost = struct {
         return x.text(x.ctx, e) orelse @errorName(e);
     }
 
+    /// Only a backend's explicit request-data classifier can change a prefill failure into a refusal.
+    pub fn passFailure(h: *LaneHost, job: *Job, err: anyerror) bool {
+        if (h.explain) |x| if (x.request) |request| if (request(x.ctx, err)) |message|
+            return h.dropReason(job, .refused, message);
+        return h.drop(job, h.words(err));
+    }
+
     pub fn drop(h: *LaneHost, job: *Job, message: []const u8) bool {
+        return h.dropReason(job, .failed, message);
+    }
+
+    fn dropReason(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) bool {
         h.remove(job);
         if (job.started and !job.stream.finished) h.core.discard(&job.stream);
-        h.finish(job, .failed, message);
+        h.finish(job, reason, message);
         return true;
     }
 
@@ -601,4 +612,5 @@ test {
     _ = @import("lane_host_frame_test.zig");
     _ = @import("lane_host_tests.zig");
     _ = @import("lane_host_fetch.zig");
+    _ = @import("lane_host_media_test.zig");
 }
