@@ -5,6 +5,9 @@ production TP2 `Session`. It keeps the existing `validate` and single-block `mea
 commands. This driver prescribes work; it adds no serving path or inference scheduler.
 Hardware correctness, transport, original/default-server neutrality and performance remain
 separate gates. Host tests and a compiled command do not establish those gates.
+Before booking this full campaign, complete the production workload-shape check and the cheap
+served q8 sharding screen in [DECISION.md](../../tools/perf/glm_replay/DECISION.md), report both
+with a recommendation, and wait for the user's campaign decision. Preserve the host implementation.
 
 ## Commands
 

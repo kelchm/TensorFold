@@ -5,6 +5,8 @@ not load an engine, call a model, start a service, or establish device correctne
 and external Python adapters consume the exact same arrays and ordered forward schedule.
 All work uses standard speed. Native arithmetic remains dense/head 8/8, TP2 and FP8 paged KV;
 the recorded Python q4 profile is a contextual comparison.
+Finish and retain host work first. The full hardware campaign waits for the production workload
+and cheap served-sharding screens, then the user's decision; see [DECISION.md](DECISION.md).
 
 The schemas and exact hash rules are in [SCHEMA.md](SCHEMA.md). Python 3.11+ is sufficient
 for validation, generation of synthetic host fixtures, tests and analysis. Real tokenization
@@ -41,7 +43,8 @@ The example file checksums are in `fixtures/manifest.json`.
 
 ## Real fixture generation
 
-Real campaign fixtures are intentionally absent until pinned local assets are provided.
+The repository ships synthetic host controls; generate real campaign fixtures locally from
+verified pinned assets. Asset identity and host fixture validation do not qualify device behavior.
 Use a dedicated tokenizer directory containing only files named in an independently pinned
 manifest. Every file is hashed before `AutoTokenizer` is imported or constructed. Both
 `tokenizer.json` and `tokenizer_config.json` are required; include the template, added-token,

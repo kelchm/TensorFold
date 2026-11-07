@@ -3,6 +3,8 @@
 The local experiment is based on historical `e52eb42b52b1e50f3f23a5eae8115bbe80c5e7d9`.
 It retains dense/head 8/8, FP8 paged KV, TP2, four configured slots and DFlash2 q4 allocations.
 The same patched binary provides both sharding arms. No proposer runs in replay.
+The full hardware campaign is conditional on the workload-shape and served-sharding screens
+and the user's decision in [DECISION.md](DECISION.md). Host readiness does not book a window.
 
 ## Host commands
 
