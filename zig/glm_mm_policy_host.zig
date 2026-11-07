@@ -82,3 +82,22 @@ test "TF_GLM_W8A8: only packed 8-bit prompt calls inside the scratch quantize th
         try std.testing.expectEqual(@as(u32, 256), cuda.symbols[0]);
     }
 }
+
+test "TF_GLM_PDL_CHAIN: a K-sliced call's reduce launches as the matmul's dependent only with chain.reduce" {
+    for ([_]bool{ false, true }) |on| for ([_]usize{ 1, 8, 32 }) |rows| {
+        var k = kernels;
+        k.pdl = true;
+        k.chain.reduce = on;
+        cuda.count = 0;
+        try mm.matmul(&k, .{}, 4096, 2048, .{ .w = 8192, .s = 12288, .n = 4096, .k = 2048, .bits = 8 }, 16384, 32768, rows, false, false);
+        try std.testing.expectEqual(@as(usize, 2), cuda.count);
+        try std.testing.expect(cuda.configs[0].pdl); // the matmul's own, as before
+        try std.testing.expectEqual(@as(u32, 1024), cuda.symbols[1]);
+        try std.testing.expectEqual(on, cuda.configs[1].pdl);
+    };
+    try std.testing.expectEqual(mm.Chain.all, mm.Chain.parse("1").?);
+    try std.testing.expectEqual(mm.Chain{}, mm.Chain.parse("0").?);
+    try std.testing.expectEqual(mm.Chain{ .reduce = true, .p2p = true }, mm.Chain.parse("reduce,p2p").?);
+    try std.testing.expectEqual(mm.Chain{ .hc = true }, mm.Chain.parse("hc").?);
+    try std.testing.expect(mm.Chain.parse("reduce,hc,x") == null);
+}

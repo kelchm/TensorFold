@@ -36,6 +36,39 @@ pub const Packed = struct {
     }
 };
 
+/// TF_GLM_PDL_CHAIN: dependent launches past glm_mm's own, each kernel waiting before it touches another grid's
+/// data, so the bits never depend on overlap. "1" (the default) all, "0" none, or a comma list of the names below;
+/// TF_GLM_PDL=0 turns these off with glm_mm's.
+pub const Chain = struct {
+    reduce: bool = false, // glm_mm_reduce launches as its matmul's dependent (not on the shared expert's side stream)
+    hc: bool = false, // a decode window's hc_post, hc_partial8 and hc_finish (cuda_glue)
+    p2p: bool = false, // the peer-store all-gather (cuda/p2p_gather.zig): waits, lets the next grid launch, exchanges
+
+    pub const all: Chain = .{ .reduce = true, .hc = true, .p2p = true };
+
+    /// The chain a TF_GLM_PDL_CHAIN value names; null when a name is none of the three.
+    pub fn parse(v: []const u8) ?Chain {
+        if (std.mem.eql(u8, v, "1")) return all;
+        if (std.mem.eql(u8, v, "0")) return .{};
+        var c: Chain = .{};
+        var it = std.mem.tokenizeScalar(u8, v, ',');
+        while (it.next()) |name| {
+            if (std.mem.eql(u8, name, "reduce")) c.reduce = true else if (std.mem.eql(u8, name, "hc")) c.hc = true else if (std.mem.eql(u8, name, "p2p")) c.p2p = true else return null;
+        }
+        return c;
+    }
+
+    /// The process's chain: TF_GLM_PDL=0 none; else TF_GLM_PDL_CHAIN (unset: all; a bad value: none, logged).
+    pub fn read() Chain {
+        if (std.c.getenv("TF_GLM_PDL")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return .{};
+        const v = std.mem.span(std.c.getenv("TF_GLM_PDL_CHAIN") orelse return all);
+        return parse(v) orelse {
+            std.log.err("TF_GLM_PDL_CHAIN: 1, 0 or a comma list of reduce, hc, p2p (not '{s}'): the chain stays off", .{v});
+            return .{};
+        };
+    }
+};
+
 /// glm_mm's bf16 kernels by row bucket, the K-slice reduce and the tiling.
 pub const Kernels = struct {
     by_rows: [4]cuda.Function, // bf16: 16, 32, 64, 128 rows a block
@@ -48,6 +81,7 @@ pub const Kernels = struct {
     tile_packed: [3]cuda.Function, // glm_mm_tile4/6/8: packed rows and their scales into the tiles
     prompt_fixed_k: bool = false, // opt-in prompt experiment; never selected from the number of batched rows
     pdl: bool, // dependent launches: a matmul's weights stream in while the kernel before it finishes
+    chain: Chain = .{}, // TF_GLM_PDL_CHAIN: the dependent launches past glm_mm's (none unless load reads them)
     q8: cuda.Function, // glm_q8_rows: a prompt's bf16 rows to int8 with a scale per row and 64- or 32-group (TF_GLM_W8A8)
     mm8a8: [2][2]cuda.Function, // [64-, 32-groups][glm_mm8a8_64s3r (to 1024 rows), _128s3r]: int8 rows by the 8-bit codes
     a8: ?A8 = null, // TF_GLM_W8A8=1: the int8 rows' scratch; null: packed prompts stay on bf16 rows (the default)
@@ -77,6 +111,7 @@ pub const Kernels = struct {
         }
         try k.prompt.allowDynamicShared(smem(128));
         if (std.c.getenv("TF_GLM_PDL")) |v| k.pdl = !std.mem.eql(u8, std.mem.span(v), "0");
+        k.chain = Chain.read();
         return k;
     }
 };
@@ -222,7 +257,8 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
             r.add(@as(c_longlong, @intCast(total)));
             r.add(@as(c_int, @intCast(sk)));
             r.add(@as(c_int, @intFromBool(wide)));
-            try cuda.launch.launch(k.reduce, .{ .grid = .{ .x = @intCast((total + 255) / 256) }, .block = .{ .x = 256 } }, s, &r);
+            // with chain.reduce it may start while the matmul runs: it waits for it before reading `part`
+            try cuda.launch.launch(k.reduce, .{ .grid = .{ .x = @intCast((total + 255) / 256) }, .block = .{ .x = 256 }, .pdl = k.chain.reduce }, s, &r);
         }
         done += rows;
     }

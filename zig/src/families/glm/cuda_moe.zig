@@ -7,6 +7,7 @@ const experts = @import("cuda_experts.zig");
 const exl3 = @import("cuda_exl3.zig");
 const prof_mod = @import("cuda_prof.zig");
 const projection = @import("cuda_proj.zig");
+const mm_mod = @import("cuda_mm.zig");
 
 /// One MoE layer on a rank: router (bf16 [count][dims]) and fp32 bias, routed experts, shared [gate | up] and down.
 pub const Layer = struct {
@@ -79,7 +80,15 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
         const sd = k.side.?;
         try sd.fork.record(stream);
         try sd.s.wait(sd.fork);
-        try sharedRows(k, sd.s, l, s, x, x_stride, 0, rows, prompt, !grouped(k, l, rows, prompt));
+        // the side stream keeps glm_mm's own dependent launches only: none of TF_GLM_PDL_CHAIN's there
+        var ks = k;
+        var side_mm: mm_mod.Kernels = undefined;
+        if (k.set.mm) |m| {
+            side_mm = m.*;
+            side_mm.chain = .{};
+            ks.set.mm = &side_mm;
+        }
+        try sharedRows(ks, sd.s, l, s, x, x_stride, 0, rows, prompt, !grouped(k, l, rows, prompt));
         try sd.join.record(sd.s);
     }
     var stamp = prof_mod.span(k.prof, stream, .router);

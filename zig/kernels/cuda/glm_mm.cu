@@ -218,9 +218,11 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
 
 }  // namespace
 
-// The K slices' partials added in slice order, then rounded once.
+// The K slices' partials added in slice order, then rounded once. Dependent launch: it may start while the matmul
+// that writes `part` runs, so every thread waits for that grid before it reads `part` or writes `out` (or exits).
 extern "C" __global__ void glm_mm_reduce(const float* __restrict__ part, void* __restrict__ out, long long total, int SK, int f32) {
     qmm_frag::grid_launch();
+    qmm_frag::grid_wait();
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     float acc = part[i];
