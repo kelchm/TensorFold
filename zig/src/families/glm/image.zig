@@ -1,4 +1,4 @@
-//! An image's bytes to GLM5-Next vision patches as TensorFold 0.6.6's --vision made them (Pillow, then mlx-vlm).
+//! GLM5-Next image decode, geometry, Torch uint8 resizing and scoped patch preparation.
 const std = @import("std");
 const picture = @import("../../core/picture/picture.zig");
 const vision = @import("vision_config.zig");
@@ -12,6 +12,7 @@ pub const Error = steps.Error;
 pub const decoderProblem = steps.decoderProblem;
 pub const patchify = steps.patchify;
 pub const prepare = steps.prepare;
+pub const plan = steps.plan;
 pub const prepareRgb = steps.prepareRgb;
 
 test "geometry follows smart_resize" {

@@ -7,6 +7,7 @@ const messages_mod = @import("messages.zig");
 const model_text = @import("model_text.zig");
 const chat = @import("chat.zig");
 const images = @import("images.zig");
+const media_order = @import("media_order.zig");
 const Server = @import("server.zig").Server;
 const Value = json.Value;
 const Cx = errors.Cx;
@@ -30,6 +31,10 @@ pub const isTitle = messages_mod.isTitleRequest;
 
 /// ``render_prompt_ids``: messages normalized for this template, rendered, and a dangling ``<think>`` closed.
 pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool) errors.Refused![]const u32 {
+    return renderIdsMedia(srv, cx, messages, tools, thinking, effort, generation, null);
+}
+
+fn renderIdsMedia(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, ordered: ?*Value) errors.Refused![]const u32 {
     const normalized = try messages_mod.toolArguments(cx, try messages_mod.normalizeWith(cx, messages, srv.late_system, srv.needs_user_after_tool, .of(srv.info.vision)));
     var problem: []const u8 = "";
     const options: model_text.RenderOptions = .{
@@ -39,7 +44,7 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
         .reasoning_effort = if (thinking) effort else null,
         .clear_thinking = cx.clear_thinking,
     };
-    var ids = render(srv, cx.a, normalized, options, &problem) catch |e| switch (e) {
+    var ids = render(srv, cx, normalized, options, &problem, ordered) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Template => return cx.fail(.request, "{s}", .{problem}),
     };
@@ -70,8 +75,31 @@ pub fn canCloseThinking(srv: *Server) bool {
 }
 
 /// The template's ids for `messages`; with image input, a marker the text spells is ordinary text (images.zig).
-fn render(srv: *Server, a: std.mem.Allocator, messages: Value, options: model_text.RenderOptions, problem: *[]const u8) model_text.Error![]u32 {
+fn render(srv: *Server, cx: *Cx, messages: Value, options: model_text.RenderOptions, problem: *[]const u8, ordered: ?*Value) model_text.Error![]u32 {
+    const a = cx.a;
     var rendered = try srv.text.render(a, messages, options, problem);
+    if (ordered) |out| if (srv.info.vision) |v| if (v.image_limits) |limits| if (limits.render_order) {
+        const tagged = media_order.tag(cx, messages, v.part_type) catch |e| {
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            problem.* = cx.message;
+            return error.Template;
+        };
+        if (tagged.media.len > 0) {
+            const trace = try srv.text.render(a, tagged.messages, options, problem);
+            const resolved = media_order.resolve(cx, tagged, trace) catch |e| {
+                if (e == error.OutOfMemory) return error.OutOfMemory;
+                problem.* = cx.message;
+                return error.Template;
+            };
+            if (!std.mem.eql(u8, rendered.text, resolved.rendered.text)) {
+                problem.* = "the chat template cannot preserve media occurrence order without changing its text";
+                return error.Template;
+            }
+            rendered = resolved.rendered;
+            out.* = resolved.messages;
+        }
+    };
+
     if (srv.info.vision) |v| if (v.video) |o| if (o.video_text.len > 0) {
         const word = try srv.text.tokenString(a, o.video_token);
         rendered = try rendered.replaceTemplate(a, o.video_text, word);
@@ -123,14 +151,15 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
         } },
         .ids => |ids| return .{ .ids = ids },
     };
-    const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true);
+    var media_messages = input.messages;
+    const prompt = try renderIdsMedia(srv, cx, input.messages, input.tools, thinking, effort, true, &media_messages);
     const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
     var history_len: usize = 0;
     if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
     if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
     if (history_len > 0) history_len = continuedLen(srv, cx, input.messages, input.tools, thinking, effort, history, history_len);
     // --vision: placeholders expanded to image tokens before the window, chunks and cache see it; no rewind kept
-    if (try images.expand(srv.info.vision, if (srv.config.vision_urls) images.Fetch.network(srv.io) else null, srv.text, cx, input.messages, prompt, history_len)) |x| return .{ .ids = x.ids, .history_len = x.history_len, .images = x.images, .cache_key = x.cache_key };
+    if (try images.expand(srv.info.vision, if (srv.config.vision_urls) images.Fetch.network(srv.io) else null, srv.text, cx, media_messages, prompt, history_len)) |x| return .{ .ids = x.ids, .history_len = x.history_len, .images = x.images, .cache_key = x.cache_key };
     const count = if (input.messages == .array) input.messages.array.len else 0;
     const rewind_len = if (srv.info.prompt_cache) rewindLen(srv, cx, input.messages, count, input.tools, prompt, thinking, effort) else 0; // one more render
     return .{ .ids = prompt, .history_len = history_len, .rewind_len = rewind_len, .user_end = userEnd(input.messages, history_len) };

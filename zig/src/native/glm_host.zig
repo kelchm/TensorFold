@@ -118,9 +118,10 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, window: u32, speed_up: 
         h.markers = .{ v.c.image_start, v.c.image_token, v.c.image_end };
         h.video_open = o;
         offer = .{ .ctx = h, .prepare = prepareImage, .image_token = v.c.image_token, .markers = &h.markers, .image_tokens = o.image_tokens, .max_images = o.max_images, .explain = glm.image.decoderProblem };
+        offer.?.image_limits = .{ .io = io, .per_image_tokens = 2048, .max_request_bytes = 64 << 20, .max_request_pixels = 400 << 20, .prepare_seconds = 100, .render_order = true };
         if (v.c.video) |vm| {
             h.video_markers = vm;
-            offer.?.video = .{ .prepare = prepareVideo, .video_token = vm[1], .group_open = v.c.image_start, .group_close = v.c.image_end, .markers = &h.video_markers, .video_tokens = o.video_tokens, .max_videos = o.max_videos, .max_frames = o.max_frames };
+            offer.?.video = .{ .per_video_tokens = 16384, .prepare = prepareVideo, .video_token = vm[1], .group_open = v.c.image_start, .group_close = v.c.image_end, .markers = &h.video_markers, .video_tokens = o.video_tokens, .max_videos = o.max_videos, .max_frames = @min(o.max_frames, 128) };
         }
     }
     // sampled draws on one Mac (the pair refuses them per request)
@@ -188,8 +189,8 @@ fn borrowedState(ctx: *anyopaque, saved: *anyopaque) bool {
 /// Info.vision's prepare: an image's bytes to the tower's patches (families/glm/image.zig), on the HTTP thread.
 fn prepareImage(ctx: *anyopaque, a: Allocator, bytes: []const u8, max_tokens: u32) anyerror!api.PreparedImage {
     const h: *Host = @ptrCast(@alignCast(ctx));
-    const p = try glm.image.prepare(h.wall.io, a, bytes, h.eng.vision.?.c, max_tokens);
-    return .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .tokens = p.tokens, .hash = p.hash };
+    const p = try glm.image.plan(h.wall.io, a, bytes, h.eng.vision.?.c, max_tokens);
+    return .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .tokens = p.tokens, .hash = p.hash, .source_pixels = p.source_pixels, .deferred = if (p.deferred) |d| .{ .ctx = d.ctx, .prepare = d.prepare } else null };
 }
 
 /// Info.vision's video offer: a decoded video's frames to the tower's frame groups (glm/video.zig), on the HTTP thread.
@@ -210,7 +211,7 @@ fn prepareVideo(ctx: *anyopaque, a: Allocator, src: api.VideoSource, max_tokens:
     };
     var ad: Adapter = .{ .src = src };
     const s: glm.video.Source = .{ .frames = src.frames, .rate_num = src.rate_num, .rate_den = src.rate_den, .width = src.width, .height = src.height, .ctx = &ad, .decode = Adapter.decode };
-    const p = try glm.video.prepare(a, s, h.eng.vision.?.c, max_tokens, max_frames);
+    const p = try glm.video.prepare(a, s, h.eng.vision.?.c, @min(max_tokens, 16384), @min(max_frames, 128));
     const groups = try a.alloc(api.PreparedImage, p.groups.len);
     for (groups, p.groups) |*g, q| g.* = .{ .pixels = q.pixels, .gh = q.gh, .gw = q.gw, .tokens = q.tokens, .hash = q.hash };
     return .{ .groups = groups, .times = p.times };

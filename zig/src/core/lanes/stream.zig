@@ -103,12 +103,24 @@ pub const Held = struct {
 
 /// One image of a prompt: tower input (patches [gh * gw, width]) for the `tokens` placeholder rows from `at`.
 pub const Image = struct {
+    pub const Deferred = struct {
+        ctx: *const anyopaque,
+        prepare: *const fn (ctx: *const anyopaque, a: Allocator) anyerror![]const f32,
+    };
+
     pixels: []const f32,
+    deferred: ?Deferred = null,
+
     gh: u32,
     gw: u32,
     at: u32,
     tokens: u32,
     hash: u64 = 0, // core/picture/identity.zig's: the bytes and the grid, as the prompt cache's key names the image
+
+    /// Patches live only in the caller's scoped allocator; encoded input lives with the request.
+    pub fn materialize(img: Image, a: Allocator) ![]const f32 {
+        return if (img.deferred) |d| try d.prepare(d.ctx, a) else img.pixels;
+    }
 };
 
 pub const Spec = struct {

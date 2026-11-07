@@ -68,7 +68,7 @@ pub const Fetch = struct {
 pub fn sourceBytes(cx: *Cx, fetch: ?Fetch, url: []const u8, limit: usize, deadline: std.Io.Timestamp) errors.Refused![]const u8 {
     if (std.ascii.startsWithIgnoreCase(url, "data:")) {
         const bytes = try dataBytes(cx, url);
-        if (bytes.len > limit) return cx.refuse("the request's images exceed 20 MB encoded");
+        if (bytes.len > limit) return cx.refuse("the request's images exceed the configured encoded byte limit");
         return bytes;
     }
     if (!std.mem.startsWith(u8, url, "https://")) return cx.refuse("images require data URLs or public HTTPS URLs");
@@ -79,7 +79,7 @@ pub fn sourceBytes(cx: *Cx, fetch: ?Fetch, url: []const u8, limit: usize, deadli
         error.OutOfMemory => return error.OutOfMemory,
         error.Media => return cx.refuse(failure.text),
     };
-    if (bytes.len == 0) return cx.refuse("image is empty or exceeds the encoded byte limit");
+    if (bytes.len == 0 or bytes.len > limit) return cx.refuse("image is empty or exceeds the encoded byte limit");
     return bytes;
 }
 
@@ -112,6 +112,7 @@ pub fn dataBytesOf(cx: *Cx, url: []const u8, max: usize, comptime noun: []const 
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
     while (i < payload.len) : (i += 1) {
+        if (out.items.len == max) return cx.refuse(noun ++ " exceeds the encoded byte limit");
         if (payload[i] == '%' and i + 2 < payload.len) {
             const b = std.fmt.parseInt(u8, payload[i + 1 .. i + 3], 16) catch return cx.refuse("invalid " ++ noun ++ " data URL encoding");
             try out.append(cx.a, b);
@@ -166,26 +167,35 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
     if (ps.len == 0) return null;
     if (n_images > v.max_images) return cx.refuse(try std.fmt.allocPrint(cx.a, "a request may hold at most {d} images (--vision-max-images); it has {d}", .{ v.max_images, n_images }));
     if (v.video) |o| if (n_videos > o.max_videos) return cx.refuse(try std.fmt.allocPrint(cx.a, "a request supports at most {d} videos", .{o.max_videos}));
-    const budget: u32 = if (n_images > 0) v.image_tokens / @as(u32, @intCast(n_images)) else 0;
+    const budget: u32 = if (v.image_limits) |l| l.per_image_tokens else if (n_images > 0) v.image_tokens / @as(u32, @intCast(n_images)) else 0;
+    const request_bytes = if (v.image_limits) |l| l.max_request_bytes else max_request_bytes;
+    const io: ?std.Io = if (v.image_limits) |l| l.io else if (fetch) |f| f.io else null;
+    const started: std.Io.Timestamp = if (io) |i| std.Io.Clock.awake.now(i) else .{ .nanoseconds = 0 };
+    var pixels_total: u64 = 0;
+    var tokens_total: u64 = 0;
     if (n_images > 0 and budget < 1) return cx.refuse("the image count exceeds the visual-token budget");
     const prepared = try cx.a.alloc(api.PreparedImage, n_images);
     const clips = try cx.a.alloc(api.PreparedVideo, n_videos);
     var bytes_total: usize = 0;
     // every URL's download inside one request's seconds (images.py total_timeout_seconds, videos.py's)
-    const deadline: std.Io.Timestamp = if (fetch) |f| std.Io.Clock.awake.now(f.io).addDuration(.fromSeconds(media_fetch.total_s)) else .{ .nanoseconds = 0 };
+    const deadline: std.Io.Timestamp = if (io) |i| std.Io.Clock.awake.now(i).addDuration(.fromSeconds(if (v.image_limits) |l| l.prepare_seconds else media_fetch.total_s)) else .{ .nanoseconds = 0 };
     var video_budget: videos.Budget = .{ .deadline = if (fetch) |f| std.Io.Clock.awake.now(f.io).addDuration(.fromSeconds(videos.total_s)) else .{ .nanoseconds = 0 } };
     var ii: usize = 0;
     var vi: usize = 0;
+    var video_tokens_total: u64 = 0;
     for (ps) |p| {
         if (p.video) {
             const o = v.video.?;
-            clips[vi] = try videos.prepare(cx, o, v.ctx, fetch, p.url, vi, o.video_tokens / @as(u32, @intCast(n_videos)), &video_budget);
+            const cap = videoTokenBudget(o, n_videos);
+            clips[vi] = try videos.prepare(cx, o, v.ctx, fetch, p.url, vi, cap, &video_budget);
+            try accountVideo(cx, o, clips[vi], cap, &video_tokens_total);
             vi += 1;
             continue;
         }
+        if (v.image_limits) |l| if (started.durationTo(std.Io.Clock.awake.now(l.io)).nanoseconds > @as(i96, l.prepare_seconds) * std.time.ns_per_s) return cx.refuse("image preparation exceeded the configured time limit");
         const i = ii;
         ii += 1;
-        const bytes = try sourceBytes(cx, fetch, p.url, @min(max_image_bytes, max_request_bytes - bytes_total), deadline);
+        const bytes = try sourceBytes(cx, fetch, p.url, @min(max_image_bytes, request_bytes - bytes_total), deadline);
         bytes_total += bytes.len;
         switch (sniff(bytes)) { // the Python frontend's formats (images.py: JPEG, PNG, WebP)
             .png, .jpeg, .webp => {},
@@ -194,6 +204,13 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
         const cap = if (p.low) @min(budget, low_detail_tokens) else budget;
         prepared[i] = v.prepare(v.ctx, cx.a, bytes, cap) catch |e| return refusal(cx, v, i, e);
         if (prepared[i].tokens == 0 or prepared[i].tokens > cap) return cx.refuse("the image processor exceeded the per-image visual-token budget");
+        tokens_total += prepared[i].tokens;
+        if (tokens_total > v.image_tokens) return cx.refuse("the request's images exceed the configured total visual-token budget");
+        if (v.image_limits) |l| {
+            pixels_total += prepared[i].source_pixels;
+            if (pixels_total > l.max_request_pixels) return cx.refuse("the request's images exceed the configured decoded pixel limit");
+            if (started.durationTo(std.Io.Clock.awake.now(l.io)).nanoseconds > @as(i96, l.prepare_seconds) * std.time.ns_per_s) return cx.refuse("image preparation exceeded the configured time limit");
+        }
     }
     var out_ids: std.ArrayList(u32) = .empty;
     var key: std.ArrayList(u32) = .empty;
@@ -246,6 +263,20 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
     return .{ .ids = out_ids.items, .history_len = hist, .images = imgs.items, .cache_key = key.items };
 }
 
+/// GLM fixes each clip's ceiling; families without that policy keep their existing shared-budget behavior.
+pub fn videoTokenBudget(o: api.VideoOffer, count: usize) u32 {
+    return o.per_video_tokens orelse (o.video_tokens / @as(u32, @intCast(count)));
+}
+
+/// Count actual prepared rows, rejecting any per-clip or request excess rather than reducing earlier media.
+pub fn accountVideo(cx: *Cx, o: api.VideoOffer, clip: api.PreparedVideo, cap: u32, total: *u64) errors.Refused!void {
+    var tokens: u64 = 0;
+    for (clip.groups) |g| tokens += g.tokens;
+    if (tokens == 0 or tokens > cap) return cx.refuse("the video processor exceeded the per-video visual-token budget");
+    total.* += tokens;
+    if (total.* > o.video_tokens) return cx.refuse("the request's videos exceed the configured total visual-token budget");
+}
+
 /// A video group's time as text at the end of `ids`; Qwen's "<X.Y seconds>" when `angle`.
 fn appendTime(cx: *Cx, text: model_text.Text, ids: *std.ArrayList(u32), key: *std.ArrayList(u32), secs: f64, angle: bool) errors.Refused!void {
     var buf: [64]u8 = undefined;
@@ -266,7 +297,7 @@ pub fn both(a: std.mem.Allocator, ids: *std.ArrayList(u32), key: *std.ArrayList(
 /// Appends one image's rows, its engine entry and its cache words; `named`: the word before them is its marker's.
 fn placeImage(a: std.mem.Allocator, ids: *std.ArrayList(u32), key: *std.ArrayList(u32), imgs: *std.ArrayList(api.Image), token: u32, img: api.PreparedImage, named: bool) !void {
     if (named) key.items[key.items.len - 1] = image_key.open(img.hash);
-    try imgs.append(a, .{ .pixels = img.pixels, .gh = img.gh, .gw = img.gw, .at = @intCast(ids.items.len), .tokens = img.tokens, .hash = img.hash });
+    try imgs.append(a, .{ .pixels = img.pixels, .deferred = img.deferred, .gh = img.gh, .gw = img.gw, .at = @intCast(ids.items.len), .tokens = img.tokens, .hash = img.hash });
     for (0..img.tokens) |j| {
         try ids.append(a, token);
         try key.append(a, image_key.row(img.hash, j));

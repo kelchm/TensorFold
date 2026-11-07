@@ -9,6 +9,8 @@ pub const PreparedImage = struct {
     gw: u32,
     tokens: u32,
     hash: u64,
+    source_pixels: u64 = 0,
+    deferred: ?@import("lanes").stream.Image.Deferred = null,
     /// The image as tower inputs in order, each image tokens between `before` and `after`; empty: `pixels` alone.
     pieces: []const Piece = &.{},
 };
@@ -31,6 +33,15 @@ pub const Vision = struct {
     /// Image tokens one request may hold in all, and images.
     image_tokens: u32,
     max_images: u32,
+    /// A family may keep every image at a fixed budget and impose its own request-wide limits.
+    image_limits: ?struct {
+        io: std.Io,
+        per_image_tokens: u32,
+        max_request_bytes: usize,
+        max_request_pixels: u64,
+        prepare_seconds: u32,
+        render_order: bool = false,
+    } = null,
     /// Video input, when the engine's family reads it.
     video: ?VideoOffer = null,
     /// The engine's words for a prepare error the server cannot word (a decoder library it lacks); null: the server's.
@@ -74,6 +85,8 @@ pub const VideoOffer = struct {
     markers: []const u32 = &.{},
     /// Video tokens one request may hold in all, videos, and frames sampled a video.
     video_tokens: u32,
+    /// A family may fix the per-clip ceiling independently of the request total.
+    per_video_tokens: ?u32 = null,
     max_videos: u32,
     max_frames: u32,
 };

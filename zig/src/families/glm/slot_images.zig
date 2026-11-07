@@ -18,10 +18,13 @@ pub fn encode(sl: *Slots, i: u32, imgs: []const Image) !void {
     for (imgs) |img| {
         if (row + img.tokens > e.vision_limits.image_tokens or img.gh * img.gw != img.tokens * vision_mod.patches_per_token) return error.ImageTooLarge;
         if (img.at + img.tokens > sl.slots[i].prompt_len) return error.ImageOutOfPrompt;
+        var scratch: std.heap.ArenaAllocator = .init(v.gpa);
+        defer scratch.deinit();
+        const pixels = try img.materialize(scratch.allocator());
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         const b = e.begin();
-        try v.encode(b.enc, img.pixels, img.gh, img.gw, e.vision_rows.at(@as(usize, row) * e.c.hidden * 2), null);
+        try v.encode(b.enc, pixels, img.gh, img.gw, e.vision_rows.at(@as(usize, row) * e.c.hidden * 2), null);
         try e.finish(b.cb, b.enc);
         try v.spans.append(v.gpa, .{ .at = img.at, .n = img.tokens, .row = row });
         row += img.tokens;

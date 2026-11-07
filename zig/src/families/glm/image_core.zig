@@ -1,14 +1,21 @@
-//! An image's bytes to GLM5-Next vision patches as TensorFold 0.6.6's --vision made them, over the caller's decoder.
+//! GLM5-Next image geometry, Torch uint8 resizing and patch inputs over the caller's decoder.
 const std = @import("std");
 const vision = @import("vision_config.zig");
 
 /// One image ready for the tower: its patches, its patch grid and its tokens (gh * gw / 4).
+pub const Deferred = struct {
+    ctx: *const anyopaque,
+    prepare: *const fn (ctx: *const anyopaque, a: std.mem.Allocator) anyerror![]const f32,
+};
+
 pub const Prepared = struct {
     pixels: []f32, // [gh * gw, 1176]
+    source_pixels: u64 = 0,
+    deferred: ?Deferred = null,
     gh: u32,
     gw: u32,
     tokens: u32,
-    hash: u64, // its identity (core/picture/identity.zig): bytes and grid, so another budget is another image
+    hash: u64, // processor revision, encoded bytes, normalization, fitted content and grid
 };
 
 // ---- the processor's geometry ----
@@ -95,22 +102,58 @@ pub fn For(comptime picture: type) type {
             return out;
         }
 
-        /// Bytes to patches: decoded as 0.6.6 decoded them, sized for `max_tokens`, resized, padded and cut.
+        const Lazy = struct {
+            io: std.Io,
+            bytes: []const u8,
+            config: vision.Config,
+            max_tokens: u32,
+
+            fn materialize(ctx: *const anyopaque, a: std.mem.Allocator) anyerror![]const f32 {
+                const self: *const Lazy = @ptrCast(@alignCast(ctx));
+                return (try prepare(self.io, a, self.bytes, self.config, self.max_tokens)).pixels;
+            }
+        };
+
+        /// Validate in temporary memory, retaining encoded bytes and geometry rather than all float patches.
+        pub fn plan(io: std.Io, a: std.mem.Allocator, bytes: []const u8, c: vision.Config, max_tokens: u32) Error!Prepared {
+            if (bytes.len > 10 << 20) return error.Oversized;
+            var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const img = try picture.decode(io, scratch.allocator(), bytes);
+            const g = try geometry(@intCast(img.height), @intCast(img.width), @min(c.min_tokens, max_tokens), max_tokens);
+            const grid = [2]u32{ g.target_h / vision.patch, g.target_w / vision.patch };
+            const lazy = try a.create(Lazy);
+            lazy.* = .{ .io = io, .bytes = bytes, .config = c, .max_tokens = max_tokens };
+            return .{ .pixels = &.{}, .source_pixels = @as(u64, img.width) * img.height, .gh = grid[0], .gw = grid[1], .tokens = grid[0] * grid[1] / vision.patches_per_token, .hash = preparedHash(picture.identity.ofBytes(0x1a6e, bytes), c, g), .deferred = .{ .ctx = lazy, .prepare = Lazy.materialize } };
+        }
+
+        /// Bytes to patches: decoded, fitted with Torch's uint8 bicubic resize, padded and cut.
         pub fn prepare(io: std.Io, gpa: std.mem.Allocator, bytes: []const u8, c: vision.Config, max_tokens: u32) Error!Prepared {
+            if (bytes.len > 10 << 20) return error.Oversized;
             var img = try picture.decode(io, gpa, bytes);
             defer img.deinit(gpa);
             return prepareRgb(gpa, img, picture.identity.ofBytes(0x1a6e, bytes), c, max_tokens);
         }
 
-        /// RGB to patches (Pillow's bicubic resize, the padded canvas cut); the hash covers the bytes and the grid.
+        fn preparedHash(bytes_hash: u64, c: vision.Config, g: Geometry) u64 {
+            var identity: [40]u8 = undefined;
+            @memcpy(identity[0..8], std.mem.asBytes(&bytes_hash));
+            @memcpy(identity[8..20], std.mem.asBytes(&c.mean));
+            @memcpy(identity[20..32], std.mem.asBytes(&c.std));
+            @memcpy(identity[32..36], std.mem.asBytes(&g.content_h));
+            @memcpy(identity[36..40], std.mem.asBytes(&g.content_w));
+            return picture.identity.withGrid(picture.identity.ofBytes(0x746f72636802, &identity), .{ g.target_h / vision.patch, g.target_w / vision.patch });
+        }
+
+        /// RGB to patches; identity includes processor revision, normalization, fitted size, encoded bytes and grid.
         pub fn prepareRgb(gpa: std.mem.Allocator, img: picture.Rgb, bytes_hash: u64, c: vision.Config, max_tokens: u32) Error!Prepared {
             const g = try geometry(@intCast(img.height), @intCast(img.width), @min(c.min_tokens, max_tokens), max_tokens);
-            const resized = try picture.resample.resize(gpa, .pillow, .of(img.pixels, img.width, img.height), g.content_w, g.content_h);
+            const resized = try picture.resample.resize(gpa, .torch, .of(img.pixels, img.width, img.height), g.content_w, g.content_h);
             defer gpa.free(resized);
             const content: picture.Rgb = .{ .width = g.content_w, .height = g.content_h, .pixels = resized };
             const pixels = try patchify(gpa, content, g, c.mean, c.std);
             const grid = [2]u32{ g.target_h / vision.patch, g.target_w / vision.patch };
-            return .{ .pixels = pixels, .gh = grid[0], .gw = grid[1], .tokens = grid[0] * grid[1] / vision.patches_per_token, .hash = picture.identity.withGrid(bytes_hash, grid) };
+            return .{ .pixels = pixels, .gh = grid[0], .gw = grid[1], .tokens = grid[0] * grid[1] / vision.patches_per_token, .source_pixels = @as(u64, img.width) * img.height, .hash = preparedHash(bytes_hash, c, g) };
         }
     };
 }

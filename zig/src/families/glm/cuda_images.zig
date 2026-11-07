@@ -44,6 +44,7 @@ pub const Images = struct {
 
     /// The chat template writes each image's begin and end itself (the server only expands the image token).
     pub const template_wraps = true;
+    pub const fixed_image_tokens: u32 = 2048;
     /// A video's frames to patch pairs (Glm5NextVideoProcessor), over core's decoder: each pair goes in as an image.
     pub const video = video_mod;
 
@@ -159,7 +160,10 @@ pub const Images = struct {
             if (img.gh * img.gw != img.tokens * vcfg.patches_per_token) return error.ImageOutOfStep;
             if (img.at + img.tokens <= from) continue; // in the kept state already
             if (img.tokens > (try v.rowLimit()) -| row) return error.ImageRows; // the server holds a request to its limits
-            try t.encode(&v.run, img.pixels, .{ 1, img.gh, img.gw }, v.rows.ptr + @as(u64, row) * vcfg.out_hidden * 2);
+            var scratch: std.heap.ArenaAllocator = .init(v.gpa);
+            defer scratch.deinit();
+            const pixels = try img.materialize(scratch.allocator());
+            try t.encode(&v.run, pixels, .{ 1, img.gh, img.gw }, v.rows.ptr + @as(u64, row) * vcfg.out_hidden * 2);
             try v.spans.append(v.gpa, .{ .at = img.at, .n = img.tokens, .row = row });
             row += img.tokens;
         }
@@ -219,12 +223,12 @@ pub const Images = struct {
 
     /// A video's sampled frames as patch pairs within `max_tokens` and `max_frames` (the server's prepare).
     pub fn prepareVideo(v: *const Images, a: std.mem.Allocator, s: video.Source, max_tokens: u32, max_frames: u32) !video.Prepared {
-        return video.prepare(a, s, v.cfg.?, max_tokens, max_frames);
+        return video.prepare(a, s, v.cfg.?, @min(max_tokens, 16384), @min(max_frames, 128));
     }
 
     /// An image's bytes as the tower reads them, at most `max_tokens` tokens (the server's prepare).
     pub fn prepare(v: *const Images, a: std.mem.Allocator, data: []const u8, max_tokens: u32) !image_core.Prepared {
-        return image.prepare(v.io, a, data, v.cfg.?, max_tokens);
+        return image.plan(v.io, a, data, v.cfg.?, max_tokens);
     }
 };
 

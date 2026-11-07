@@ -13,7 +13,12 @@ pub fn offer(v: anytype, open: ?api.VisionOpen) ?api.Vision {
         fn f(ctx: *anyopaque, a: Allocator, bytes: []const u8, max_tokens: u32) anyerror!api.PreparedImage {
             const t: *T = @ptrCast(@alignCast(ctx));
             const p = try t.prepare(a, bytes, max_tokens);
-            return .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .tokens = p.tokens, .hash = p.hash };
+            var out: api.PreparedImage = .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .tokens = p.tokens, .hash = p.hash };
+            if (comptime @hasField(@TypeOf(p), "source_pixels")) out.source_pixels = p.source_pixels;
+            if (comptime @hasField(@TypeOf(p), "deferred")) if (p.deferred) |lazy| {
+                out.deferred = .{ .ctx = lazy.ctx, .prepare = lazy.prepare };
+            };
+            return out;
         }
     }.f;
     if (comptime T == qwen35.native.vision.Vision) {
@@ -24,6 +29,7 @@ pub fn offer(v: anytype, open: ?api.VisionOpen) ?api.Vision {
     // a template that writes each image's begin and end itself: the server expands the image token alone
     const wrap: ?[2]u32 = if (@hasDecl(T, "template_wraps")) null else .{ x.marks.open, x.marks.close };
     var out: api.Vision = .{ .ctx = x, .prepare = prepare, .image_token = x.marks.image, .markers = &x.mark_ids, .wrap = wrap, .image_tokens = x.limits.image_tokens, .max_images = x.limits.max_images, .explain = T.explain };
+    if (comptime @hasDecl(T, "fixed_image_tokens")) out.image_limits = .{ .io = x.io, .per_image_tokens = T.fixed_image_tokens, .max_request_bytes = 64 << 20, .max_request_pixels = 400 << 20, .prepare_seconds = 100, .render_order = true };
     if (comptime @hasDecl(T, "part_type")) out.part_type = T.part_type; // the template's name for an image part
     if (comptime T == nemotron.native.vision.Vision) {
         // video: the checkpoint's temporal projection, and a reserved token for the template's `<video>`
@@ -44,6 +50,10 @@ pub fn offer(v: anytype, open: ?api.VisionOpen) ?api.Vision {
     }
     if (comptime @hasDecl(T, "prepareVideo")) if (x.video_ids) |*vm| {
         out.video = .{ .prepare = Video(T).prepare, .video_token = vm[1], .group_open = x.marks.open, .group_close = x.marks.close, .markers = vm, .video_tokens = x.limits.video_tokens, .max_videos = x.limits.max_videos, .max_frames = x.limits.max_frames };
+    };
+    if (comptime @hasDecl(T, "fixed_image_tokens")) if (out.video) |*video| {
+        video.per_video_tokens = 16384;
+        video.max_frames = @min(video.max_frames, 128);
     };
     return out;
 }
