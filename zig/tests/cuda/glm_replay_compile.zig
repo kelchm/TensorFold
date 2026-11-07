@@ -4,3 +4,7 @@ const std = @import("std");
 export fn compileReplayCommand(init: *std.process.Init, args: [*]const [:0]const u8, count: usize) void {
     _ = @import("glm_replay.zig").command(init.*, "glm-replay", args[0..count]) catch {};
 }
+
+export fn compileReplayCampaign(init: *std.process.Init, args: [*]const [:0]const u8, count: usize) void {
+    @import("glm_replay_campaign_run.zig").run(init.*, args[0..count]) catch {};
+}

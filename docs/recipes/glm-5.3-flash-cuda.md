@@ -44,6 +44,9 @@ left after a 12.2 GiB reserve` and a 5.8 GiB prompt cache
 - `--kv-cache fp8` is an opt-in FP8 latent cache. BF16 remains the default, and its native quality and device
   qualification are pending ([1.1.2](../../CHANGELOG.md#112)).
 
+The [local fixed-work replay driver](glm-replay-campaign.md) also supports an ordered
+multi-block campaign in one TP2 process per rank, subject to its separate device gates.
+
 ## More ranks
 
 `TF_GLM_WORLD=3` places a third rank the same way. From 1.1.2 the uneven KDA input projections of TP=3 (22, 21 and

@@ -23,6 +23,8 @@ fn run(init: std.process.Init, cmd: []const u8, args: []const [:0]const u8) !voi
     const a = init.arena.allocator();
     const compiler = @import("builtin").zig_version;
     if (compiler.major != 0 or compiler.minor != 17) return error.ReplayCompiler;
+    if (std.mem.eql(u8, cmd, "glm-replay") and args.len != 0 and std.mem.eql(u8, args[0], "measure-many"))
+        return @import("glm_replay_campaign_run.zig").run(init, args);
     if (std.mem.eql(u8, cmd, "glm-replay-compare")) return @import("glm_replay_compare.zig").run(a, init.io, args);
     if (std.mem.eql(u8, cmd, "glm-replay-check")) {
         if (args.len != 1) return error.ReplayArguments;
@@ -46,11 +48,7 @@ fn run(init: std.process.Init, cmd: []const u8, args: []const [:0]const u8) !voi
     try metadata.checkTokenizer(a, init.io, args[2], f);
     const prep = try exec.compile(a, f, f.preparation);
     const compiled = try exec.compile(a, f, f.forwards);
-    const config_path = try std.fs.path.join(a, &.{ args[2], "config.json" });
-    const config_raw = try std.Io.Dir.cwd().readFileAlloc(init.io, config_path, a, .limited(1 << 24));
-    const model_config = try glm.config.parse(a, config_raw);
-    const expected_model: glm.config.Config = .{};
-    if (model_config.vocab < f.provenance.tokenizer.vocab_size or model_config.vocab != expected_model.vocab or model_config.layers != expected_model.layers or model_config.mla_heads != 64 or model_config.kv_lora != 512 or model_config.i_dim != 128) return error.LoadedConfiguration;
+    try checkModel(a, init.io, args[2], f);
     const place = try glm.native.place();
     if (place.world != 2) return error.ReplayNeedsTP2;
     var driver = try cuda.Driver.open();
@@ -90,22 +88,35 @@ fn drive(init: std.process.Init, args: []const [:0]const u8, s: *replay.Session,
         std.debug.print("PASS glm-replay validation: {d} both-rank forward comparisons; default-server neutrality remains external\n", .{evidence.comparisons});
         return;
     }
+    try measureBlock(init, args[4], s, f, budget, m, sharded, prep, compiled, g, &runtime_hash);
+}
+
+pub fn measureBlock(init: std.process.Init, output: []const u8, s: *replay.Session, f: fixture.Fixture, budget: @import("glm_replay_control.zig").Budget, m: metadata.Metadata, sharded: bool, prep: []exec.Compiled, compiled: []exec.Compiled, g: @import("glm_replay_control.zig").Geometry, runtime_hash: []const u8) !void {
+    const a = init.arena.allocator();
     try s.enableTiming(true);
     try exec.prepare(s, f, budget, prep);
-    _ = try exec.block(s, compiled);
+    try exec.checkCompletion(try exec.block(s, compiled), f.forwards, sharded, g);
     const before = clock(init.io);
     try exec.prepare(s, f, budget, prep);
     const preparation_ns: u64 = @intCast(clock(init.io) - before);
     const completed = try exec.block(s, compiled);
     try exec.checkCompletion(completed, f.forwards, sharded, g);
     try metadata.checkTelemetry(a, init.io, m);
-    try result.write(a, init.io, args[4], f, budget, m, completed, preparation_ns, sharded, s.owned.e, g, &runtime_hash);
+    try result.write(a, init.io, output, f, budget, m, completed, preparation_ns, sharded, s.owned.e, g, runtime_hash);
     const seconds = @as(f64, @floatFromInt(completed.elapsed_ns)) / 1e9;
     const rate = @as(f64, @floatFromInt(completed.ranks[0].rows)) / seconds;
     std.debug.print("PASS glm-replay: both ranks completed {d} forwards; replay throughput {d:.3} forced tokens/s\n", .{ f.forwards.len, rate });
 }
 
-fn settings() !glm.ranks.Settings {
+pub fn checkModel(a: std.mem.Allocator, io: std.Io, dir: []const u8, f: fixture.Fixture) !void {
+    const config_path = try std.fs.path.join(a, &.{ dir, "config.json" });
+    const config_raw = try std.Io.Dir.cwd().readFileAlloc(io, config_path, a, .limited(1 << 24));
+    const model_config = try glm.config.parse(a, config_raw);
+    const expected_model: glm.config.Config = .{};
+    if (model_config.vocab < f.provenance.tokenizer.vocab_size or model_config.vocab != expected_model.vocab or model_config.layers != expected_model.layers or model_config.mla_heads != 64 or model_config.kv_lora != 512 or model_config.i_dim != 128) return error.LoadedConfiguration;
+}
+
+pub fn settings() !glm.ranks.Settings {
     var problem: []const u8 = "";
     const s = try glm.ranks.Settings.read(&glm.ranks.environment, &problem);
     if (glm.ranks.environment("TF_GLM_DFLASH2_PROF") != null) return error.ReplayIntrusiveProfiler;

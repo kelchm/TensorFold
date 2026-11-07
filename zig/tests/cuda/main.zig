@@ -270,6 +270,7 @@ const usage =
     \\  glm-replay-compare OFF ON [GATE_PREFIX]  compare logical validation evidence without CUDA
     \\  glm-replay-check FIXTURE  validate fixed-work inputs without CUDA
     \\  glm-replay MODE FIXTURE MODEL DRAFTER OUTPUT METADATA  local replay (MODE validate|measure)
+    \\  glm-replay measure-many CAMPAIGN MODEL DRAFTER FAILURE_PREFIX  ordered blocks, one rank session
     \\  glm-fp8g-shares          block-FP8 TP shares packed as GLM's loader packs them, on the lane, against FP64 of the cut
     \\  aot-fallback <dir>        a launch's 1 from the runtime-parameter variant: the folded variant's bits (#1003)
     \\
