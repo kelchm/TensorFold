@@ -280,7 +280,10 @@ pub const Images = struct {
     }
 
     pub fn planVideo(v: *const Images, a: std.mem.Allocator, s: video.Source, max_tokens: u32, max_frames: u32) !video.Plan {
-        return video.plan(a, s, v.cfg.?, @min(max_tokens, 16384), @min(max_frames, 128));
+        const cap = @min(max_tokens, 16384);
+        const planned = try video.plan(a, s, v.cfg.?, cap, @min(max_frames, 128));
+        _ = try planned.retainedBytes(cap); // same odd-tail accounting and refusal as frame preparation
+        return planned;
     }
 
     /// An image's bytes as the tower reads them, at most `max_tokens` tokens (the server's prepare).
