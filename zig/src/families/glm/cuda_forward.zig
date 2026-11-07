@@ -51,6 +51,7 @@ pub const Modules = struct {
     quant: quant.Kernels,
     q4: q4.Kernels,
     topk_sum: bool = true, // TF_GLM_TOPK_SUM=0: a decode window's grouped select reads the summed logits (the same bits)
+    shared_segs: bool = true, // TF_GLM_SHARED_SEGS=0: a shared window's segments take their own launches (the same bits)
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
         const k = cuda.kernels;
@@ -89,6 +90,7 @@ pub const Modules = struct {
         m.tiled = false;
         m.packs = null; // `m` starts undefined: the field default does not apply
         m.topk_sum = if (std.c.getenv("TF_GLM_TOPK_SUM")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+        m.shared_segs = if (std.c.getenv("TF_GLM_SHARED_SEGS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         return m;
     }
 

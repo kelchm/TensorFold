@@ -60,7 +60,8 @@ constexpr int wide_smem() {
 template <int HB, bool FP8 = false, bool PAGED8 = false>
 __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
-                            float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr) {
+                            float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr,
+                            int64_t rr = -1, int64_t cc = -1) {
   constexpr int MT = HB / 16;
   extern __shared__ __align__(16) unsigned char smem[];
   __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(smem);
@@ -71,7 +72,8 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   if (blockDim.x != CHUNK_THREADS) __trap();  // the launch contract above, not a tuning knob
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, q = lane & 3;
   const int kg = warp & 3, hh = warp >> 2;
-  const int64_t r = blockIdx.x, h0 = (int64_t)blockIdx.y * HB, c = blockIdx.z;
+  // a segment-batched launch passes the block's row and chunk within its segment (rr, cc)
+  const int64_t r = rr >= 0 ? rr : (int64_t)blockIdx.x, h0 = (int64_t)blockIdx.y * HB, c = cc >= 0 ? cc : (int64_t)blockIdx.z;
   const int64_t n = sparse ? cnt[r] : 0, limit = sparse ? 0 : (int64_t)pos[0] + r, start = c * CH;
   const bool live = sparse ? start < n : start <= limit;
   // a dense chunk's 512 keys are one page, its rows from that page's; a sparse key's row comes as the token list has it
@@ -663,6 +665,85 @@ extern "C" __global__ void __launch_bounds__(128)
     m = nm;
   }
   for (int j = 0; j < 4; ++j) out[(r * heads + h) * LW + k0 + j] = __float2bfloat16_rn(glm_triton::div_full(o[j], l));
+}
+
+// tf_glm_merge's code for a segment-batched launch: row r of its segment (the same loop, word for word).
+namespace glm_attn {
+__device__ __forceinline__ void merge_body(const float* po, const float* pm, const float* pl, __nv_bfloat16* out,
+                                           const int* cnt, int64_t rows, int64_t heads, int nch, int sparse, int64_t r) {
+  const int64_t h = blockIdx.y;
+  if (sparse && cnt[r] == 0) return;
+  const int k0 = threadIdx.x * 4;
+  float m = -INFINITY, l = 0.0f, o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (int c = 0; c < nch; ++c) {
+    const int64_t base = (c * rows + r) * heads + h;
+    const float cm = pm[base], cl = pl[base];
+    const bool active = cl > 0.0f;
+    const float nm = active ? fmaxf(m, cm) : m;
+    const float b = active ? glm_triton::exp_approx(cm - nm) : 0.0f;
+    if (c == 0) {
+      for (int j = 0; j < 4; ++j) o[j] = __fmaf_rn(b, po[base * LW + k0 + j], 0.0f);
+      l = __fmaf_rn(b, cl, 0.0f);
+    } else {
+      const float a = active ? (m == -INFINITY ? 0.0f : glm_triton::exp_approx(m - nm)) : 1.0f;
+      for (int j = 0; j < 4; ++j) o[j] = __fmaf_rn(o[j], a, __fmul_rn(b, po[base * LW + k0 + j]));
+      l = __fmaf_rn(l, a, __fmul_rn(b, cl));
+    }
+    m = nm;
+  }
+  for (int j = 0; j < 4; ++j) out[(r * heads + h) * LW + k0 + j] = __float2bfloat16_rn(glm_triton::div_full(o[j], l));
+}
+}  // namespace glm_attn
+
+// A shared window's latent attention with every segment (stream) in one launch: x runs over the window's rows and
+// each block finds its segment; z runs to the most chunks a segment has, and blocks past their segment's chunks leave.
+// Each block is the block its segment's own tf_glm_chunks_16_fp8_paged / tf_glm_merge launch runs (its row and chunk
+// within the segment; the segment's queries, cache table, position, token lists and partials region), so the bits are
+// the per-segment launches'.
+namespace glm_attn {
+struct AttnSeg {
+  const __nv_bfloat16* qa;  // the segment's absorbed queries (its first row)
+  const unsigned char* lc;  // the stream's latent cache (on pages: this layer's place in page 0)
+  const float* scales;
+  const int* pos;           // the stream's position on the device
+  const int* tok;           // sparse: the segment's token lists and counts (its first row)
+  const int* cnt;
+  float* po;                // the segment's own partials region
+  float* pm;
+  float* pl;
+  const int* pt;            // the stream's page table
+  int64_t rows;
+  int nch;                  // the segment's chunks
+  int row0;                 // its first row in the window
+};
+constexpr int ATTN_SEGS = 16;  // Engine.max_shared
+struct AttnSegs {
+  AttnSeg s[ATTN_SEGS];
+  int n;
+};
+__device__ __forceinline__ const AttnSeg& seg_of(const AttnSegs& t, int row) {
+  int k = 0;
+  while (k + 1 < t.n && row >= t.s[k + 1].row0) ++k;
+  return t.s[k];
+}
+}  // namespace glm_attn
+
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_chunks_16_fp8_paged_segs(int64_t heads, int64_t w, float scale, int sparse, int64_t pstep,
+                                    const glm_attn::AttnSegs t) {
+  const glm_attn::AttnSeg& g = glm_attn::seg_of(t, static_cast<int>(blockIdx.x));
+  const int64_t c = blockIdx.z;
+  if (c >= g.nch) return;  // past the segment's own grid
+  glm_attn::chunks_wide<16, true, true>(g.qa, reinterpret_cast<const __nv_bfloat16*>(g.lc), g.pos, g.tok, g.cnt, g.po,
+                                       g.pm, g.pl, g.rows, heads, w, scale, sparse, g.pt, pstep, g.scales,
+                                       static_cast<int64_t>(blockIdx.x) - g.row0, c);
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+    tf_glm_merge_segs(__nv_bfloat16* out, int64_t heads, int sparse, const glm_attn::AttnSegs t) {
+  const glm_attn::AttnSeg& g = glm_attn::seg_of(t, static_cast<int>(blockIdx.x));
+  glm_attn::merge_body(g.po, g.pm, g.pl, out + static_cast<int64_t>(g.row0) * heads * glm_attn::LW, g.cnt, g.rows,
+                       heads, g.nch, sparse, static_cast<int64_t>(blockIdx.x) - g.row0);
 }
 
 // sparse._scores, block (row, L pool blocks) of 4 warps, 16 pools a warp: sum_h w relu(dots scale), -inf past visible.

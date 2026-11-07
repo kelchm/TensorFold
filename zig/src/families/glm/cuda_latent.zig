@@ -183,6 +183,47 @@ fn fused(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb) }, .block = .{ .x = chunk_threads }, .shared = shared }, stream, &a);
 }
 
+/// The most segments one attentionSegs launch takes (glm_glue_attn.cuh's ATTN_SEGS: Engine.max_shared).
+pub const max_segs = 16;
+
+/// One segment of a shared window's latent attention, as glm_glue_attn.cuh's AttnSeg: its queries, the stream's
+/// E4M3 cache on pages (codes, scales, table), its position (dense) or token lists (sparse), its partials region.
+pub const AttnSeg = extern struct { qa: u64, lc: u64, scales: u64, pos: u64, tok: u64, cnt: u64, po: u64, pm: u64, pl: u64, pt: u64, rows: i64, nch: c_int, row0: c_int };
+pub const AttnSegs = extern struct { s: [max_segs]AttnSeg, n: c_int, pad: c_int = 0 };
+
+/// A shared window's latent attention with every segment in one chunks launch and one merge launch
+/// (tf_glm_chunks_16_fp8_paged_segs, tf_glm_merge_segs): x the window's `rows` rows, z the most chunks a segment
+/// has; each block is the block its segment's own chunks / merge launch runs (E4M3 on pages, 16-head blocks), so the
+/// same bits. Out rows from each segment's first row; `pstep` the pages' stride, `w` the sparse lists' width.
+pub fn attentionSegs(set: glue.Set, stream: cuda.Stream, t: *const AttnSegs, rows: usize, heads: usize, lw: usize, w: usize, scale: f32, pstep: u64, sparse: bool, out: u64) !void {
+    if (lw != 512) return error.LatentShape;
+    const n: usize = @intCast(t.n);
+    if (n == 0 or n > max_segs) return error.TooManySegments;
+    var most: usize = 0;
+    for (t.s[0..n]) |g| most = @max(most, @as(usize, @intCast(g.nch)));
+    if (most == 0) return;
+    var a: cuda.Args = .{};
+    a.add(@as(i64, @intCast(heads)));
+    a.add(@as(i64, @intCast(w)));
+    a.add(scale);
+    a.add(@as(c_int, @intFromBool(sparse)));
+    a.add(@as(i64, @intCast(pstep)));
+    a.add(t.*);
+    try cuda.launch.launch(set.glue.chunks_16_fp8_paged_segs, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, heads_tile), .z = @intCast(most) }, .block = .{ .x = chunk_threads }, .shared = glue.chunksSmem(heads_tile) }, stream, &a);
+    var m: cuda.Args = .{};
+    m.add(out);
+    m.add(@as(i64, @intCast(heads)));
+    m.add(@as(c_int, @intFromBool(sparse)));
+    m.add(t.*);
+    try cuda.launch.launch(set.glue.merge_segs, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(heads) }, .block = .{ .x = 128 } }, stream, &m);
+}
+
+test "a shared window's attention segments fit glm_glue_attn.cuh's table and one launch's arguments" {
+    try std.testing.expectEqual(@as(usize, 96), @sizeOf(AttnSeg));
+    try std.testing.expectEqual(@as(usize, 16 * 96 + 8), @sizeOf(AttnSegs));
+    try std.testing.expect(32 + @sizeOf(AttnSegs) <= cuda.launch.Args.max_bytes);
+}
+
 fn merge(set: glue.Set, stream: cuda.Stream, p: Partials, out: u64, counts: u64, rows: usize, heads: usize, lw: usize, nch: usize, sparse: bool) !void {
     if (lw != 512) return error.LatentShape;
     var a: cuda.Args = .{};

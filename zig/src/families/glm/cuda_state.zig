@@ -183,6 +183,7 @@ pub const Buffers = struct {
     prefill: bool,
     part_rows: usize, // rows one dense attention call takes
     nch: usize, // the dense pass's most 512-key chunks
+    part_chunks: usize = 0, // a shared decode window's chunks of partials a row, every segment's apart (0: one call's)
     ids: u64,
     x: u64,
     normed: u64,
@@ -256,8 +257,11 @@ pub const Buffers = struct {
         const lw: usize = c.kv_lora;
         const part_rows = if (prefill) @min(rows, dsa_block.prompt_att_rows) else seg;
         const nch = latent.chunksFor(@min(capacity, dense_reach) + seg);
-        // dense calls, or one sparse; a prompt chunk's sparse calls past them merge in the kernel (latent.fuses)
-        const partial_rows = if (prefill) nch * part_rows else @max(nch * part_rows, latent.chunksFor(sparse.width) * seg);
+        // dense calls, or one sparse; a prompt chunk's sparse calls past them merge in the kernel (latent.fuses), and a
+        // shared decode window holds every segment's chunks apart (one attention launch)
+        const shared_decode = !prefill and seg < rows;
+        const part_chunks = @max(nch, latent.chunksFor(sparse.width));
+        const partial_rows = if (prefill) nch * part_rows else if (shared_decode) part_chunks * rows else @max(nch * part_rows, latent.chunksFor(sparse.width) * seg);
         const np_max = capacity / sparse.pool;
         var mm: usize = 4;
         // windows under rows_from rows keep their K slices apart (a prompt's tail chunk on the prefill buffers too)
@@ -323,6 +327,7 @@ pub const Buffers = struct {
             .prefill = prefill,
             .part_rows = part_rows,
             .nch = nch,
+            .part_chunks = if (shared_decode) part_chunks else 0,
             .ids = p[twin_at.ids],
             .x = p[twin_at.x],
             .normed = p[twin_at.normed],
