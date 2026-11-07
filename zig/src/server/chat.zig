@@ -56,6 +56,8 @@ pub const Reply = struct {
     reasoning: ?[]const u8,
     tool_calls_streamed: bool,
     finish_reason: []const u8,
+    // The engine stopped normally and no incomplete tool call needed a synthetic closing suffix.
+    complete: bool = false,
     prompt_tokens: usize,
     cached_tokens: usize,
     completion_tokens: usize,
@@ -576,6 +578,7 @@ const Generation = struct {
             .reasoning = reasoning,
             .tool_calls_streamed = g.calls != null and g.calls.?.streamed,
             .finish_reason = reason,
+            .complete = m.reason == .stop and std.mem.eql(u8, reason, "stop") and close.len == 0,
             .prompt_tokens = prompt_len,
             .cached_tokens = m.cached orelse 0,
             .completion_tokens = g.collected.items.len,

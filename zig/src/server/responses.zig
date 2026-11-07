@@ -191,27 +191,19 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
     var reply: Reply = .{ .srv = srv, .a = a, .conn = conn, .base = base, .streaming = t.stream, .keep = t.store, .added = t.added, .cx = &cx };
     var out: Wire = .{ .reply = &reply };
     openai.run(srv, a, out.out(), .{ .conn = conn }, true, t.chat);
-    if (out.opened or conn.broken) return;
-    const status = out.status orelse return;
-    if (status != 200) return routes.sendValue(conn, a, status, out.payload);
-    const final = reply.completion(out.payload) catch return;
-    routes.sendValue(conn, a, 200, final);
 }
 
 /// The chat handler's output, translated as Python's Wire reads it.
 const Wire = struct {
     reply: *Reply,
-    opened: bool = false,
-    status: ?u16 = null,
-    payload: Value = .null,
+    sent: bool = false,
 
     fn out(w: *Wire) openai.Out {
-        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .keepalive = keepalive } };
+        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .delivered = delivered, .keepalive = keepalive } };
     }
 
     fn open(ctx: *anyopaque, _: usize) error{Closed}!void {
         const w: *Wire = @ptrCast(@alignCast(ctx));
-        w.opened = true;
         try sse.open(w.reply.conn);
         try w.reply.start();
     }
@@ -228,8 +220,18 @@ const Wire = struct {
 
     fn whole(ctx: *anyopaque, status: u16, payload: Value) void {
         const w: *Wire = @ptrCast(@alignCast(ctx));
-        w.status = status;
-        w.payload = payload;
+        const conn = w.reply.conn;
+        const a = w.reply.a;
+        if (conn.broken) return;
+        if (status != 200) return routes.sendValue(conn, a, status, payload);
+        const final = w.reply.completion(payload) catch return;
+        routes.sendValue(conn, a, 200, final);
+        w.sent = conn.response_complete and !conn.broken;
+    }
+
+    fn delivered(ctx: *anyopaque) bool {
+        const w: *Wire = @ptrCast(@alignCast(ctx));
+        return w.sent;
     }
 };
 

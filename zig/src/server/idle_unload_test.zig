@@ -97,6 +97,7 @@ pub const Harness = struct {
             .keys = null,
             .metrics = .{ .gpa = gpa },
             .store = .{ .gpa = gpa },
+            .reasoning = .{ .gpa = gpa },
             .arena = .init(gpa),
             .slide = .init(gpa, self.io, null),
             .teacher = .init(gpa),

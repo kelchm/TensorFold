@@ -7,6 +7,7 @@ const chat = @import("chat.zig");
 const compact = @import("compact.zig");
 const grammar = @import("grammar.zig");
 const messages = @import("messages.zig");
+const delivered_calls = @import("delivered_calls.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_parse = @import("tool_parse.zig");
 const tool_stream = @import("tool_stream.zig");
@@ -37,6 +38,8 @@ pub const Out = struct {
         event: *const fn (ctx: *anyopaque, payload: ?Value) error{Closed}!void,
         /// A whole JSON reply.
         reply: *const fn (ctx: *anyopaque, status: u16, payload: Value) void,
+        /// True only after a whole reply was successfully translated and written to its client.
+        delivered: ?*const fn (ctx: *anyopaque) bool = null,
         /// Bytes that keep a silent stream alive (an SSE comment, or the API's ping); null: none.
         keepalive: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
     };
@@ -59,7 +62,7 @@ const ClientOut = struct {
     a: Allocator,
 
     fn out(c: *ClientOut) Out {
-        return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply, .keepalive = keepalive } };
+        return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply, .delivered = delivered, .keepalive = keepalive } };
     }
 
     fn open(ctx: *anyopaque, _: usize) error{Closed}!void {
@@ -75,6 +78,11 @@ const ClientOut = struct {
     fn reply(ctx: *anyopaque, status: u16, payload: Value) void {
         const c: *ClientOut = @ptrCast(@alignCast(ctx));
         routes.sendValue(c.conn, c.a, status, payload);
+    }
+
+    fn delivered(ctx: *anyopaque) bool {
+        const c: *ClientOut = @ptrCast(@alignCast(ctx));
+        return c.conn.response_complete and !c.conn.broken;
     }
 
     fn keepalive(ctx: *anyopaque) error{Closed}!void {
@@ -140,6 +148,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
         input.messages = try messages.normalizeWith(cx, m, "system", srv.needs_user_after_tool, .of(srv.info.vision));
     };
+    input.messages = try srv.reasoning.restore(srv.io, cx.a, input.messages);
     if (!is_chat and input.messages.array.len == 0) input.prompt = try legacyPrompt(srv, cx, body.get("prompt"));
     // ``body.get("max_tokens") or body.get("max_completion_tokens")``: both are ints or None by now
     const first = body.get("max_tokens");
@@ -274,6 +283,7 @@ const Run = struct {
     id: []const u8,
     created: i64,
     streamed_prose: bool = false,
+    delivered: delivered_calls.Delivered = .{},
     prose_sent: std.ArrayList(u8) = .empty, // the content a tool stream sent
     text_offset: usize = 0, // characters a completion stream's logprob rows have covered
     turn: ?*cortheon.Turn = null, // --cortheon's work on this request
@@ -307,7 +317,10 @@ const Run = struct {
     }
 
     fn emit(r: *Run, payload: Value) error{Closed}!void {
-        return r.out.vt.event(r.out.ctx, payload);
+        try r.out.vt.event(r.out.ctx, payload);
+        if (r.is_chat) if (payload.get("choices")) |choices| if (choices == .array) {
+            for (choices.array) |choice| if (choice.get("delta")) |delta| r.delivered.note(r.a, delta);
+        };
     }
 
     fn usage(r: *Run, reply: *const chat.Reply) Allocator.Error!Value {
@@ -404,11 +417,24 @@ const Run = struct {
         const a = r.a;
         var cx: Cx = .{ .a = a };
         var reply = (if (r.turn) |t| cortheon.loop.whole(t, r.srv, &cx, &r.plan.input, gone) else chat.run(r.srv, &cx, r.plan.input, null, gone)) catch |e| return r.unsent(&cx, e, field);
+        const completed = normallyCompleted(&reply);
         const calls = r.attachCalls(&reply) catch return;
         const o = json.newObject(a) catch return;
         r.wholeBody(o, &reply, calls) catch return;
         r.out.vt.reply(r.out.ctx, 200, .{ .object = o });
+        if (r.out.vt.delivered) |delivered| if (delivered(r.out.ctx)) r.remember(&reply, calls, completed);
         r.warmNext(&reply, calls);
+    }
+
+    fn normallyCompleted(reply: *const chat.Reply) bool {
+        return reply.complete and std.mem.eql(u8, reply.finish_reason, "stop") and reply.loop_stop == null and reply.stop_sequence == null;
+    }
+
+    fn remember(r: *Run, reply: *const chat.Reply, calls: ?[]Value, completed: bool) void {
+        if (!r.is_chat or !completed or !std.mem.eql(u8, reply.finish_reason, "tool_calls")) return;
+        const parsed = calls orelse return;
+        const exposed = (if (r.plan.stream) r.delivered.ids(r.a, parsed) else delivered_calls.idsOf(r.a, parsed)) catch return;
+        r.srv.reasoning.remember(r.srv.io, exposed orelse return, reply.reasoning) catch {};
     }
 
     /// The next turn's prompt prefilled in the background, from the reply as its client got it (warm.zig).
@@ -578,6 +604,7 @@ const Run = struct {
             r.out.vt.event(r.out.ctx, null) catch {};
             return;
         };
+        const completed = normallyCompleted(&reply);
         var calls: ?[]Value = null;
         if (tools) {
             calls = r.attachCalls(&reply) catch return;
@@ -617,7 +644,8 @@ const Run = struct {
             r.emit(u) catch return;
         }
         if (reply.loop_stop) |period| r.emit(wrapError(a, @import("loop_stop.zig").errorBody(a, period) catch return) catch return) catch return;
-        r.out.vt.event(r.out.ctx, null) catch {};
+        r.out.vt.event(r.out.ctx, null) catch return;
+        r.remember(&reply, calls, completed);
         r.warmNext(&reply, calls);
     }
 };

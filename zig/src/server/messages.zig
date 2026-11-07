@@ -128,6 +128,7 @@ pub fn normalizeWith(cx: *Cx, messages: ?Value, late_system: []const u8, needs_u
         } else if (content.? != .string) {
             return cx.refuse("message content must be text or an array of text parts");
         }
+        item = try @import("history_contract.zig").reasoningAlias(cx, item);
         const r = role.?.string;
         if (std.mem.eql(u8, r, "system") or std.mem.eql(u8, r, "developer")) {
             if (out.items.len == 0) {
@@ -172,6 +173,7 @@ pub fn normalizeWith(cx: *Cx, messages: ?Value, late_system: []const u8, needs_u
             try out.insert(cx.a, at, .{ .object = turn });
         }
     }
+    try @import("history_contract.zig").toolResults(cx, out.items);
     return .{ .array = out.items };
 }
 
@@ -255,7 +257,7 @@ test "a conversation with no user query gains one placeholder turn after its las
     defer arena.deinit();
     var cx: Cx = .{ .a = arena.allocator() };
     const messages = (try json.parse(cx.a,
-        \\[{"role": "assistant", "content": "", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "f", "arguments": {}}}]}, {"role": "tool", "tool_call_id": "t1", "content": "42 rows"}, {"role": "tool", "tool_call_id": "t2", "content": "ok"}]
+        \\[{"role": "assistant", "content": "", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "f", "arguments": {}}}, {"id": "t2", "type": "function", "function": {"name": "g", "arguments": {}}}]}, {"role": "tool", "tool_call_id": "t1", "content": "42 rows"}, {"role": "tool", "tool_call_id": "t2", "content": "ok"}]
     )).ok;
     const out = try normalize(&cx, messages, "system", true);
     try std.testing.expectEqual(@as(usize, 4), out.array.len);

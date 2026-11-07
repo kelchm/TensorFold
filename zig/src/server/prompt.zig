@@ -56,6 +56,19 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
     return ids;
 }
 
+/// Probe the actual prompt wrapper: a fixed thinking suffix is switchable when off appends its close token.
+pub fn canCloseThinking(srv: *Server) bool {
+    if (srv.text.tokenId("</think>") == null) return false;
+    var arena: std.heap.ArenaAllocator = .init(srv.gpa);
+    defer arena.deinit();
+    var cx: Cx = .{ .a = arena.allocator() };
+    const on = generationPrompt(srv, &cx, true) catch return false;
+    const off = generationPrompt(srv, &cx, false) catch return false;
+    if (on.len == 0 or off.len != on.len + 1 or !std.mem.eql(u32, on, off[0..on.len])) return false;
+    const tail = srv.text.decode(cx.a, off[on.len..]) catch return false;
+    return std.mem.eql(u8, tail, "</think>");
+}
+
 /// The template's ids for `messages`; with image input, a marker the text spells is ordinary text (images.zig).
 fn render(srv: *Server, a: std.mem.Allocator, messages: Value, options: model_text.RenderOptions, problem: *[]const u8) model_text.Error![]u32 {
     var rendered = try srv.text.render(a, messages, options, problem);

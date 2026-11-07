@@ -52,7 +52,8 @@ fn countTokens(srv: *Server, cx: *Cx, chat: Value) errors.Refused!usize {
     const on = thinking.enable orelse srv.config.enable_thinking;
     cx.clear_thinking = thinking.clear;
     const tools = try tool_specs.active(cx, chat.get("tools"), chat.get("tool_choice"));
-    const msgs = try messages_mod.normalizeWith(cx, chat.get("messages"), "system", srv.needs_user_after_tool, .of(srv.info.vision));
+    const normalized = try messages_mod.normalizeWith(cx, chat.get("messages"), "system", srv.needs_user_after_tool, .of(srv.info.vision));
+    const msgs = try srv.reasoning.restore(srv.io, cx.a, normalized);
     const ids_ = prompt.renderIds(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), true) catch |e| switch (e) {
         error.Refused => return cx.other(cx.message),
         else => |x| return x,
@@ -85,33 +86,18 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
     reply.init() catch return;
     var wire: Wire = .{ .reply = &reply };
     openai.run(srv, a, wire.out(), .{ .conn = conn }, true, prepared[0]);
-    if (wire.opened or wire.status == null or conn.broken) return;
-    const payload = wire.payload;
-    if (wire.status.? != 200) {
-        const problem = payload.get("error") orelse Value.null;
-        const message = if (problem == .object) (if (problem.get("message")) |m| (if (m == .string) m.string else "request failed") else "request failed") else (if (problem == .string) problem.string else "request failed");
-        return sendError(conn, a, message, wire.status.?);
-    }
-    const whole = reply.completion(payload) catch |e| {
-        const message = std.fmt.allocPrint(a, "invalid model response: {s}", .{reply.problem orelse @errorName(e)}) catch return;
-        return sendError(conn, a, message, 500);
-    };
-    routes.sendValue(conn, a, 200, whole);
 }
 
 const Wire = struct {
     reply: *Reply,
-    opened: bool = false,
-    status: ?u16 = null,
-    payload: Value = .null,
+    sent: bool = false,
 
     fn out(w: *Wire) openai.Out {
-        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .keepalive = ping } };
+        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .delivered = delivered, .keepalive = ping } };
     }
 
     fn open(ctx: *anyopaque, prompt_len: usize) error{Closed}!void {
         const w: *Wire = @ptrCast(@alignCast(ctx));
-        w.opened = true;
         // the head counts the whole prompt; message_delta's usage splits it into input and cache_read
         if (prompt_len > 0) {
             const n = json.intValue(w.reply.a, prompt_len) catch return error.Closed;
@@ -128,8 +114,26 @@ const Wire = struct {
 
     fn whole(ctx: *anyopaque, status: u16, payload: Value) void {
         const w: *Wire = @ptrCast(@alignCast(ctx));
-        w.status = status;
-        w.payload = payload;
+        const conn = w.reply.conn;
+        const a = w.reply.a;
+        const reply = w.reply;
+        if (conn.broken) return;
+        if (status != 200) {
+            const problem = payload.get("error") orelse Value.null;
+            const message = if (problem == .object) (if (problem.get("message")) |m| (if (m == .string) m.string else "request failed") else "request failed") else (if (problem == .string) problem.string else "request failed");
+            return sendError(conn, a, message, status);
+        }
+        const body = reply.completion(payload) catch |e| {
+            const message = std.fmt.allocPrint(a, "invalid model response: {s}", .{reply.problem orelse @errorName(e)}) catch return;
+            return sendError(conn, a, message, 500);
+        };
+        routes.sendValue(conn, a, 200, body);
+        w.sent = conn.response_complete and !conn.broken;
+    }
+
+    fn delivered(ctx: *anyopaque) bool {
+        const w: *Wire = @ptrCast(@alignCast(ctx));
+        return w.sent;
     }
     fn ping(ctx: *anyopaque) error{Closed}!void {
         const w: *Wire = @ptrCast(@alignCast(ctx));
