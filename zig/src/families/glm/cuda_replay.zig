@@ -72,6 +72,7 @@ pub const Session = struct {
     options: Options,
     prepared: bool = false,
     ended: bool = false,
+    failed: bool = false,
     captures: [2]Snapshot = undefined,
     capture_dev: cuda.DeviceBuffer,
 
@@ -104,11 +105,13 @@ pub const Session = struct {
 
     pub fn follow(s: *Session) !void {
         if (s.owned.group.rank == 0) return error.ReplayNotFollower;
+        errdefer s.fail();
         try follow_mod.follow(s.owned.e, &s.owned.link);
         s.ended = true;
     }
 
     pub fn close(s: *Session) void {
+        if (s.failed) std.c._exit(1);
         const gpa = s.owned.gpa;
         if (s.owned.group.rank == 0 and !s.ended) {
             cuda.tp_watch.ended();
@@ -128,6 +131,7 @@ pub const Session = struct {
     pub fn prepare(s: *Session, streams: []const Stream) !void {
         if (s.state.block or streams.len != 4) return error.ReplayPreparation;
         const x = try s.leader();
+        errdefer s.fail();
         const e = x.e;
         for (streams, 0..) |st, i| {
             if (st.slot != i or st.owner >= 2 or st.prompt.len == 0) return error.ReplayPreparation;
@@ -170,12 +174,14 @@ pub const Session = struct {
 
     pub fn enableTiming(s: *Session, enabled: bool) !void {
         const x = try s.leader();
+        errdefer s.fail();
         try x.developer(if (enabled) 3 else 4, 0);
     }
 
     pub fn beginBlock(s: *Session) !void {
         if (!s.prepared) return error.ReplayPreparation;
         const x = try s.leader();
+        errdefer s.fail();
         try x.developer(1, 0);
     }
 
@@ -198,6 +204,7 @@ pub const Session = struct {
             reqs[i] = .{ .slot = p.slot, .pos = @intCast(p.position + p.keep), .n = p.keep, .anchor = p.anchor };
         }
         if (rows > 32) return error.ReplayPart;
+        errdefer s.fail();
         if (parts.len == 1) {
             try x.bind(parts[0].slot);
             try x.verify(parts[0].ids, parts[0].out, 0);
@@ -212,6 +219,7 @@ pub const Session = struct {
 
     pub fn complete(s: *Session, expected: u64) !Completion {
         const x = try s.leader();
+        errdefer s.fail();
         try x.developer(0, expected);
         return .{ .ranks = s.state.receipts, .elapsed_ns = s.state.elapsed_ns, .records = s.state.all_records[0 .. 2 * s.state.audit.used], .timings = if (s.state.audit.trace != null) s.state.all_timings[0 .. 2 * s.state.audit.used] else &.{} };
     }
@@ -219,8 +227,14 @@ pub const Session = struct {
     pub fn capture(s: *Session, slot: u32, position: usize) ![2]Snapshot {
         if (s.state.block) return error.ReplayCaptureWhileTimed;
         const x = try s.leader();
+        errdefer s.fail();
         try x.capture(slot, position);
         return s.captures;
+    }
+
+    fn fail(s: *Session) void {
+        s.failed = true;
+        cuda.tp_watch.fail("GLM replay session failed");
     }
 
     fn captureRank(ptr: *anyopaque, slot: u32, position: usize) !void {

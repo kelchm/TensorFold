@@ -107,7 +107,7 @@ test "replay ingest rejects duplicates and stale generation before dispatch" {
     const D = struct { slots: struct { items: []const S }, verifies: u64 = 1, calls: u64 = 0, lost: u64 = 0 };
     const E = struct { drafter: ?*const D };
     const slots = [_]S{ .{ .v_pos0 = 4 }, .{ .v_pos0 = 8 } };
-    const dr: D = .{ .slots = .{ .items = &slots } };
+    var dr: D = .{ .slots = .{ .items = &slots } };
     const e: E = .{ .drafter = &dr };
     const Q = struct { slot: u32, n: usize, pos: usize };
     var reqs = [_]Q{ .{ .slot = 0, .n = 1, .pos = 5 }, .{ .slot = 1, .n = 2, .pos = 10 } };
@@ -116,5 +116,8 @@ test "replay ingest rejects duplicates and stale generation before dispatch" {
     try std.testing.expectError(error.ReplayDuplicateIngest, audit.validate(e, &reqs));
     reqs[1].slot = 1;
     reqs[1].pos = 9;
+    try std.testing.expectError(error.ReplayStaleIngest, audit.validate(e, &reqs));
+    reqs[1].pos = 10;
+    dr.verifies = 2;
     try std.testing.expectError(error.ReplayStaleIngest, audit.validate(e, &reqs));
 }

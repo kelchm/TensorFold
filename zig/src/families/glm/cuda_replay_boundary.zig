@@ -86,7 +86,7 @@ pub const Boundary = struct {
             b.started = std.Io.Clock.awake.now(e.io).toNanoseconds();
             return;
         }
-        if (action != 0 or !b.block or b.audit.pending or b.audit.forwards != expected or
+        if (action != 0 or expected == 0 or !b.block or b.audit.pending or b.audit.forwards != expected or
             b.audit.groups != expected) return error.UnfinishedReplay;
         try e.stream.synchronize();
         if (e.side) |side| try side.s.synchronize();
