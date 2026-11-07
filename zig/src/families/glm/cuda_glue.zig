@@ -10,7 +10,8 @@ const index_mod = @import("cuda_index.zig");
 /// `dsel`: a decode window's DSA select on many CTAs (tf_glm_dsel_*, cuda_sparse; TF_GLM_DSEL, default on).
 /// `pdl_hc`: a decode window's hc_post, hc_partial8 and hc_finish launch as dependents (TF_GLM_PDL_CHAIN's hc).
 /// `pdl_moe`: a decode window's slice_sum, topk_group and topk_group_sum launch as dependents (TF_GLM_PDL_CHAIN's moe).
-pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false, pdl_hc: bool = false, pdl_moe: bool = false };
+/// `hc_split`: hc_pre's finish on the split schedule (TF_GLM_HC_SPLIT=0: off), the same bits.
+pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false, pdl_hc: bool = false, pdl_moe: bool = false, hc_split: bool = false };
 
 /// A hidden-size norm's weight: bf16, or float32 (FP4-Local's) read as float32 by the _f32w kernels.
 pub const Norm = union(enum) { bf16: u64, f32: u64 };
@@ -46,6 +47,8 @@ pub const Kernels = struct {
     hc_partial8: cuda.Function,
     hc_finish: cuda.Function,
     hc_finish_f32w: cuda.Function,
+    hc_finish_split: cuda.Function, // the same outputs with warp 0's Sinkhorn beside the collapse (Set.hc_split)
+    hc_finish_f32w_split: cuda.Function,
     absorb_q: cuda.Function,
     expand_v: cuda.Function,
     lat_write: cuda.Function,
@@ -288,9 +291,10 @@ pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale:
         a.add(i64of(rows));
         try cuda.launch.launch(set.glue.hc_partial, .{ .grid = .{ .x = cdiv(rows, 4), .y = hc_blocks }, .block = .{ .x = 128 } }, stream, &a);
     }
+    const split = set.hc_split and rows < 64; // decode windows: a row's latency; prompt rows keep the one-warp schedule
     const f, const w = switch (norm) {
-        .bf16 => |p| .{ set.glue.hc_finish, p },
-        .f32 => |p| .{ set.glue.hc_finish_f32w, p },
+        .bf16 => |p| .{ if (split) set.glue.hc_finish_split else set.glue.hc_finish, p },
+        .f32 => |p| .{ if (split) set.glue.hc_finish_f32w_split else set.glue.hc_finish_f32w, p },
     };
     var b: cuda.Args = .{};
     inline for (.{ x, part, base, scale, w, out, xs, post, comb, eps, hc_eps, @as(c_int, hc_blocks), cint(iters) }) |v| b.add(v);
