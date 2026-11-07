@@ -107,6 +107,9 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: 
         if (err == error.Cancelled) try snapshots.interrupted(e, marks, @intCast(start));
         return err;
     };
+    var writes: [2]Engine.PageWriteRange = .{ try Engine.PageWriteRange.rows(e.cur.st.pos, ra + rb), .{ .start = 0, .end = 0 } };
+    if (e.mtp and e.drafter == null) writes[1] = try Engine.PageWriteRange.rows(e.cur.st.mtp_len, part.len - 1);
+    try e.guardPageWrites(&writes);
     var one: [1]fw.Rank = undefined;
     var two: [1]fw.Rank = undefined;
     var fa = e.view(&e.bp, &one);

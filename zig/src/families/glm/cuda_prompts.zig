@@ -19,7 +19,6 @@ pub fn fits(parts: []const engine.Prompt, capacity: usize) bool {
 
 /// The prompts' pass on their slots (each begun, at position 0); `firsts[k]`: prompt k's first token.
 pub fn prefillMany(e: *Engine, parts: []const engine.Prompt, firsts: []u32) !void {
-    for (parts) |p| if (p.slot >= e.seqs.items.len or e.seqs.items[p.slot] == null) return error.BadPrompts;
     return pass(e, parts, firsts, fw.Forward, fw.Rank);
 }
 
@@ -37,6 +36,10 @@ pub fn pass(e: anytype, parts: []const engine.Prompt, firsts: []u32, comptime Fo
         rows += p.ids.len;
     }
     try e.gate(null);
+    // The real Engine guards the already-bound owners after admission and before either target or MTP writes.
+    if (comptime @hasDecl(@TypeOf(e.*), "guardPageWritesAt")) for (parts) |p| {
+        try e.guardPageWritesAt(p.slot, &.{try Engine.PageWriteRange.rows(0, p.ids.len)});
+    };
     var one: [1]Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = &e.bp, .segs = segs[0..parts.len] }};
     var f: Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = &e.pieces, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .taps = if (e.drafter) |dr| dr.taps(true) else null };
     // TF_GLM_CE_EXCHANGE=1: the batched pass's split exchanges by copy engines too (the same prompt buffers and pieces)

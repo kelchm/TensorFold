@@ -218,6 +218,9 @@ pub const Pages = struct {
     /// The stream on paged slot `slot` ended: its sequence reaches no rows, and rank 0's lease gives its pages back.
     pub fn close(p: *Pages, slot: u32) void {
         if (!p.paged(slot) or !p.used[slot]) return;
+        // The inference stream must finish before unpinned pages can be reused. Checkpoint DMA on another
+        // stream retains its own Pool pin until Lease.close succeeds; closing a live owner never cancels it.
+        cuda.completion.drain(p.e.d, p.e.stream, "GLM live page release did not drain");
         const st = &p.e.seqs.items[slot].?.st;
         st.pages = &.{};
         st.capacity = 0;

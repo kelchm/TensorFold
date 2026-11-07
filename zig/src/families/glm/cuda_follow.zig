@@ -496,7 +496,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
             defer e.gpa.free(ids);
             const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
             _ = e.prefill(ids, from, null, null) catch |err| switch (err) {
-                error.Cancelled => {},
+                error.Cancelled, error.PageWriteDeferred => {},
                 else => return err,
             };
         },
@@ -507,7 +507,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
             const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
             e.index_split = indexSplit(h);
             _ = e.prefillChunk(ids, h.depth, h.top_k, from, null, null) catch |err| switch (err) {
-                error.Cancelled => {},
+                error.Cancelled, error.PageWriteDeferred => {},
                 else => return err,
             };
         },
@@ -539,7 +539,10 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
         .verify => { // rank 0 alone reads the draws: this rank joins their gathers and leaves the tokens on the device
             e.discard_draws = true;
             defer e.discard_draws = false;
-            try e.verify(ids_in, s.sampled[0..ids_in.len], 0);
+            e.verify(ids_in, s.sampled[0..ids_in.len], 0) catch |err| {
+                if (err == error.PageWriteDeferred) return true; // all ranks refused before forward; retain owners
+                return err;
+            };
             try e.checkGathers(); // no sync now: a peer-store wait the GPU gave up on (this step's or earlier) stops here
         },
         .redraw => _ = try e.redrawFirst(@intCast(h.a), 0),
@@ -559,20 +562,29 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
             }
             e.discard_draws = true;
             defer e.discard_draws = false;
-            try e.verifyShared(parts[0..k]);
+            e.verifyShared(parts[0..k]) catch |err| {
+                if (err == error.PageWriteDeferred) return true; // all ranks refused before forward; retain owners
+                return err;
+            };
             try e.checkGathers(); // as for .verify
         },
         .many => {
             var parts: [engine.max_together]engine.Prompt = undefined;
             const decoded = try prompt_wire.decode(ids_in, h.depth, e.capacity, &parts);
             var firsts: [engine.max_together]u32 = undefined;
-            try e.prefillMany(decoded, &firsts);
+            e.prefillMany(decoded, &firsts) catch |err| {
+                if (err == error.PageWriteDeferred) return true; // all ranks refused before forward; retain owners
+                return err;
+            };
         },
         .keep => try e.keep(@intCast(h.a)),
         .draft => {
             const ids = try e.gpa.dupe(u32, ids_in);
             defer e.gpa.free(ids);
-            try e.draft(h.flags & 1 != 0, ids, h.depth, &s.drafts, if (h.flags & 2 != 0) &s.chances else null);
+            e.draft(h.flags & 1 != 0, ids, h.depth, &s.drafts, if (h.flags & 2 != 0) &s.chances else null) catch |err| {
+                if (err == error.PageWriteDeferred) return true; // all ranks refused before forward; retain owners
+                return err;
+            };
         },
         .block => {
             const k = h.depth;

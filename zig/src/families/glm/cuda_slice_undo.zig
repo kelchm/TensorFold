@@ -101,6 +101,11 @@ pub const Undo = struct {
     pub fn restore(u: *Undo, e: anytype) !void {
         const st = &u.seq.st;
         if (!std.mem.eql(u32, st.pages, u.ids)) return error.SliceOwnerChanged;
+        // The native page owner and DFlash ring must both validate before any rollback write.
+        for (u.plan.parts[0..u.plan.count], u.immutable[0..u.plan.count]) |part, immutable| {
+            if (part.span == 0 or immutable == part.len) continue;
+            try e.guardPageWritesLocal(u.slot, &.{.{ .start = immutable / part.span * state.page_rows, .end = ((part.len - 1) / part.span + 1) * state.page_rows }}, false);
+        }
         // Check every external owner before the first copy, including a nullable/replaced DFlash ring.
         if (u.draft) |saved| {
             const dr = e.drafter orelse return error.SliceOwnerChanged;

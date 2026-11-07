@@ -20,6 +20,7 @@ const prof_mod = @import("cuda_prof.zig");
 const pages_mod = @import("cuda_pages.zig");
 const prompt_pair = @import("cuda_prompt_pair.zig");
 const taps_mod = @import("cuda_taps.zig");
+const page_write = @import("cuda_page_write.zig");
 pub const Options = @import("cuda_engine_types.zig").Options;
 
 /// Rank 0's own word on its request (cancelled or not); the other ranks have none and hear rank 0's.
@@ -435,6 +436,7 @@ pub const Engine = struct {
         _ = e.dropPartialOf(e.slot);
         e.cur.sampling = sampler.check(sampling);
         e.cur.in_head = 0;
+        // Reset touches only fixed/recurrent state. Retain the old page owners; the next actual write COWs its range.
         try e.cur.st.reset(e.stream);
         if (e.drafter) |dr| try dr.restart(e.slot, 0);
     }
@@ -501,6 +503,9 @@ pub const Engine = struct {
         };
         stamp.end();
         if (f.prof) |p| p.mark(e.stream, .gate);
+        var writes: [2]page_write.Range = .{ try page_write.Range.rows(e.cur.st.pos, rows), .{ .start = 0, .end = 0 } };
+        if (e.mtp and e.drafter == null) writes[1] = try page_write.Range.rows(e.cur.st.mtp_len, part.len - 1);
+        try e.guardPageWrites(&writes);
         try f.run(as_i32[0..rows]);
         e.index_splits += @intFromBool(split);
         stamp = prof_mod.span(f.prof, e.stream, .prompt_score);
@@ -570,7 +575,24 @@ pub const Engine = struct {
     pub const unprepareSnapshots = snapshots.unprepare;
     pub const keepState = snapshots.keep;
     pub const keepAs = snapshots.keepAs;
-    pub const restoreState = snapshots.restore;
+    /// Restoring copied snapshots is a real page write, including the Plan's two pooled lookahead rows.
+    pub fn restoreState(e: *Engine, id: u64) !void {
+        if (e.partial != null) return page_write.refuse(e, error.SliceBusy);
+        const s = e.snaps.get(id) orelse return page_write.refuse(e, error.NoKeptState);
+        const at = @max(s.pos, if (e.mtp) s.mtp_len else 0);
+        const pools = std.math.add(usize, at / 4, 2) catch |err| return page_write.refuse(e, err);
+        const end = std.math.mul(usize, pools, 4) catch |err| return page_write.refuse(e, err);
+        try e.guardPageWrites(&.{.{ .start = 0, .end = end }});
+        snapshots.restore(e, id) catch |err| {
+            if (e.share.world > 1) page_write.fatal(err);
+            return err;
+        };
+    }
+
+    pub const guardPageWrites = page_write.guard;
+    pub const guardPageWritesAt = page_write.at;
+    pub const guardPageWritesLocal = page_write.local;
+    pub const PageWriteRange = page_write.Range;
     pub const holds = snapshots.holds;
     pub const dropState = snapshots.drop;
     const freeSnap = snapshots.free;
@@ -628,6 +650,7 @@ pub const Engine = struct {
         const at = e.cur.st.pos;
         f.prof = e.profs[ids.len - 1];
         if (f.prof) |p| try p.begin(e.stream, verifyLabel(ids.len));
+        try e.guardPageWrites(&.{try page_write.Range.rows(at, ids.len)});
         try f.run(@ptrCast(ids));
         if (e.drafter) |dr| try dr.noteVerify(e.slot, 0, ids.len, at, true);
         e.cur.rows_at = e.bd.fnormed;
@@ -661,6 +684,10 @@ pub const Engine = struct {
         f.prof = e.shared_profs[rows - 1];
         if (f.prof) |p| try p.begin(e.stream, sharedLabel(rows));
         defer if (f.prof) |p| p.end();
+        // Guard every segment in the same order on every rank before the batched write kernels/collectives.
+        for (parts, segs[0..parts.len]) |part, seg| {
+            try e.guardPageWritesAt(part.slot, &.{try page_write.Range.rows(seg.st.pos, seg.rows)});
+        }
         try f.run(@ptrCast(ids[0..rows]));
         if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
         // every part greedy (no grammar, no sampled stream; the same on every rank): all rows in one pick, one launch,
@@ -718,7 +745,10 @@ pub const Engine = struct {
         const f = e.view(bm, &one);
         const D = e.c.hidden;
         const hidden = if (from_prompt) @import("cuda_prompt_hold.zig").input(e) else e.cur.rows_at;
-        try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len - e.cur.in_head);
+        const head_start = std.math.sub(usize, e.cur.st.mtp_len, e.cur.in_head) catch return page_write.refuse(e, error.PageWriteOwner);
+        const head_rows = try std.math.add(usize, follow.len, depth -| 1);
+        try e.guardPageWrites(&.{try page_write.Range.rows(head_start, head_rows)});
+        try e.cur.st.setMtpLen(e.stream, head_start);
         e.cur.in_head = 0;
         const next: []const i32 = @ptrCast(follow);
         var s0: usize = 0;
