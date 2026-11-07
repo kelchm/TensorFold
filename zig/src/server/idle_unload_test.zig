@@ -101,6 +101,7 @@ pub const Harness = struct {
             .arena = .init(gpa),
             .slide = .init(gpa, self.io, null),
             .teacher = .init(gpa),
+            .prepare_memory = .init(gpa),
         };
         self.srv = srv;
         var args: cli.Args = .{};
