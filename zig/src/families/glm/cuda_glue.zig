@@ -38,6 +38,7 @@ pub const Kernels = struct {
     group_sums: cuda.Function,
     topk: cuda.Function,
     topk_group: cuda.Function,
+    topk_group_sum: cuda.Function, // the router's slices summed in the fused select-and-group: no slice-sum launch
     router_part: cuda.Function,
     router_tile: cuda.Function,
     hc_partial: cuda.Function,
@@ -193,6 +194,12 @@ pub const router_ks = 8;
 
 /// glue.router: out [m][ne] fp32 = x . w rows; d a multiple of router_ks x 64: K slices in `part`, added in order.
 pub fn router(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, part: u64, m: usize, d: usize, ne: usize) !void {
+    try routerSlices(set, stream, x, x_stride, w, part, m, d, ne);
+    try sliceSum(set, stream, part, out, m * ne, router_ks, true);
+}
+
+/// The router's K slices alone: part [router_ks][m][ne] fp32, each slice's dot as `router` takes it.
+pub fn routerSlices(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, part: u64, m: usize, d: usize, ne: usize) !void {
     if (d % (router_ks * 64) != 0) return error.RouterWidth; // the Python family's single-pass _router: no GLM width
     var a: cuda.Args = .{};
     inline for (.{ x, w, part, i64of(m), i64of(x_stride), i64of(d), i64of(ne), @as(c_int, router_ks) }) |v| a.add(v);
@@ -200,7 +207,6 @@ pub fn router(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, ou
         try cuda.launch.launch(set.glue.router_tile, .{ .grid = .{ .x = cdiv(m, 64), .y = cdiv(ne, 32), .z = router_ks }, .block = .{ .x = 128 } }, stream, &a)
     else
         try cuda.launch.launch(set.glue.router_part, .{ .grid = .{ .x = cdiv(m, 16), .y = cdiv(ne, 32), .z = router_ks }, .block = .{ .x = 128 } }, stream, &a);
-    try sliceSum(set, stream, part, out, m * ne, router_ks, true);
 }
 
 /// glue.select: top_k by sigmoid + bias (lower id on ties), normed if `norm`, times `scale`, then the shared expert.
@@ -222,6 +228,29 @@ pub fn selectGroup(set: Set, stream: cuda.Stream, logits: u64, bias: u64, pick: 
     var a: cuda.Args = .{};
     inline for (.{ logits, bias, pick, wts, scale, cint(experts), cint(top_k), @as(c_int, @intFromBool(norm)), cint(rows), pick8, ids, count, members }) |v| a.add(v);
     try cuda.launch.launch(set.glue.topk_group, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, stream, &a);
+}
+
+/// Shared memory a summed select-and-group takes beyond its static arrays: the rows' sigmoid scores.
+pub fn selectGroupSumShared(rows: usize, experts: usize) usize {
+    return rows * experts * 4;
+}
+
+/// The most of it a launch takes: 48 KiB a block without opt-in, less the kernel's own 11.1 KiB (cuobjdump: 11,392 B),
+/// which holds GLM-5.3-Flash's 32 rows of 288 experts.
+pub const select_group_sum_shared = 36 * 1024;
+
+/// `selectGroup` on the router's slices (`part`, `routerSlices`'): tf_glm_topk_group_sum sums them into `logits` in
+/// slice order (tf_glm_slice_sum's adds), then selects and groups as tf_glm_topk_group does, the same bits in one
+/// launch. False (nothing launched) when the rows' scores do not fit the block's default shared memory.
+pub fn selectGroupSum(set: Set, stream: cuda.Stream, part: u64, logits: u64, bias: u64, pick: u64, wts: u64, rows: usize, top_k: usize, experts: usize, scale: f32, norm: bool, pick8: u64, ids: u64, count: u64, members: u64) !bool {
+    if (experts > 512 or top_k >= 32) return error.TopkTooWide;
+    if (rows == 0 or rows > select_group_rows or rows * top_k > 1024) return error.TooManyRows;
+    const shared = selectGroupSumShared(rows, experts);
+    if (shared > select_group_sum_shared) return false;
+    var a: cuda.Args = .{};
+    inline for (.{ part, logits, bias, pick, wts, scale, cint(experts), cint(top_k), @as(c_int, @intFromBool(norm)), cint(rows), pick8, ids, count, members }) |v| a.add(v);
+    try cuda.launch.launch(set.glue.topk_group_sum, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 }, .shared = @intCast(shared) }, stream, &a);
+    return true;
 }
 
 /// glue.combine: out [rows][d] fp32 = sum over slots in order of wts[r][k] y[r][k] (y fp32 in decode, bf16 in prefill).

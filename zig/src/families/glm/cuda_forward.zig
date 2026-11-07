@@ -50,6 +50,7 @@ pub const Modules = struct {
     pack_dense: cuda.Function,
     quant: quant.Kernels,
     q4: q4.Kernels,
+    topk_sum: bool = true, // TF_GLM_TOPK_SUM=0: a decode window's grouped select reads the summed logits (the same bits)
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
         const k = cuda.kernels;
@@ -87,6 +88,7 @@ pub const Modules = struct {
         if (!m.dsel) std.log.warn("TF_GLM_DSEL=0: a decode window's DSA select keeps one 1,024-thread CTA a row", .{});
         m.tiled = false;
         m.packs = null; // `m` starts undefined: the field default does not apply
+        m.topk_sum = if (std.c.getenv("TF_GLM_TOPK_SUM")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         return m;
     }
 
@@ -322,7 +324,7 @@ pub const Forward = struct {
     }
 
     fn moeKernels(f: *const Forward) moe.Kernels {
-        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .put_slot = f.m.put_slot, .prof = f.prof, .side = if (f.ranks[0].b.prefill) null else f.side, .fuse = f.moe_fuse };
+        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .put_slot = f.m.put_slot, .prof = f.prof, .side = if (f.ranks[0].b.prefill) null else f.side, .fuse = f.moe_fuse, .sum = f.m.topk_sum };
     }
 
     pub const Site = enum { mixer, ffn };
