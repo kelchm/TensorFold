@@ -64,6 +64,7 @@ pub fn offer(v: anytype, open: ?api.VisionOpen) ?api.Vision {
     if (comptime @hasDecl(T, "fixed_image_tokens")) if (out.video) |*video| {
         if (comptime @hasDecl(T, "lazy_video")) video.lazy = T.lazy_video;
         if (comptime @hasDecl(T, "prepareVideoWithScratch")) video.prepare_scratch = Video(T).prepareScratch;
+        if (comptime @hasDecl(T, "planVideo")) video.plan_tokens = Video(T).planTokens;
         video.per_video_tokens = 16384;
         video.max_frames = @min(video.max_frames, 128);
     };
@@ -74,6 +75,18 @@ pub fn offer(v: anytype, open: ?api.VisionOpen) ?api.Vision {
 fn Video(comptime T: type) type {
     return struct {
         src: api.VideoSource,
+
+        fn noDecode(_: *anyopaque, _: []const u32, _: *T.video.Sink) anyerror!void {
+            return error.TokenPlanCannotDecode;
+        }
+
+        fn planTokens(ctx: *anyopaque, a: Allocator, src: api.VideoMetadata, max_tokens: u32, max_frames: u32) anyerror!api.VideoTokenPlan {
+            const t: *T = @ptrCast(@alignCast(ctx));
+            const p = try t.planVideo(a, .{ .frames = src.frames, .rate_num = src.rate_num, .rate_den = src.rate_den, .width = src.width, .height = src.height, .ctx = ctx, .decode = noDecode }, max_tokens, max_frames);
+            const groups = try a.alloc(u32, p.pairs());
+            @memset(groups, p.tokensPerPair());
+            return .{ .group_tokens = groups, .times = p.times };
+        }
 
         fn decode(c: *anyopaque, indices: []const u32, sink: *T.video.Sink) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(c));

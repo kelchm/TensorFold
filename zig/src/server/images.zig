@@ -201,13 +201,22 @@ fn refusal(cx: *Cx, v: api.Vision, i: usize, err: anyerror) errors.Refused {
 
 /// The prompt with image placeholders expanded to tokens and video ones to frame groups, its images and cache ids.
 pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx, messages: Value, ids: []const u32, history_len: usize) errors.Refused!?Expanded {
+    return expandMode(vision, fetch, text, cx, messages, ids, history_len, false);
+}
+
+/// The token-count route receives IDs only: metadata plans cannot become an inference request or warm cache entry.
+pub fn countIds(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx, messages: Value, ids: []const u32) errors.Refused!?[]const u32 {
+    return if (try expandMode(vision, fetch, text, cx, messages, ids, 0, true)) |x| x.ids else null;
+}
+
+fn expandMode(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx, messages: Value, ids: []const u32, history_len: usize, count_only: bool) errors.Refused!?Expanded {
     const v = vision orelse return null;
     const ps = try parts(cx, messages, v.part_type);
     var n_images: usize = 0;
     for (ps) |p| n_images += @intFromBool(!p.video);
     const n_videos = ps.len - n_images;
     const owner = @import("prepare_memory.zig").current;
-    const reusable: ?*const VideoReuse = if (owner) |r| if (r.video_reuse) |raw| blk: {
+    const reusable: ?*const VideoReuse = if (count_only) null else if (owner) |r| if (r.video_reuse) |raw| blk: {
         const saved: *const VideoReuse = @ptrCast(@alignCast(raw));
         break :blk if (saved.matches(v, ps)) saved else null;
     } else null else null;
@@ -265,7 +274,10 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
             defer if (video_work) |b| b.finish(phase.?);
             if (video_work) |b| video_budget.deadline = b.deadline();
             const cap = videoTokenBudget(o, n_videos);
-            clips[vi] = try videos.prepare(cx, o, v.ctx, fetch, p.url, vi, cap, &video_budget);
+            clips[vi] = if (count_only)
+                try videos.planForCount(cx, o, v.ctx, fetch, p.url, vi, cap, &video_budget)
+            else
+                try videos.prepare(cx, o, v.ctx, fetch, p.url, vi, cap, &video_budget);
             try accountVideo(cx, o, clips[vi], cap, &video_tokens_total);
             if (video_work) |b| {
                 b.check(phase.?) catch return cx.refuse("video preparation exceeded the configured time limit");
@@ -302,7 +314,7 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
             if (image_work) |b| b.check(phase.?) catch return cx.refuse("image preparation exceeded the configured time limit");
         }
     }
-    if (n_videos > 0 and v.video.?.lazy and v.video.?.prepare_scratch != null) if (owner) |r| {
+    if (!count_only and n_videos > 0 and v.video.?.lazy and v.video.?.prepare_scratch != null) if (owner) |r| {
         const retained = r.arena.allocator();
         // Only publish data allocated in the parent's retained arena, never a temporary expansion's data.
         if (r.video_reuse == null and cx.a.ptr == retained.ptr and cx.a.vtable == retained.vtable) {

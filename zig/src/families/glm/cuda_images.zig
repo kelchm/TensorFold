@@ -279,6 +279,10 @@ pub const Images = struct {
         return video.prepareLazyWithScratch(a, scratch, s, v.cfg.?, @min(max_tokens, 16384), @min(max_frames, 128));
     }
 
+    pub fn planVideo(v: *const Images, a: std.mem.Allocator, s: video.Source, max_tokens: u32, max_frames: u32) !video.Plan {
+        return video.plan(a, s, v.cfg.?, @min(max_tokens, 16384), @min(max_frames, 128));
+    }
+
     /// An image's bytes as the tower reads them, at most `max_tokens` tokens (the server's prepare).
     pub fn prepare(v: *const Images, a: std.mem.Allocator, data: []const u8, max_tokens: u32) !image_core.Prepared {
         return v.prepareWithScratch(a, std.heap.page_allocator, data, max_tokens);

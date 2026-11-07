@@ -94,6 +94,15 @@ pub fn prepare(
     max_tokens: u32,
     b: *Budget,
 ) errors.Refused!api.PreparedVideo {
+    return prepareMode(cx, offer, ctx, fetch, url, i, max_tokens, b, false);
+}
+
+/// Container validation and identical token planning, without decoding when the family offers a planner.
+pub fn planForCount(cx: *Cx, offer: api.VideoOffer, ctx: *anyopaque, fetch: ?images.Fetch, url: []const u8, i: usize, max_tokens: u32, b: *Budget) errors.Refused!api.PreparedVideo {
+    return prepareMode(cx, offer, ctx, fetch, url, i, max_tokens, b, true);
+}
+
+fn prepareMode(cx: *Cx, offer: api.VideoOffer, ctx: *anyopaque, fetch: ?images.Fetch, url: []const u8, i: usize, max_tokens: u32, b: *Budget, count_only: bool) errors.Refused!api.PreparedVideo {
     b.check() catch return cx.refuse("video preparation exceeded the configured time limit");
     var arena: std.heap.ArenaAllocator = .init(b.scratch);
     defer arena.deinit();
@@ -149,7 +158,9 @@ pub fn prepare(
     // The open decoder and encoded source are borrowed only for this synchronous preparation call.
     if (offer.lazy) src.identity = std.hash.Wyhash.hash(0x7466766964656f03, bytes);
     b.check() catch return cx.refuse("video preparation exceeded the configured time limit");
-    const prepared = (if (offer.prepare_scratch) |prepare_frames|
+    const prepared = (if (count_only and offer.plan_tokens != null)
+        tokenPlan(cx.a, offer, ctx, src, max_tokens)
+    else if (offer.prepare_scratch) |prepare_frames|
         prepare_frames(ctx, cx.a, b.scratch, src, max_tokens, offer.max_frames)
     else
         offer.prepare(ctx, cx.a, src, max_tokens, offer.max_frames)) catch |e| switch (e) {
@@ -174,6 +185,14 @@ pub fn prepare(
     };
     b.check() catch return cx.refuse("video preparation exceeded the configured time limit");
     return prepared;
+}
+
+fn tokenPlan(a: std.mem.Allocator, offer: api.VideoOffer, ctx: *anyopaque, src: api.VideoSource, max_tokens: u32) !api.PreparedVideo {
+    const p = try offer.plan_tokens.?(ctx, a, .{ .frames = src.frames, .rate_num = src.rate_num, .rate_den = src.rate_den, .width = src.width, .height = src.height }, max_tokens, offer.max_frames);
+    if (p.group_tokens.len != p.times.len or (p.labels.len != 0 and p.labels.len != p.times.len)) return error.BadVideo;
+    const groups = try a.alloc(api.PreparedImage, p.group_tokens.len);
+    for (groups, p.group_tokens) |*group, tokens| group.* = .{ .pixels = &.{}, .gh = 0, .gw = 0, .tokens = tokens, .hash = 0 };
+    return .{ .groups = groups, .times = @constCast(p.times), .labels = p.labels };
 }
 
 test "video bytes: data URLs within the limits; URLs only with --vision-urls" {

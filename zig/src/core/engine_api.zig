@@ -137,6 +137,8 @@ pub const Vision = vision_types.Vision;
 pub const VideoSource = vision_types.VideoSource;
 pub const FrameSink = vision_types.FrameSink;
 pub const PreparedVideo = vision_types.PreparedVideo;
+pub const VideoMetadata = vision_types.VideoMetadata;
+pub const VideoTokenPlan = vision_types.VideoTokenPlan;
 pub const VideoOffer = vision_types.VideoOffer;
 pub const VisionOpen = vision_types.VisionOpen;
 

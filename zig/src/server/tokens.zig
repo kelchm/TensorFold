@@ -39,12 +39,13 @@ fn tokenize(srv: *Server, cx: *Cx, body: Value) errors.Refused!Value {
         const thinking = try fields.thinkingFields(cx, body, srv.effort_levels);
         const on = thinking.enable orelse srv.config.enable_thinking;
         cx.clear_thinking = thinking.clear;
-        ids = prompt.renderIds(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), generation) catch |e| switch (e) {
+        var ordered: Value = .null;
+        ids = prompt.renderIdsMedia(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), generation, &ordered) catch |e| switch (e) {
             error.Refused => return cx.other(cx.message),
             else => |x| return x,
         };
-        // media expanded as the chat route expands them: each image's tokens, each video's frame groups
-        if (try images.expand(srv.info.vision, if (srv.config.vision_urls) images.Fetch.network(srv.io) else null, srv.text, cx, msgs, ids, 0)) |x| ids = x.ids;
+        // Count the same ordered media and video grids as chat; metadata planning never validates pixels.
+        if (try images.countIds(srv.info.vision, if (srv.config.vision_urls) images.Fetch.network(srv.io) else null, srv.text, cx, if (ordered == .null) msgs else ordered, ids)) |x| ids = x;
     } else {
         const text = body.get("prompt");
         if (text == null or text.? != .string) return cx.refuse("prompt must be a string (or send messages)");
