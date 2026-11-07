@@ -263,6 +263,10 @@ extern "C" __global__ void __launch_bounds__(tf_exl3::GROUP_THREADS)
   __shared__ int cnt[512], place[512];
   const int total = rows * ne;
   for (int i = threadIdx.x; i < ne; i += blockDim.x) sb[i] = bias[i];
+  // Dependent launch (decode windows): the bias (immutable) is staged before the wait; the router's slices, an
+  // earlier grid's, and every store come after it.
+  pdl_wait();
+  pdl_trigger();
   for (int i = threadIdx.x; i < total; i += blockDim.x) {
     float v[glm_moe::ROUTER_KS];
 #pragma unroll
@@ -289,6 +293,9 @@ extern "C" __global__ void __launch_bounds__(tf_exl3::GROUP_THREADS)
     tf_glm_topk_group(const float* logits, const float* bias, int* pick, float* wts, float scale, int ne, int top_k, int norm,
                       int rows, int* pick8, int* uids, int* ucount, int* members) {
   __shared__ int sh_pick[tf_exl3::GROUP_THREADS];
+  // Dependent launch (decode windows): the logits are an earlier grid's, so the wait comes first.
+  pdl_wait();
+  pdl_trigger();
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   if (warp < rows) glm_moe::topk_row(warp, lane, logits, bias, pick, wts, scale, ne, top_k, norm, sh_pick);
   __syncthreads();

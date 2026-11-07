@@ -100,6 +100,8 @@ test "TF_GLM_PDL_CHAIN: a K-sliced call's reduce launches as the matmul's depend
     try std.testing.expectEqual(mm.Chain{ .reduce = true, .p2p = true }, mm.Chain.parse("reduce,p2p").?);
     try std.testing.expectEqual(mm.Chain{ .hc = true }, mm.Chain.parse("hc").?);
     try std.testing.expect(mm.Chain.parse("reduce,hc,x") == null);
+    try std.testing.expectEqual(mm.Chain{ .moe = true, .hc = true }, mm.Chain.parse("moe,hc").?);
+    try std.testing.expect(mm.Chain.all.moe and mm.Chain.all.reduce and mm.Chain.all.hc and mm.Chain.all.p2p);
 }
 
 test "decode two-problem launches keep each problem's split K, one reduce for both, and refuse what matmul would not run" {

@@ -141,6 +141,9 @@ extern "C" __global__ void tf_glm_combine(
 
 // glue._router_sum and qmm._reduce: ks slices of `total` fp32 added in order (fp32 or bf16 out), 8 values a thread.
 extern "C" __global__ void tf_glm_slice_sum(const float* part, void* out, int64_t total, int ks, int f32) {
+  // Dependent launch (decode windows): the slices are an earlier grid's, so the wait comes first.
+  pdl_wait();
+  pdl_trigger();
   const int64_t i0 = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
   if (i0 >= total) return;
   const bool aligned = ((reinterpret_cast<uintptr_t>(out) | reinterpret_cast<uintptr_t>(part)) & 15) == 0;
