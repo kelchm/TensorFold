@@ -43,8 +43,9 @@ pub const Chain = struct {
     reduce: bool = false, // glm_mm_reduce launches as its matmul's dependent (not on the shared expert's side stream)
     hc: bool = false, // a decode window's hc_post, hc_partial8 and hc_finish (cuda_glue)
     p2p: bool = false, // the peer-store all-gather (cuda/p2p_gather.zig): waits, lets the next grid launch, exchanges
+    moe: bool = false, // a decode window's MoE router glue: slice_sum, topk_group(_sum) launch as dependents (cuda_glue)
 
-    pub const all: Chain = .{ .reduce = true, .hc = true, .p2p = true };
+    pub const all: Chain = .{ .reduce = true, .hc = true, .p2p = true, .moe = true };
 
     /// The chain a TF_GLM_PDL_CHAIN value names; null when a name is none of the three.
     pub fn parse(v: []const u8) ?Chain {
@@ -53,7 +54,7 @@ pub const Chain = struct {
         var c: Chain = .{};
         var it = std.mem.tokenizeScalar(u8, v, ',');
         while (it.next()) |name| {
-            if (std.mem.eql(u8, name, "reduce")) c.reduce = true else if (std.mem.eql(u8, name, "hc")) c.hc = true else if (std.mem.eql(u8, name, "p2p")) c.p2p = true else return null;
+            if (std.mem.eql(u8, name, "reduce")) c.reduce = true else if (std.mem.eql(u8, name, "hc")) c.hc = true else if (std.mem.eql(u8, name, "p2p")) c.p2p = true else if (std.mem.eql(u8, name, "moe")) c.moe = true else return null;
         }
         return c;
     }
@@ -63,7 +64,7 @@ pub const Chain = struct {
         if (std.c.getenv("TF_GLM_PDL")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return .{};
         const v = std.mem.span(std.c.getenv("TF_GLM_PDL_CHAIN") orelse return all);
         return parse(v) orelse {
-            std.log.err("TF_GLM_PDL_CHAIN: 1, 0 or a comma list of reduce, hc, p2p (not '{s}'): the chain stays off", .{v});
+            std.log.err("TF_GLM_PDL_CHAIN: 1, 0 or a comma list of reduce, hc, p2p, moe (not '{s}'): the chain stays off", .{v});
             return .{};
         };
     }

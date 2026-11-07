@@ -9,7 +9,8 @@ const index_mod = @import("cuda_index.zig");
 /// `absorb_mma`: TF_GLM_ABSORB_MMA=1 on a prompt pass (absorb_q and expand_v on tensor cores, cuda_latent).
 /// `dsel`: a decode window's DSA select on many CTAs (tf_glm_dsel_*, cuda_sparse; TF_GLM_DSEL, default on).
 /// `pdl_hc`: a decode window's hc_post, hc_partial8 and hc_finish launch as dependents (TF_GLM_PDL_CHAIN's hc).
-pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false, pdl_hc: bool = false };
+/// `pdl_moe`: a decode window's slice_sum, topk_group and topk_group_sum launch as dependents (TF_GLM_PDL_CHAIN's moe).
+pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false, pdl_hc: bool = false, pdl_moe: bool = false };
 
 /// A hidden-size norm's weight: bf16, or float32 (FP4-Local's) read as float32 by the _f32w kernels.
 pub const Norm = union(enum) { bf16: u64, f32: u64 };
@@ -230,7 +231,8 @@ pub fn selectGroup(set: Set, stream: cuda.Stream, logits: u64, bias: u64, pick: 
     if (rows == 0 or rows > select_group_rows or rows * top_k > 1024 or experts > 4096) return error.TooManyRows;
     var a: cuda.Args = .{};
     inline for (.{ logits, bias, pick, wts, scale, cint(experts), cint(top_k), @as(c_int, @intFromBool(norm)), cint(rows), pick8, ids, count, members }) |v| a.add(v);
-    try cuda.launch.launch(set.glue.topk_group, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, stream, &a);
+    // `pdl_moe`: a dependent launch; the kernel waits before it reads the logits or writes anything
+    try cuda.launch.launch(set.glue.topk_group, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 }, .pdl = set.pdl_moe }, stream, &a);
 }
 
 /// Shared memory a summed select-and-group takes beyond its static arrays: the rows' sigmoid scores.
@@ -252,7 +254,8 @@ pub fn selectGroupSum(set: Set, stream: cuda.Stream, part: u64, logits: u64, bia
     if (shared > select_group_sum_shared) return false;
     var a: cuda.Args = .{};
     inline for (.{ part, logits, bias, pick, wts, scale, cint(experts), cint(top_k), @as(c_int, @intFromBool(norm)), cint(rows), pick8, ids, count, members }) |v| a.add(v);
-    try cuda.launch.launch(set.glue.topk_group_sum, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 }, .shared = @intCast(shared) }, stream, &a);
+    // `pdl_moe`: a dependent launch (router_tile before it triggers at its start); the kernel stages the bias, then waits
+    try cuda.launch.launch(set.glue.topk_group_sum, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 }, .shared = @intCast(shared), .pdl = set.pdl_moe }, stream, &a);
     return true;
 }
 
@@ -348,7 +351,8 @@ pub fn convShift(set: Set, stream: cuda.Stream, conv: u64, proj: u64, keep: usiz
 pub fn sliceSum(set: Set, stream: cuda.Stream, part: u64, out: u64, total: usize, ks: usize, wide: bool) !void {
     var a: cuda.Args = .{};
     inline for (.{ part, out, i64of(total), cint(ks), @as(c_int, @intFromBool(wide)) }) |v| a.add(v);
-    try cuda.launch.launch(set.glue.slice_sum, .{ .grid = .{ .x = cdiv(total, 1024) }, .block = .{ .x = 128 } }, stream, &a);
+    // `pdl_moe`: a dependent launch (router_tile before it triggers at its start); the kernel waits before it reads
+    try cuda.launch.launch(set.glue.slice_sum, .{ .grid = .{ .x = cdiv(total, 1024) }, .block = .{ .x = 128 }, .pdl = set.pdl_moe }, stream, &a);
 }
 
 test "the norm's block is the next power of two of the width" {
