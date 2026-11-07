@@ -138,7 +138,8 @@ pub const Engine = struct {
     index_splits: u64 = 0, // prompt steps whose indexer rows split (glm-split-check counts them)
     a8_buf: ?cuda.DeviceBuffer = null, // TF_GLM_W8A8=1: a prompt pass's int8 rows and scales (cuda_mm.A8)
     partial: ?PartialFill = null, // TF_GLM_FILL_SLICE_MS: the one prompt chunk between its layers (its slot bound to run it)
-    slice_costs: LayerCosts = .{}, // its per-layer costs: the first chunk calibrates by events, later ones the EWMA scale
+    slice_costs: LayerCosts = .{}, // bounded exact-row timing bands; unknown rows start one layer at a time
+    slice_workspace: ?*sliced.Workspace = null, // one startup allocation, shared by sequential chunk leases
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
@@ -271,6 +272,7 @@ pub const Engine = struct {
         if (e.side) |x| x.s.synchronize() catch {}; // shared-expert work still in flight reads buffers and weights freed below
         if (e.partial) |p| _ = e.dropPartialOf(p.slot);
         e.slice_costs.deinit();
+        if (e.slice_workspace) |w| w.destroy(e.gpa);
 
         e.gpa.free(e.packs.ptrs);
         e.gpa.free(e.packs.bits);
@@ -542,6 +544,7 @@ pub const Engine = struct {
         return first;
     }
 
+    pub const startSlices = sliced.startup;
     pub const sliceHi = sliced.hi;
     pub const prepareSlice = sliced.prepare;
     pub const agreeSlice = sliced.admit;

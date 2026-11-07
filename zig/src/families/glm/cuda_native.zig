@@ -171,9 +171,9 @@ pub fn roceBytes(text: ?[]const u8) !usize {
 const startup = @import("cuda_start.zig");
 const paging = startup.paging;
 
-/// TF_GLM_FILL_SLICE_MS in milliseconds, read once as the lanes are made (0, unset or ill-formed: off): a prompt
+/// TF_GLM_FILL_SLICE_MS in milliseconds, read once before rank agreement (0, unset or ill-formed: off): a prompt
 /// chunk's layers then run a slice about this cheap at a time, the decode rounds between the slices -- rank 0 alone
-/// reads it, its steps carrying each slice's end layer to the other ranks.
+/// chooses each end layer; all ranks agree on the setting before allocating its startup workspace.
 fn fillSlice() f64 {
     const v = std.c.getenv("TF_GLM_FILL_SLICE_MS") orelse return 0;
     const ms = std.fmt.parseFloat(f64, std.mem.span(v)) catch {
@@ -196,6 +196,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         return err;
     };
     set.kv8 = o.kv8;
+    set.fill_slice_ms = fillSlice();
     return startup.open(io, p, if (std.c.getenv("TF_KV_PAGES")) |v| std.mem.span(v) else null, set, cuda.tp_watch, StartArgs{ .gpa = gpa, .io = io, .ctx = ctx, .dir = dir, .o = o, .p = p, .roce_bytes = roce_bytes }, openRank);
 }
 
@@ -306,6 +307,8 @@ fn finishRank(a: OpenArgs) !Loaded {
     own.link = try follow.Link.init(gpa, ctx.d, &own.group.lib, own.group.comm, own.e.stream, try linkCapacity(cap, o.vision));
     errdefer own.link.deinit();
     own.e.snap_setup = .{ .ptr = own, .run = readySnapshots };
+    // Persistent slicing memory is already resident when local/peer room and the live KV plan are read.
+    try own.e.startSlices(set.fill_slice_ms > 0);
     // Rank 0 admits by the smallest room of the ranks; its sizes are the largest (the first ranks take the remainder).
     const rooms = try gpa.alloc(u64, p.world);
     defer gpa.free(rooms);
@@ -338,7 +341,7 @@ fn finishRank(a: OpenArgs) !Loaded {
         }
     }.get;
     own.link.asleep = cuda.tp_watch.open(); // the other ranks begin asleep (follow): the first step wakes them
-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .fill_slice_ms = fillSlice(), .mtp_confidence = o.mtp_confidence };
+    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .fill_slice_ms = set.fill_slice_ms, .mtp_confidence = o.mtp_confidence };
     const extra: u64 = (if (o.drafter != null) dflash.ring_bytes else 0) + if (own.e.images) |v| v.streamBytes() else @as(usize, 0);
     own.layout = if (set.pages) try pages_mod.layout(gpa, own.e, extra) else null;
     return .{

@@ -42,6 +42,7 @@ const Lane = struct {
     chances: [max_held]f64 = undefined, // each held draft's chance: DFlash2's selector's, or the MTP head's (--mtp-confidence)
     held_n: usize = 0,
     first: ?u64 = null,
+    fill_error: ?anyerror = null, // a foreign drain reports failure only when this owner next runs
     fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
     raw: [max_held]f64 = undefined, // DFlash2's selector chances as drawn (chances may be cut or calibrated)
     lean: rule.Lean = .{}, // TF_GLM_DRAFT_RULE=tpm: the stream's own lean and tokens a ms
@@ -223,6 +224,7 @@ pub const Lanes = struct {
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
         const self = of(ptr);
         try self.drainPartial(); // a suspended chunk would run under the whole pass's own (a warm turn finds one)
+        if (self.lanes.getPtr(s)) |l| if (l.fill_error) |err| return err;
         const from = try self.opening(s);
         try self.images(s, from);
         var sink: Sink = .{ .gpa = self.x.e.gpa, .s = s };
@@ -241,19 +243,20 @@ pub const Lanes = struct {
         while (it.next()) |entry| if (entry.value_ptr.slot == p.slot) {
             const owner = @constCast(entry.key_ptr.*);
             const l = entry.value_ptr;
-            try self.x.bind(p.slot);
+            self.x.bind(p.slot) catch |err| {
+                self.failPartial(owner, l, err);
+                return;
+            };
             var sink: Sink = .{ .gpa = e.gpa, .s = owner };
             sink.prepare() catch |err| {
-                try self.x.cancelSlice(p.start, marksOf(owner));
-                l.fill = null;
-                return err;
+                self.failPartial(owner, l, err);
+                return;
             };
             e.prompt_logprobs = sink.want();
             defer e.prompt_logprobs = null;
             const step = self.x.chunkSliced(&.{}, p.start, false, null, budget, .{ .ptr = owner, .check = cancelled }, marksOf(owner)) catch |err| {
-                l.fill = null;
-                if (err == error.Cancelled) return;
-                return err;
+                self.failPartial(owner, l, err);
+                return;
             };
             if (step.first) |first| {
                 l.first = self.take(first);
@@ -264,6 +267,17 @@ pub const Lanes = struct {
         try self.x.bind(p.slot);
         try self.x.cancelSlice(p.start, null);
         return error.SliceOwnerMissing;
+    }
+
+    fn failPartial(self: *Lanes, owner: *lanes.Stream, l: *Lane, err: anyerror) void {
+        const undo = @import("cuda_slice_undo.zig");
+        undo.admissionError(err);
+        if (self.x.e.partial) |p| {
+            self.x.bind(p.slot) catch |why| undo.fatal(why);
+            self.x.cancelSlice(p.start, marksOf(owner)) catch |why| undo.fatal(why);
+        }
+        l.fill_error = err;
+        l.fill = null;
     }
 
     pub fn drainPartial(self: *Lanes) !void {
@@ -306,11 +320,12 @@ pub const Lanes = struct {
     fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
         const self = of(ptr);
         const e = self.x.e;
+        if (self.lanes.getPtr(s)) |l| if (l.fill_error) |err| return err;
         const mine: ?u32 = if (self.lanes.getPtr(s)) |l| l.slot else null;
         if (mine != null) if (self.lanes.getPtr(s).?.first != null and self.lanes.getPtr(s).?.fill == null) return true; // its prompt ended inside another stream's step
         if (e.partial) |p| if (mine == null or p.slot != mine.?) {
-            try self.advancePartial(self.fill_slice_ms);
-            return false;
+            // Host charged this choice to s: finish the foreign chunk, then advance s in the same call.
+            try self.drainPartial();
         };
         const going: ?usize = if (self.lanes.getPtr(s)) |l| l.fill else null;
         const from = if (going == null) try self.opening(s) else null;

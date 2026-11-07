@@ -9,6 +9,13 @@ const prompt_lp = @import("cuda_prompt_logprobs.zig");
 const df = @import("dflash.zig");
 const max_layers = @import("config.zig").max_layers;
 const Engine = engine.Engine;
+pub const Workspace = @import("cuda_slice_workspace.zig").Workspace;
+
+pub fn startup(e: *Engine, enabled: bool) !void {
+    if (!enabled) return;
+    if (e.slice_workspace != null) return;
+    e.slice_workspace = try Workspace.create(e);
+}
 
 pub const Partial = struct {
     slot: u32,
@@ -22,18 +29,18 @@ pub const Partial = struct {
     events: [2]cuda.Event,
     costs: [max_layers + 1]f64 = @splat(0),
     calibrated: bool,
+    measured: usize = 0,
     admitted: bool = false,
     logprobs: ?u8,
 };
 
 pub fn resident(e: *const Engine) usize {
-    const p = if (e.partial) |*v| v else return 0;
-    return @sizeOf(Partial) + p.undo.resident() + p.part.len * @sizeOf(u32);
+    return if (e.slice_workspace) |w| w.resident() else 0;
 }
 
 pub fn hi(e: *Engine, rows: usize, lo: usize, budget: f64) !usize {
     if (lo >= e.w.layers.len or !std.math.isFinite(budget) or budget <= 0) return error.BadSlice;
-    if (e.slice_costs.ready()) return @min(e.w.layers.len, e.slice_costs.stop(rows, lo, budget));
+    if (e.slice_costs.readyRows(rows)) return @min(e.w.layers.len, e.slice_costs.stop(rows, lo, budget));
     return lo + 1;
 }
 
@@ -47,14 +54,11 @@ pub fn prepare(e: *Engine, part: []const u32, start: usize, len: usize, from: ?e
     if (part.len != @min(rows + 1, len - start)) return error.BadChunk;
     if (from != null and try e.prefillStart(len, from) != start) return error.BadChunk;
     if (e.cur.st.pos != start) return error.BadChunk;
-    const ids = try e.gpa.dupe(u32, part);
-    errdefer e.gpa.free(ids);
-    var first = try cuda.Event.init(e.d, true);
-    errdefer closeEvent(&first);
-    var last = try cuda.Event.init(e.d, true);
-    errdefer closeEvent(&last);
+    const workspace = e.slice_workspace orelse return error.SlicingNotStarted;
     var saved = try undo.Undo.capture(e);
     errdefer saved.close(e.gpa);
+    const ids = workspace.part[0..part.len];
+    @memcpy(ids, part);
     const p: Partial = .{
         .slot = e.slot,
         .start = start,
@@ -63,8 +67,8 @@ pub fn prepare(e: *Engine, part: []const u32, start: usize, len: usize, from: ?e
         .part = ids,
         .split = e.index_split,
         .undo = saved,
-        .events = .{ first, last },
-        .calibrated = e.slice_costs.ready(),
+        .events = workspace.events,
+        .calibrated = e.slice_costs.readyRows(rows),
         .logprobs = if (e.prompt_logprobs) |w| w.k else null,
     };
     e.partial = p;
@@ -83,16 +87,9 @@ pub fn admit(e: *Engine, failed: ?anyerror) !void {
     e.partial.?.admitted = true;
 }
 
-fn closeEvent(ev: *cuda.Event) void {
-    ev.d.check(ev.d.api.cuEventDestroy_v2(ev.handle), "slice event destroy") catch |err| undo.fatal(err);
-    ev.* = undefined;
-}
-
 fn dispose(e: *Engine, slot: u32) void {
     if (e.partial) |*p| if (p.slot == slot) {
         p.undo.close(e.gpa);
-        for (&p.events) |*ev| closeEvent(ev);
-        e.gpa.free(p.part);
         e.partial = null;
     };
 }
@@ -149,8 +146,11 @@ pub fn run(e: *Engine, part: []const u32, start: usize, len: usize, from: ?engin
     e.stream.synchronize() catch |err| undo.fatal(err);
     const ms = p.events[0].elapsedMs(p.events[1]) catch |err| undo.fatal(err);
     if (!std.math.isFinite(ms) or ms < 0) undo.fatal(error.BadSliceTiming);
-    if (!p.calibrated and end == p.j + 1) p.costs[p.j] = ms;
-    if (e.slice_costs.ready()) e.slice_costs.observe(p.rows, p.j, end, ms);
+    if (!p.calibrated and end == p.j + 1) {
+        p.costs[p.j] = ms;
+        p.measured += 1;
+    }
+    if (p.calibrated) e.slice_costs.observe(p.rows, p.j, end, ms);
     p.j = end;
     if (end < e.w.layers.len) return null;
     p.events[0].record(e.stream) catch |err| undo.fatal(err);
@@ -158,10 +158,11 @@ pub fn run(e: *Engine, part: []const u32, start: usize, len: usize, from: ?engin
     p.events[1].record(e.stream) catch |err| undo.fatal(err);
     e.stream.synchronize() catch |err| undo.fatal(err);
     const tail_ms = p.events[0].elapsedMs(p.events[1]) catch |err| undo.fatal(err);
+    if (!std.math.isFinite(tail_ms) or tail_ms < 0) undo.fatal(error.BadSliceTiming);
     if (!p.calibrated) {
         p.costs[end] = tail_ms;
-        // Timing metadata is optional; failed host allocation leaves the next chunk cold and fully sliced.
-        e.slice_costs.calibrate(p.rows, p.costs[0 .. end + 1]) catch {};
+        // Direct callers may choose wider cold ranges; only complete single-layer measurements train a band.
+        if (p.measured == end) e.slice_costs.calibrate(p.rows, p.costs[0 .. end + 1]) catch {};
     } else e.slice_costs.observeTail(p.rows, tail_ms);
     if ((e.shared(0) catch |err| undo.fatal(err)) != 0) undo.fatal(error.PeerSliceCommit);
     e.index_splits += @intFromBool(p.split);

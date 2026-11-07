@@ -8,6 +8,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 /// The forward's knobs a rank reads from its environment (the Python family's names and defaults).
 pub const Settings = struct {
     kv8: bool = false, // --kv-cache fp8, supplied by the native options rather than an environment override
+    fill_slice_ms: f64 = 0, // native opt-in, agreed before load and allocated before room sampling
     pages: bool = false, // TF_KV_PAGES as `open` resolves it (with the world and --kv-cache): every sequence on pages
     prompt_fixed_k: bool = false, // TF_GLM_PROMPT_K: one (default) or shape (experimental fixed K slices)
     tiled: bool = true, // TF_GLM_MM: 1 (the bf16 linears on glm_mm, tiled at load) or 0
@@ -142,7 +143,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 14, // this struct's version (13 was num3's numerics or prefill3's pair alone)
+    layout: u32 = 15, // slicing workspace admission is part of the rank agreement
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -162,6 +163,7 @@ pub const Fingerprint = extern struct {
     max_frames: u32 = 0,
     bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
     numerics: u32 = 0, // Settings.numerics: every rank's prompt kernels round alike
+    fill_slice_ms: f64 = 0,
     capacity: u64, // tokens a sequence holds
     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
     heat_low: f64,
@@ -190,6 +192,7 @@ pub const Fingerprint = extern struct {
         max_frames,
         bits,
         numerics,
+        fill_slice_ms,
         capacity,
         heat_high,
         heat_low,
@@ -223,6 +226,7 @@ pub const Fingerprint = extern struct {
             .mtp = @intFromBool(mtp),
             .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
             .numerics = s.numerics.bits(),
+            .fill_slice_ms = s.fill_slice_ms,
             .capacity = capacity,
             .heat_high = if (s.heat) |b| b.high_c else 0,
             .heat_low = if (s.heat) |b| b.low_c else 0,
@@ -260,6 +264,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "max_frames",
             "bits",
             "numerics",
+            "fill_slice_ms",
             "capacity",
             "heat_high",
             "heat_low",
@@ -370,6 +375,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .max_frames => "the frame limit",
         .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
         .numerics => "TF_GLM_ABSORB_MMA or TF_GLM_W8A8",
+        .fill_slice_ms => "TF_GLM_FILL_SLICE_MS",
         .capacity => "the sequence capacity (the context)",
         .heat_high => "TF_HEAT_HIGH",
         .heat_low => "TF_HEAT_LOW",
