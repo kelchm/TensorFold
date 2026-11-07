@@ -35,6 +35,22 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
 }
 
 fn renderIdsMedia(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, ordered: ?*Value) errors.Refused![]const u32 {
+    var arena: std.heap.ArenaAllocator = .init(@import("prepare_memory.zig").scratch(.prompt));
+    defer arena.deinit();
+    var scratch: Cx = .{ .a = arena.allocator(), .clear_thinking = cx.clear_thinking };
+    var media: Value = .null;
+    const ids = renderIdsScratch(srv, &scratch, messages, tools, thinking, effort, generation, if (ordered != null) &media else null) catch |err| {
+        cx.kind = scratch.kind;
+        cx.message = try cx.a.dupe(u8, scratch.message);
+        return err;
+    };
+    if (ordered) |out| if (media != .null) {
+        out.* = try json.deepCopy(cx.a, media);
+    };
+    return cx.a.dupe(u32, ids);
+}
+
+fn renderIdsScratch(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, ordered: ?*Value) errors.Refused![]const u32 {
     const normalized = try messages_mod.toolArguments(cx, try messages_mod.normalizeWith(cx, messages, srv.late_system, srv.needs_user_after_tool, .of(srv.info.vision)));
     var problem: []const u8 = "";
     const options: model_text.RenderOptions = .{
@@ -123,7 +139,9 @@ fn generationPrompt(srv: *Server, cx: *Cx, thinking: bool) errors.Refused![]cons
 /// Earlier replies' decoded rows: from each turn's generation prompt end through its closing stop token.
 pub fn replySpans(srv: *Server, cx: *Cx, prompt: []const u32) errors.Refused![]const [2]u32 {
     if (srv.eos.len == 0) return &.{};
-    var probe: Cx = .{ .a = cx.a, .clear_thinking = cx.clear_thinking }; // a template that refuses the probe leaves the request without spans, not failed
+    var arena: std.heap.ArenaAllocator = .init(@import("prepare_memory.zig").scratch(.prompt));
+    defer arena.deinit();
+    var probe: Cx = .{ .a = arena.allocator(), .clear_thinking = cx.clear_thinking };
     const openers = [2][]const u32{ generationPrompt(srv, &probe, false) catch &.{}, generationPrompt(srv, &probe, true) catch &.{} };
     var spans: std.ArrayList([2]u32) = .empty;
     var i: usize = 0;
@@ -153,11 +171,20 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
     };
     var media_messages = input.messages;
     const prompt = try renderIdsMedia(srv, cx, input.messages, input.tools, thinking, effort, true, &media_messages);
-    const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
-    var history_len: usize = 0;
-    if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
-    if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
-    if (history_len > 0) history_len = continuedLen(srv, cx, input.messages, input.tools, thinking, effort, history, history_len);
+    const history_len = blk: {
+        var arena: std.heap.ArenaAllocator = .init(@import("prepare_memory.zig").scratch(.prompt));
+        defer arena.deinit();
+        var scratch: Cx = .{ .a = arena.allocator(), .clear_thinking = cx.clear_thinking };
+        const history = renderIds(srv, &scratch, input.messages, input.tools, thinking, effort, false) catch |err| {
+            cx.kind = scratch.kind;
+            cx.message = try cx.a.dupe(u8, scratch.message);
+            return err;
+        };
+        var n: usize = 0;
+        if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) n = history.len;
+        if (n == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) n = prompt.len - 1;
+        break :blk if (n > 0) continuedLen(srv, &scratch, input.messages, input.tools, thinking, effort, history, n) else n;
+    };
     // --vision: placeholders expanded to image tokens before the window, chunks and cache see it; no rewind kept
     if (try images.expand(srv.info.vision, if (srv.config.vision_urls) images.Fetch.network(srv.io) else null, srv.text, cx, media_messages, prompt, history_len)) |x| return .{ .ids = x.ids, .history_len = x.history_len, .images = x.images, .cache_key = x.cache_key };
     const count = if (input.messages == .array) input.messages.array.len else 0;
@@ -204,6 +231,13 @@ test "interior prompt: user end excludes later tool and assistant text" {
 
 /// Where the latest user message's text starts (of the first `real_count`): the prompt and a probe there agree to it.
 pub fn rewindLen(srv: *Server, cx: *Cx, messages: Value, real_count: usize, tools: []const Value, prompt: []const u32, thinking: bool, effort: ?[]const u8) usize {
+    var arena: std.heap.ArenaAllocator = .init(@import("prepare_memory.zig").scratch(.prompt));
+    defer arena.deinit();
+    var scratch: Cx = .{ .a = arena.allocator(), .clear_thinking = cx.clear_thinking };
+    return rewindLenScratch(srv, &scratch, messages, real_count, tools, prompt, thinking, effort);
+}
+
+fn rewindLenScratch(srv: *Server, cx: *Cx, messages: Value, real_count: usize, tools: []const Value, prompt: []const u32, thinking: bool, effort: ?[]const u8) usize {
     if (messages != .array or real_count > messages.array.len) return 0;
     const user_index = for (0..real_count) |n| {
         const i = real_count - 1 - n;
@@ -223,6 +257,13 @@ pub fn rewindLen(srv: *Server, cx: *Cx, messages: Value, real_count: usize, tool
 
 /// A reusable system prefix, found with a probe in place of the first user message; zero below 512 tokens.
 pub fn systemPrefixLen(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, prompt_ids: []const u32, thinking: bool, effort: ?[]const u8) usize {
+    var arena: std.heap.ArenaAllocator = .init(@import("prepare_memory.zig").scratch(.prompt));
+    defer arena.deinit();
+    var scratch: Cx = .{ .a = arena.allocator(), .clear_thinking = cx.clear_thinking };
+    return systemPrefixLenScratch(srv, &scratch, messages, tools, prompt_ids, thinking, effort);
+}
+
+fn systemPrefixLenScratch(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, prompt_ids: []const u32, thinking: bool, effort: ?[]const u8) usize {
     if (messages != .array) return 0;
     const first_user = for (messages.array, 0..) |m, i| {
         const role = m.get("role") orelse continue;

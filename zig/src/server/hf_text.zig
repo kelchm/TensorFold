@@ -8,6 +8,7 @@ const dsv41_chat = @import("dsv41_chat");
 const dsv41 = if (@hasDecl(dsv41_chat, "template")) dsv41_chat.template else dsv41_chat;
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
+const memory_contract = @import("prepare_memory.zig");
 
 const clear_thinking_env = "TF_GLM_CLEAR_THINKING";
 
@@ -271,19 +272,32 @@ pub const HfText = struct {
         return @ptrCast(@alignCast(ctx));
     }
 
+    fn scratchTokenizer(t: *HfText) tokenizer.Tokenizer {
+        var view = t.tok;
+        view.scratch_allocator = memory_contract.scratch(.tokenize);
+        return view;
+    }
+
     fn encodeFn(ctx: *anyopaque, a: Allocator, s: []const u8, add_special: bool) model_text.Error![]u32 {
         const t = self(ctx);
-        const ids = t.tok.encode(a, s) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Template;
-        if (!add_special or (t.prefix.len == 0 and t.suffix.len == 0)) return ids;
+        var scratch: std.heap.ArenaAllocator = .init(memory_contract.scratch(.tokenize));
+        defer scratch.deinit();
+        const ids = scratchTokenizer(t).encode(scratch.allocator(), s) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Template;
+        if (!add_special or (t.prefix.len == 0 and t.suffix.len == 0)) return a.dupe(u32, ids);
         return std.mem.concat(a, u32, &.{ t.prefix, ids, t.suffix });
     }
 
     fn encodePlainFn(ctx: *anyopaque, a: Allocator, s: []const u8) model_text.Error![]u32 {
-        return self(ctx).tok.encodePlain(a, s) catch |e| if (e == error.OutOfMemory) error.OutOfMemory else error.Template;
+        var scratch: std.heap.ArenaAllocator = .init(memory_contract.scratch(.tokenize));
+        defer scratch.deinit();
+        return a.dupe(u32, scratchTokenizer(self(ctx)).encodePlain(scratch.allocator(), s) catch |e|
+            return if (e == error.OutOfMemory) error.OutOfMemory else error.Template);
     }
 
     fn encodeMaskedFn(ctx: *anyopaque, a: Allocator, s: []const u8, spans: []const model_text.Span, problem: *[]const u8) model_text.Error![]u32 {
-        return self(ctx).tok.encodeMasked(a, s, spans) catch |err| {
+        var scratch: std.heap.ArenaAllocator = .init(memory_contract.scratch(.tokenize));
+        defer scratch.deinit();
+        const ids = scratchTokenizer(self(ctx)).encodeMasked(scratch.allocator(), s, spans) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             problem.* = if (err == error.UnsafeNormalizedAddedTokenMask)
                 "normalized added tokens cannot be matched safely through this normalizer with request text"
@@ -293,10 +307,15 @@ pub const HfText = struct {
                 "the tokenizer cannot encode this prompt with request byte provenance";
             return error.Template;
         };
+        return a.dupe(u32, ids);
     }
 
     fn decodeFn(ctx: *anyopaque, a: Allocator, ids: []const u32) Allocator.Error![]u8 {
-        return self(ctx).tok.decode(a, ids, false) catch |e| if (e == error.OutOfMemory) error.OutOfMemory else a.dupe(u8, "\u{fffd}");
+        var scratch: std.heap.ArenaAllocator = .init(memory_contract.scratch(.tokenize));
+        defer scratch.deinit();
+        const bytes = scratchTokenizer(self(ctx)).decode(scratch.allocator(), ids, false) catch |e|
+            return if (e == error.OutOfMemory) error.OutOfMemory else a.dupe(u8, "\u{fffd}");
+        return a.dupe(u8, bytes);
     }
 
     fn tokenIdFn(ctx: *anyopaque, piece: []const u8) ?u32 {
@@ -309,7 +328,7 @@ pub const HfText = struct {
     }
 
     fn tokenBytesFn(ctx: *anyopaque, a: Allocator, id: u32) Allocator.Error!?[]u8 {
-        return self(ctx).tok.tokenBytes(a, id) catch |e| if (e == error.OutOfMemory) error.OutOfMemory else null;
+        return scratchTokenizer(self(ctx)).tokenBytes(a, id) catch |e| if (e == error.OutOfMemory) error.OutOfMemory else null;
     }
 
     fn vocabFn(ctx: *anyopaque) u32 {
@@ -353,6 +372,18 @@ pub const HfText = struct {
     }
 
     fn renderFn(ctx: *anyopaque, a: Allocator, messages: Value, options: model_text.RenderOptions, problem: *[]const u8) model_text.Error!model_text.Rendered {
+        var scratch: std.heap.ArenaAllocator = .init(memory_contract.scratch(.render));
+        defer scratch.deinit();
+        const out = renderScratch(ctx, scratch.allocator(), messages, options, problem) catch |err| {
+            problem.* = try a.dupe(u8, problem.*);
+            return err;
+        };
+        const rendered_text = try a.dupe(u8, out.text);
+        errdefer a.free(rendered_text);
+        return .{ .text = rendered_text, .spans = try a.dupe(model_text.Span, out.spans) };
+    }
+
+    fn renderScratch(ctx: *anyopaque, a: Allocator, messages: Value, options: model_text.RenderOptions, problem: *[]const u8) model_text.Error!model_text.Rendered {
         const t = self(ctx);
         const compiled = if (options.tools != null and t.tool_compiled != null) &t.tool_compiled.? else if (t.compiled) |*c| c else {
             if (t.native_deepseek) return t.renderDeepseek(a, messages, options, problem);
@@ -371,7 +402,7 @@ pub const HfText = struct {
         if (t.clear_thinking) |clear| try context.put(a, "clear_thinking", .{ .bool = options.clear_thinking orelse clear });
         var diag: template.Diag = .{};
         const tools: std.json.Value = if (options.tools) |tl| try toStd(a, tl) else .null;
-        const out = template.renderProvenanceGlobals(a, compiled, try toStd(a, messages), tools, .{ .object = context }, .{ .object = globals }, options.add_generation_prompt, &diag) catch |e| {
+        const out = template.renderProvenanceGlobalsWithScratch(a, memory_contract.scratch(.render), compiled, try toStd(a, messages), tools, .{ .object = context }, .{ .object = globals }, options.add_generation_prompt, &diag) catch |e| {
             if (e == error.OutOfMemory) return error.OutOfMemory;
             problem.* = diag.msg;
             return error.Template;

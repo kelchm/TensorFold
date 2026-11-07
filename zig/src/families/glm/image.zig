@@ -13,6 +13,7 @@ pub const decoderProblem = steps.decoderProblem;
 pub const patchify = steps.patchify;
 pub const prepare = steps.prepare;
 pub const plan = steps.plan;
+pub const planWithScratch = steps.planWithScratch;
 pub const prepareRgb = steps.prepareRgb;
 
 test "geometry follows smart_resize" {

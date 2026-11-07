@@ -117,7 +117,7 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, window: u32, speed_up: 
         const o = vision.?;
         h.markers = .{ v.c.image_start, v.c.image_token, v.c.image_end };
         h.video_open = o;
-        offer = .{ .ctx = h, .prepare = prepareImage, .image_token = v.c.image_token, .markers = &h.markers, .image_tokens = o.image_tokens, .max_images = o.max_images, .explain = glm.image.decoderProblem };
+        offer = .{ .ctx = h, .prepare = prepareImage, .prepare_scratch = prepareImageScratch, .image_token = v.c.image_token, .markers = &h.markers, .image_tokens = o.image_tokens, .max_images = o.max_images, .explain = glm.image.decoderProblem };
         offer.?.image_limits = .{ .io = io, .per_image_tokens = 2048, .max_request_bytes = 64 << 20, .max_request_pixels = 400 << 20, .prepare_seconds = 100, .render_order = true, .honor_low_detail = false };
         if (v.c.video) |vm| {
             h.video_markers = vm;
@@ -188,8 +188,12 @@ fn borrowedState(ctx: *anyopaque, saved: *anyopaque) bool {
 
 /// Info.vision's prepare: an image's bytes to the tower's patches (families/glm/image.zig), on the HTTP thread.
 fn prepareImage(ctx: *anyopaque, a: Allocator, bytes: []const u8, max_tokens: u32) anyerror!api.PreparedImage {
+    return prepareImageScratch(ctx, a, std.heap.page_allocator, bytes, max_tokens);
+}
+
+fn prepareImageScratch(ctx: *anyopaque, a: Allocator, scratch: Allocator, bytes: []const u8, max_tokens: u32) anyerror!api.PreparedImage {
     const h: *Host = @ptrCast(@alignCast(ctx));
-    const p = try glm.image.plan(h.wall.io, a, bytes, h.eng.vision.?.c, max_tokens);
+    const p = try glm.image.planWithScratch(h.wall.io, a, scratch, bytes, h.eng.vision.?.c, max_tokens);
     return .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .tokens = p.tokens, .hash = p.hash, .source_pixels = p.source_pixels, .deferred = if (p.deferred) |d| .{ .ctx = d.ctx, .prepare = d.prepare, .checked = d.checked } else null };
 }
 

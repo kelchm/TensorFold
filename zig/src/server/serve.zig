@@ -180,6 +180,10 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .keep_warm_s = args.keep_warm,
         .idle_unload_s = args.idle_unload,
         .admission = args.admission,
+        .prepare_policy = @import("prepare_gate.zig").Policy.fromEnv(s.environ) catch {
+            log.line("invalid TF_PREPARE_* policy: residents/waiting 0..128, wait 1..3600000 ms; floor and reserve require residents", .{});
+            return 1;
+        },
         .default_sampling = s.sampling,
         .use_drafts = !args.no_drafts,
         .vision_urls = args.vision_urls,

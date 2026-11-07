@@ -15,6 +15,8 @@ const Pass = struct {
     gpa: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     request: api.Request,
+    parent: ?*@import("prepare_memory.zig").Request,
+    srv: *Server,
 
     fn event(ptr: *anyopaque, _: api.Id, e: *const api.Event) void {
         if (e.* != .finished) return;
@@ -26,9 +28,12 @@ const Pass = struct {
             .failed => "failed",
             else => "ended",
         }, if (f.message.len > 0) ": " else "", f.message, f.stats.queued_seconds });
-        var arena = p.arena;
+        const parent = p.parent;
+        const srv = p.srv;
+        p.arena.deinit();
         p.gpa.destroy(p);
-        arena.deinit();
+        if (parent) |r| r.release();
+        _ = srv.generating.fetchSub(1, .seq_cst);
     }
 };
 
@@ -40,12 +45,18 @@ pub fn reply(srv: *Server, input: chat.Input, message: Value, thinking: bool, ef
 
 fn start(srv: *Server, input: chat.Input, message: Value, thinking: bool, effort: ?[]const u8, prompt_len: usize) !void {
     const p = try srv.gpa.create(Pass);
-    p.* = .{ .gpa = srv.gpa, .arena = .init(srv.gpa), .request = undefined };
+    const parent = @import("prepare_memory.zig").current;
+    if (parent) |r| r.retain();
+    _ = srv.generating.fetchAdd(1, .seq_cst);
+    p.* = .{ .gpa = srv.gpa, .srv = srv, .parent = parent, .arena = .init(srv.prepare_memory.of(.retained).allocator()), .request = undefined };
     var handed = false;
     defer if (!handed) {
         p.arena.deinit();
         srv.gpa.destroy(p);
+        if (parent) |r| r.release();
+        _ = srv.generating.fetchSub(1, .seq_cst);
     };
+    if (srv.draining.load(.seq_cst)) return;
     const a = p.arena.allocator();
     const clear = input.fields.get("clear_thinking");
     var cx: errors.Cx = .{ .a = a, .clear_thinking = if (clear != null and clear.? == .bool) clear.?.bool else null };
@@ -70,7 +81,7 @@ fn start(srv: *Server, input: chat.Input, message: Value, thinking: bool, effort
 /// tool result, after an answer a user message: a template that clears earlier turns' reasoning (GLM's) renders the
 /// loop's turns differently before each, and only the turn that comes next is worth prefilling.
 fn shared(srv: *Server, cx: *errors.Cx, input: chat.Input, message: Value, thinking: bool, effort: ?[]const u8) !struct { ids: []const u32, messages: []Value } {
-    const before = input.messages.array;
+    const before = (try json.deepCopy(cx.a, input.messages)).array;
     const calls = message.get("tool_calls");
     const called = calls != null and calls.? == .array and calls.?.array.len > 0;
     var ids: [2][]const u32 = undefined;

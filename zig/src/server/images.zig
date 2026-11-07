@@ -58,7 +58,13 @@ pub const Fetch = struct {
     pub fn network(io: std.Io) Fetch {
         return .{ .io = io, .get = struct {
             fn get(_: ?*anyopaque, a: std.mem.Allocator, i: std.Io, url: []const u8, max_bytes: usize, deadline: std.Io.Timestamp, media: []const []const u8, f: *media_fetch.Failure) media_fetch.Error![]const u8 {
-                return (try media_fetch.fetch(a, i, url, max_bytes, deadline, media, f)).data;
+                var arena: std.heap.ArenaAllocator = .init(@import("prepare_memory.zig").scratch(.media));
+                defer arena.deinit();
+                const body = media_fetch.fetch(arena.allocator(), i, url, max_bytes, deadline, media, f) catch |err| {
+                    f.text = try a.dupe(u8, f.text);
+                    return err;
+                };
+                return a.dupe(u8, body.data);
             }
         }.get };
     }
@@ -223,7 +229,10 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
         }
         const honor_low = if (v.image_limits) |l| l.honor_low_detail else true;
         const cap = if (p.low and honor_low) @min(budget, low_detail_tokens) else budget;
-        prepared[i] = v.prepare(v.ctx, cx.a, bytes, cap) catch |e| return refusal(cx, v, i, e);
+        prepared[i] = (if (v.prepare_scratch) |prepare|
+            prepare(v.ctx, cx.a, @import("prepare_memory.zig").scratch(.media), bytes, cap)
+        else
+            v.prepare(v.ctx, cx.a, bytes, cap)) catch |e| return refusal(cx, v, i, e);
         if (prepared[i].tokens == 0 or prepared[i].tokens > cap) return cx.refuse("the image processor exceeded the per-image visual-token budget");
         tokens_total += prepared[i].tokens;
         if (tokens_total > v.image_tokens) return cx.refuse("the request's images exceed the configured total visual-token budget");

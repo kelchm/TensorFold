@@ -281,7 +281,11 @@ pub const Images = struct {
 
     /// An image's bytes as the tower reads them, at most `max_tokens` tokens (the server's prepare).
     pub fn prepare(v: *const Images, a: std.mem.Allocator, data: []const u8, max_tokens: u32) !image_core.Prepared {
-        return image.plan(v.io, a, data, v.cfg.?, max_tokens);
+        return v.prepareWithScratch(a, std.heap.page_allocator, data, max_tokens);
+    }
+
+    pub fn prepareWithScratch(v: *const Images, a: std.mem.Allocator, scratch: std.mem.Allocator, data: []const u8, max_tokens: u32) !image_core.Prepared {
+        return image.planWithScratch(v.io, a, scratch, data, v.cfg.?, max_tokens);
     }
 };
 

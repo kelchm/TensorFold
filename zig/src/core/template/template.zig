@@ -116,8 +116,12 @@ pub fn renderProvenance(gpa: Allocator, t: *const Compiled, messages: std.json.V
 
 /// Checkpoint-owned globals are template data; request context overrides them and retains its provenance.
 pub fn renderProvenanceGlobals(gpa: Allocator, t: *const Compiled, messages: std.json.Value, tools: std.json.Value, context: std.json.Value, template_globals: std.json.Value, add_generation_prompt: bool, diag: ?*Diag) Error!Str {
-    // not on `gpa`: an arena there, such as a server request's, would keep the freed scratch until it is reset
-    var arena = std.heap.ArenaAllocator.init(t.arena.child_allocator);
+    return renderProvenanceGlobalsWithScratch(gpa, t.arena.child_allocator, t, messages, tools, context, template_globals, add_generation_prompt, diag);
+}
+
+/// Separate scratch ownership permits serving to account for transient allocations without retaining them.
+pub fn renderProvenanceGlobalsWithScratch(gpa: Allocator, scratch: Allocator, t: *const Compiled, messages: std.json.Value, tools: std.json.Value, context: std.json.Value, template_globals: std.json.Value, add_generation_prompt: bool, diag: ?*Diag) Error!Str {
+    var arena = std.heap.ArenaAllocator.init(scratch);
     defer arena.deinit();
     const a = arena.allocator();
     var out: v.Buffer = .{};

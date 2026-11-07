@@ -138,6 +138,7 @@ pub const Tokenizer = struct {
     raw: Trie = .{},
     normalized: Trie = .{},
     specials: std.StringHashMapUnmanaged(void) = .empty,
+    scratch_allocator: ?Allocator = null, // per-call borrowed view; vocabulary and memo ownership are unchanged
     memo: ?*Memo = null, // long segments' ids kept between encodes (null: each encode tokenizes everything)
 
     pub fn deinit(t: *Tokenizer) void {
@@ -165,7 +166,7 @@ pub const Tokenizer = struct {
     /// Token ids for `text`, without post-processor tokens; invalid UTF-8 reads as U+FFFD. Caller frees with `a`.
     pub fn encode(t: *const Tokenizer, a: Allocator, text: []const u8) Error![]u32 {
         var stack: [scratch_stack_bytes]u8 = undefined;
-        var fallback = std.heap.BufferFirstAllocator.init(&stack, t.allocator);
+        var fallback = std.heap.BufferFirstAllocator.init(&stack, t.scratch_allocator orelse t.allocator);
         var arena = std.heap.ArenaAllocator.init(fallback.allocator());
         defer arena.deinit();
         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
@@ -197,7 +198,7 @@ pub const Tokenizer = struct {
             previous = p[1];
         }
         var stack: [scratch_stack_bytes]u8 = undefined;
-        var fallback = std.heap.BufferFirstAllocator.init(&stack, t.allocator);
+        var fallback = std.heap.BufferFirstAllocator.init(&stack, t.scratch_allocator orelse t.allocator);
         var arena = std.heap.ArenaAllocator.init(fallback.allocator());
         defer arena.deinit();
         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
@@ -256,7 +257,7 @@ pub const Tokenizer = struct {
     /// `encode` with no added token matched: text that spells one (a quoted marker) is ordinary text.
     pub fn encodePlain(t: *const Tokenizer, a: Allocator, text: []const u8) Error![]u32 {
         var stack: [scratch_stack_bytes]u8 = undefined;
-        var fallback = std.heap.BufferFirstAllocator.init(&stack, t.allocator);
+        var fallback = std.heap.BufferFirstAllocator.init(&stack, t.scratch_allocator orelse t.allocator);
         var arena = std.heap.ArenaAllocator.init(fallback.allocator());
         defer arena.deinit();
         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
@@ -390,7 +391,7 @@ pub const Tokenizer = struct {
     /// Text for `ids` through the decoder chain; unknown ids are skipped. Caller frees with `a`.
     pub fn decode(t: *const Tokenizer, a: Allocator, ids: []const u32, skip_special_tokens: bool) Error![]u8 {
         var stack: [scratch_stack_bytes]u8 = undefined;
-        var fallback = std.heap.BufferFirstAllocator.init(&stack, t.allocator);
+        var fallback = std.heap.BufferFirstAllocator.init(&stack, t.scratch_allocator orelse t.allocator);
         var arena = std.heap.ArenaAllocator.init(fallback.allocator());
         defer arena.deinit();
         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
@@ -411,7 +412,7 @@ pub const Tokenizer = struct {
         const piece = t.id_to_token.get(id) orelse return try a.dupe(u8, "");
         if (t.specials.contains(piece)) return try a.dupe(u8, piece);
         var stack: [scratch_stack_bytes]u8 = undefined;
-        var fallback = std.heap.BufferFirstAllocator.init(&stack, t.allocator);
+        var fallback = std.heap.BufferFirstAllocator.init(&stack, t.scratch_allocator orelse t.allocator);
         var arena = std.heap.ArenaAllocator.init(fallback.allocator());
         defer arena.deinit();
         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() }, .raw_bytes = true };

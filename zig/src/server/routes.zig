@@ -30,6 +30,55 @@ const Allocator = std.mem.Allocator;
 const fact_path = "/v1/slide/fact/";
 
 pub fn dispatch(srv: *Server, conn: *Conn, a: Allocator) void {
+    const memory_contract = @import("prepare_memory.zig");
+    const uses_body = std.mem.eql(u8, conn.method, "POST") or conn.header("Transfer-Encoding") != null or
+        (if (conn.header("Content-Length")) |len| !std.mem.eql(u8, len, "0") else false);
+    if (!uses_body) return dispatchReady(srv, conn, a);
+    // Count before the drain check, including tokenization, pre-body waiters and malformed/unknown body routes.
+    _ = srv.generating.fetchAdd(1, .seq_cst);
+    defer _ = srv.generating.fetchSub(1, .seq_cst);
+    if (@import("builtin").is_test) if (counted_hook) |h| h();
+    if (srv.draining.load(.seq_cst)) return draining(conn, anthropic.route(conn.path));
+    const policy = srv.config.prepare_policy;
+    const held = srv.prepare_gate.enter(srv.io, policy, &srv.draining, openai.Gone{ .conn = conn }) catch |err| {
+        conn.close = true;
+        return switch (err) {
+            error.Cancelled => {},
+            error.Draining => draining(conn, anthropic.route(conn.path)),
+            else => prepareRefused(conn, err == error.PrepareQueueFull),
+        };
+    };
+    const request = memory_contract.Request.create(srv.gpa, srv.io, &srv.prepare_memory, if (held) &srv.prepare_gate else null, policy.reserve) catch {
+        if (held) srv.prepare_gate.leave(srv.io, policy.reserve);
+        return prepareRefused(conn, false);
+    };
+    defer request.release();
+    const previous = memory_contract.current;
+    memory_contract.current = request;
+    defer memory_contract.current = previous;
+    dispatchReady(srv, conn, request.arena.allocator());
+}
+
+fn prepareRefused(conn: *Conn, full: bool) void {
+    const message = if (full) "frontend preparation queue is full; retry shortly" else "frontend preparation admission timed out or could not allocate; retry shortly";
+    var buf: [384]u8 = undefined;
+    const body = if (anthropic.route(conn.path))
+        std.fmt.bufPrint(&buf, "{{\"type\":\"error\",\"error\":{{\"type\":\"overloaded_error\",\"message\":\"{s}\"}}}}", .{message}) catch unreachable
+    else
+        std.fmt.bufPrint(&buf, "{{\"error\":{{\"type\":\"server_error\",\"code\":\"prepare_unavailable\",\"message\":\"{s}\"}}}}", .{message}) catch unreachable;
+    conn.close = true;
+    conn.startResponse(if (full) 429 else 503, null) catch return;
+    conn.addHeader("Content-Type", "application/json") catch return;
+    conn.addHeader("Retry-After", "1") catch return;
+    var len: [24]u8 = undefined;
+    conn.addHeader("Content-Length", std.fmt.bufPrint(&len, "{d}", .{body.len}) catch unreachable) catch return;
+    conn.addHeader("Connection", "close") catch return;
+    conn.finish(body) catch {};
+}
+
+fn dispatchReady(srv: *Server, conn: *Conn, a: Allocator) void {
+    if (conn.header("Expect")) |expect| if (std.ascii.eqlIgnoreCase(expect, "100-continue") and
+        std.mem.order(u8, conn.version, "HTTP/1.1") != .lt) conn.sendContinue();
     const m = conn.method;
     if (!std.mem.eql(u8, m, "POST") and !consumeBody(conn, a)) return;
     if (std.mem.eql(u8, m, "GET")) return get(srv, conn, a);
@@ -117,16 +166,8 @@ fn post(srv: *Server, conn: *Conn, a: Allocator) void {
         discardBody(conn, a);
         return unknown(conn, a);
     }
-    // counted before the drain flag is read: a stop that sees no request in progress sees every later one refused
-    _ = srv.generating.fetchAdd(1, .seq_cst);
-    defer _ = srv.generating.fetchSub(1, .seq_cst);
     if (srv.idle_manager) |m| m.begin(); // engine work starts: the idle window restarts at this route's end
     defer if (srv.idle_manager) |m| m.end();
-    if (@import("builtin").is_test) if (counted_hook) |h| h();
-    if (srv.draining.load(.seq_cst)) {
-        discardBody(conn, a);
-        return draining(conn, is_anthropic);
-    }
     // --max-inflight and the rest, when set: a reservation for the whole reply, taken before the body is read
     var lease: ?admission.Lease = null;
     if (srv.config.admission.enabled()) switch (srv.admission.acquire(srv.io, srv.config.admission, conn.key_digest)) {

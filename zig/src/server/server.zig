@@ -99,6 +99,7 @@ pub const Config = struct {
     max_connections: u32 = @import("http_admission.zig").default_limit,
     /// --max-inflight, --max-inflight-per-key, --requests-per-second, --request-burst; all zero: no admission.
     admission: @import("request_admission.zig").Limits = .{},
+    prepare_policy: @import("prepare_gate.zig").Policy = .{},
     /// The open /health names these after its other keys; empty fields are left out.
     identity: Identity = .{},
     /// The process environment GET /v1/benchmark/manifest reads (rank count, revision, the hardware probe); null: none.
@@ -150,6 +151,8 @@ pub const Server = struct {
     /// The idle-unload manager (--idle-unload); null when off. Its thread parks the engine; a wake reloads it.
     idle_manager: ?*idle_unload.Manager = null,
     preparing: std.atomic.Value(i64) = .init(0),
+    prepare_gate: @import("prepare_gate.zig").Gate = .{},
+    prepare_memory: @import("prepare_memory.zig").Ledger,
     speech_inflight: std.atomic.Value(u32) = .init(0),
     arena: std.heap.ArenaAllocator,
     /// Structured output's compiler, opened by the first structured request (Python's grammar.compiler).
@@ -169,7 +172,7 @@ pub const Server = struct {
     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
     pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {
         const srv = try gpa.create(Server);
-        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .reasoning = .{ .gpa = gpa }, .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa) };
+        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .reasoning = .{ .gpa = gpa }, .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa), .prepare_memory = .init(gpa) };
         errdefer srv.deinit(); // a later step's failure stops the keepalive before the caller closes the engine
         if (srv.info.embeddings != null and srv.info.text_generation) return error.InvalidEmbeddingCapabilities;
         if (srv.info.vision) |vision| if (@import("vision_markers.zig").firstUnsafe(text, vision)) |id| {
@@ -427,7 +430,6 @@ pub const Server = struct {
             }
             if (!request_guard.allow(&conn, browser, a)) break;
             if (!srv.authenticate(&conn, a)) break;
-            if (conn.header("Expect")) |expect| if (std.ascii.eqlIgnoreCase(expect, "100-continue") and std.mem.order(u8, conn.version, "HTTP/1.1") != .lt) conn.sendContinue();
             srv.dispatch(&conn, a);
             if (conn.close or conn.broken) break;
         }

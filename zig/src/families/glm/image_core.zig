@@ -133,8 +133,12 @@ pub fn For(comptime picture: type) type {
 
         /// Validate in temporary memory, retaining encoded bytes and geometry rather than all float patches.
         pub fn plan(io: std.Io, a: std.mem.Allocator, bytes: []const u8, c: vision.Config, max_tokens: u32) Error!Prepared {
+            return planWithScratch(io, a, std.heap.page_allocator, bytes, c, max_tokens);
+        }
+
+        pub fn planWithScratch(io: std.Io, a: std.mem.Allocator, temporary: std.mem.Allocator, bytes: []const u8, c: vision.Config, max_tokens: u32) Error!Prepared {
             if (bytes.len > 10 << 20) return error.Oversized;
-            var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+            var scratch: std.heap.ArenaAllocator = .init(temporary);
             defer scratch.deinit();
             const img = try picture.decode(io, scratch.allocator(), bytes);
             const g = try geometry(@intCast(img.height), @intCast(img.width), @min(c.min_tokens, max_tokens), max_tokens);

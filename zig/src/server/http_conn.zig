@@ -142,6 +142,7 @@ pub const Conn = struct {
         var fds = [_]posix.pollfd{.{ .fd = c.fd, .events = posix.POLL.IN | posix.POLL.PRI, .revents = 0 }};
         const ready = posix.poll(&fds, 0) catch return true;
         if (ready == 0) return false;
+        if (fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) return true;
         var probe: [1]u8 = undefined;
         const rc = posix.system.recvfrom(c.fd, &probe, 1, posix.MSG.PEEK | posix.MSG.DONTWAIT, null, null);
         return switch (posix.errno(rc)) {
