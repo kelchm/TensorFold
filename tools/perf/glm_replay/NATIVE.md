@@ -31,8 +31,9 @@ tf-cuda-test glm-replay measure FIXTURE.json MODEL DRAFTER OUTPUT.jsonl METADATA
 ```
 
 Validation uses a true one-row teacher-forced reference, commits context before another verify,
-and compares both ranks' logical state, kept logits/taps and live drafter ring. It separately
-rebuilds state with timing disabled/enabled. Compare checks native off/on equality at actual
+and compares both ranks' logical state, kept logits/taps and live drafter ring. It replaces every
+discarded lookahead ID with a different deterministic token and checks whole schedules without
+per-forward synchronization as well as timing disabled/enabled. Compare checks native off/on equality at actual
 owners. The one-block measure command is useful for a pilot; a campaign must preserve genuine
 process starts and repeated blocks, rather than assigning one start ID to unrelated processes.
 The [campaign entry point](../../../docs/recipes/glm-replay-campaign.md) runs an ordered case list
@@ -47,16 +48,20 @@ Metadata schema `glm-replay-native-metadata-v1` requires:
 - `fatbin`, `compiler`, `telemetry`: local `{path,sha256}` artifact references.
 - `correctness`, `timing_neutrality`, `sharding_equality`, `default_server_neutrality`: null for
   validation, or local `{path,sha256}` gate artifacts for measurement.
+- `logical_evidence`: null for validation, or the exact retained logical artifact for measurement.
 
 The complete required metadata object also has `schema`. Source binary hashes are checked
 against the running executable; compiler/fatbin artifacts and tokenizer assets are hashed before
 CUDA opens. Gate runtime bindings are compared with the actual combined rank/transport digest
-after production startup and before replay preparation. Telemetry is read only after completion.
+after production startup and before replay preparation. Frozen external telemetry is authenticated
+before startup and rechecked after completion.
 
 Gate schema `glm-replay-native-gate-v1` requires `schema`, `gate`, `status`, `fixture_sha256`,
-`config_sha256`, `binary_sha256`, `completed_ranks`, `comparisons`, `kv_shard`, `runtime_sha256`.
+`config_sha256`, `binary_sha256`, `completed_ranks`, `comparisons`, `kv_shard`, `runtime_sha256`,
+`evidence_sha256`, `coverage="adversarial-and-whole-block-v1"`.
 Only `status=pass`, both completed ranks and positive comparisons admit measurement. Validation
-produces correctness/timing evidence on actual success; compare produces sharding equality.
+retains logical evidence before emitting gates that hash those exact bytes; compare produces
+sharding equality bound to the corresponding arm's logical artifact. Old unbound gates fail.
 Default-server token/performance neutrality uses the separate server-identity schema and offline
 producer in [SERVER_EVIDENCE.md](SERVER_EVIDENCE.md), rather than the replay gate schema/runtime.
 The host implementation supplies no passing device gates.
@@ -68,6 +73,11 @@ Each round calls production solo `Leader.verify` or multi `Leader.verifyShared`,
 all target keeps and exactly one grouped DFlash2 ingest. Both ranks finish before headline wall
 timing ends. Events are preallocated and resolved afterwards; JSON, rich correctness readbacks
 and telemetry stay outside the block. Phase spans include normal waits and submission gaps.
+Each case runs fresh warmup, a separate observed phase anchor and a fresh observer-off headline.
+Every completed block's kept outputs and final logical state must match the loaded reference.
+`OUTPUT.jsonl.anchor.json` retains both ranks' phase and headline completion records, including
+block counter deltas and layout checks. Its file hash binds the JSONL timing source. Phase
+intervals describe the anchor and cannot be summed into or subtracted from headline wall time.
 
 Off uses `2H` pages; on uses `2H+4`, retaining equal `2H` logical pages and the production part
 floor. Actual owner placement is asserted, prompt twins are returned, and carries/twins must

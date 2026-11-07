@@ -45,6 +45,10 @@ pub fn checkWhole(s: anytype, f: fixture.Fixture, b: ctl.Budget, prep: []exec.Co
     const completed = if (poisoned) try validationBlock(s, compiled) else try exec.block(s, compiled);
     try exec.checkCompletion(completed, f.forwards, sharded, g);
     if (poisoned) try evidence.checkOutputs(compiled, f.forwards, expected) else try checkMeasured(compiled, f.forwards, expected);
+    return checkFinal(s, f, expected);
+}
+
+pub fn checkFinal(s: anytype, f: fixture.Fixture, expected: []const Observed) !u64 {
     const last = f.forwards[f.forwards.len - 1];
     var seen: [4]bool = @splat(false);
     for (last.parts, 0..) |p, i| {

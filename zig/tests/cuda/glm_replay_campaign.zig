@@ -60,6 +60,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, model: []const
         const m = try meta.read(a, io, d.metadata, f, true, sharded);
         try meta.checkTelemetry(a, io, m);
         c.* = .{ .f = f, .budget = cache.items[index].loaded.budget, .m = m, .output = try outputPath(a, io, d.output) };
+        try checkOutput(a, io, c.output);
     }
     const ordered = try check(a, cases);
     return .{ .arena = arena, .fixtures = cache.items, .cases = cases, .ordered_hash = ordered };
@@ -78,6 +79,15 @@ pub fn outputPath(a: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u
     return output;
 }
 
+pub fn checkOutput(a: std.mem.Allocator, io: std.Io, output: []const u8) !void {
+    const canonical_output = try outputPath(a, io, output);
+    defer a.free(canonical_output);
+    const path = try std.fmt.allocPrint(a, "{s}.anchor.json", .{output});
+    defer a.free(path);
+    const canonical = try outputPath(a, io, path);
+    a.free(canonical);
+}
+
 pub fn check(a: std.mem.Allocator, cases: []const Case) ![32]u8 {
     if (cases.len == 0 or cases.len > max_cases) return error.CampaignSchema;
     const first = cases[0];
@@ -93,7 +103,7 @@ pub fn check(a: std.mem.Allocator, cases: []const Case) ![32]u8 {
         }
         if (!std.meta.eql(c.f.config.pool, first.f.config.pool)) return error.CampaignMixedPool;
         for (cases[0..i]) |prior| {
-            if (eq(c.output, prior.output)) return error.CampaignDuplicateOutput;
+            if (eq(c.output, prior.output) or anchorOf(c.output, prior.output) or anchorOf(prior.output, c.output)) return error.CampaignDuplicateOutput;
             if (eq(m.cell_id, prior.m.cell_id)) {
                 if (eq(m.block_id, prior.m.block_id)) return error.CampaignDuplicateBlock;
                 if (!eq(c.f.fixture_sha256, prior.f.fixture_sha256)) return error.CampaignChangedCell;
@@ -113,6 +123,7 @@ pub fn check(a: std.mem.Allocator, cases: []const Case) ![32]u8 {
             .source = m.source,
             .pool = c.f.config.pool,
             .telemetry = m.telemetry.sha256,
+            .logical_evidence = if (m.logical_evidence) |v| v.sha256 else null,
             .correctness = if (m.correctness) |v| v.sha256 else null,
             .sharding_equality = if (m.sharding_equality) |v| v.sha256 else null,
             .timing_neutrality = if (m.timing_neutrality) |v| v.sha256 else null,
@@ -127,4 +138,8 @@ pub fn check(a: std.mem.Allocator, cases: []const Case) ![32]u8 {
 
 fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+fn anchorOf(path: []const u8, output: []const u8) bool {
+    return path.len == output.len + ".anchor.json".len and std.mem.startsWith(u8, path, output) and std.mem.endsWith(u8, path, ".anchor.json");
 }

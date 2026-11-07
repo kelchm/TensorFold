@@ -116,6 +116,8 @@ test "campaign checker rejects mixed starts builds pools and duplicate block cel
     cases = original;
     cases[1].output = "solo-0";
     try std.testing.expectError(error.CampaignDuplicateOutput, campaign.check(a, &cases));
+    cases[1].output = "solo-0.anchor.json";
+    try std.testing.expectError(error.CampaignDuplicateOutput, campaign.check(a, &cases));
     cases = original;
     cases[1].f.fixture_sha256 = "changed-fixture";
     cases[1].m.fixture_sha256 = "changed-fixture";

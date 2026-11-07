@@ -8,7 +8,7 @@ const metadata = @import("glm_replay_metadata.zig");
 const exec = @import("glm_replay_execute.zig");
 const validation = @import("glm_replay_validate.zig");
 const result = @import("glm_replay_result.zig");
-const clock = @import("check.zig").now;
+const binding = @import("glm_replay_binding.zig");
 
 pub fn command(init: std.process.Init, cmd: []const u8, args: []const [:0]const u8) !u8 {
     run(init, cmd, args) catch |err| {
@@ -45,6 +45,9 @@ fn run(init: std.process.Init, cmd: []const u8, args: []const [:0]const u8) !voi
     const f = loaded.fixture;
     const preliminary_hash = try replay.runtime.settingsHash(a, set, &.{});
     const m = try metadata.read(a, init.io, args[5], f, measure, sharded);
+    try metadata.checkTelemetry(a, init.io, m);
+    const reference = if (measure) try binding.load(a, init.io, m, f, sharded) else null;
+    if (measure) try @import("glm_replay_campaign.zig").checkOutput(a, init.io, args[4]);
     try metadata.checkTokenizer(a, init.io, args[2], f);
     const prep = try exec.compile(a, f, f.preparation);
     const compiled = try exec.compile(a, f, f.forwards);
@@ -56,9 +59,9 @@ fn run(init: std.process.Init, cmd: []const u8, args: []const [:0]const u8) !voi
     var ctx = try cuda.Context.init(&driver, 0);
     defer ctx.deinit();
     const capacity = f.config.pool.configured_capacity;
-    const s = try replay.Session.open(init.gpa, init.io, &ctx, args[2], .{ .context = capacity - 16, .kv8 = true, .drafts = true, .drafter = args[3], .drafter_bits = 4 }, .{ .fixture_hash = try hexHash(f.fixture_sha256), .config_hash = agreement(f.config_sha256, &preliminary_hash), .half_pages = loaded.budget.half_pages, .max_forwards = @max(compiled.len, prep.len), .observe = true });
+    const s = try replay.Session.open(init.gpa, init.io, &ctx, args[2], .{ .context = capacity - 16, .kv8 = true, .drafts = true, .drafter = args[3], .drafter_bits = 4 }, .{ .fixture_hash = try hexHash(f.fixture_sha256), .config_hash = try binding.agreement(a, m, &preliminary_hash, sharded), .half_pages = loaded.budget.half_pages, .max_forwards = @max(compiled.len, prep.len), .observe = false });
     defer s.close();
-    drive(init, args, s, place.rank, f, loaded.budget, m, measure, sharded, prep, compiled) catch |err| {
+    drive(init, args, s, place.rank, f, loaded.budget, m, reference, measure, sharded, prep, compiled) catch |err| {
         s.failed = true;
         cuda.tp_watch.fail("replay runner failed");
         failure(init, cmd, args, err);
@@ -67,42 +70,35 @@ fn run(init: std.process.Init, cmd: []const u8, args: []const [:0]const u8) !voi
     };
 }
 
-fn drive(init: std.process.Init, args: []const [:0]const u8, s: *replay.Session, rank: usize, f: fixture.Fixture, budget: @import("glm_replay_control.zig").Budget, m: metadata.Metadata, measure: bool, sharded: bool, prep: []exec.Compiled, compiled: []exec.Compiled) !void {
+fn drive(init: std.process.Init, args: []const [:0]const u8, s: *replay.Session, rank: usize, f: fixture.Fixture, budget: @import("glm_replay_control.zig").Budget, m: metadata.Metadata, reference: ?validation.evidence.Logical, measure: bool, sharded: bool, prep: []exec.Compiled, compiled: []exec.Compiled) !void {
     const a = init.arena.allocator();
     const capacity = f.config.pool.configured_capacity;
     const runtime_hash = std.fmt.bytesToHex(s.runtime_sha256, .lower);
-    if (measure) try metadata.checkRuntime(a, init.io, m, sharded, &runtime_hash);
+    if (measure) {
+        try metadata.checkRuntime(a, init.io, m, sharded, &runtime_hash);
+        try binding.runtime(reference.?, &runtime_hash);
+    }
     if (rank != 0) return s.follow();
     if (s.owned.e.capacity != capacity or s.owned.e.c.vocab < f.provenance.tokenizer.vocab_size) return error.LoadedConfiguration;
     const g = try exec.geometry(s.owned.e);
     if (g.layers != 11 or g.heads != 32 or g.latent != 512) return error.LoadedGeometry;
     if (!measure) {
         const evidence = try validation.run(a, s, f, budget, prep, compiled, sharded);
-        const correct_path = try std.fmt.allocPrint(a, "{s}.correctness.json", .{args[4]});
-        const timing_path = try std.fmt.allocPrint(a, "{s}.timing.json", .{args[4]});
-        try result.gate(a, init.io, correct_path, f, m, "correctness", evidence.comparisons, sharded, &runtime_hash);
-        try result.gate(a, init.io, timing_path, f, m, "timing_neutrality", evidence.comparisons, sharded, &runtime_hash);
-        const logical_path = try std.fmt.allocPrint(a, "{s}.logical.json", .{args[4]});
-        const logical_raw = try std.json.Stringify.valueAlloc(a, .{ .schema = "glm-replay-native-logical-v1", .fixture_sha256 = f.fixture_sha256, .config_sha256 = f.config_sha256, .binary_sha256 = m.source.binary_sha256, .runtime_sha256 = &runtime_hash, .kv_shard = sharded, .forwards = f.forwards, .owners = [4]u8{ f.streams[0].owner, f.streams[1].owner, f.streams[2].owner, f.streams[3].owner }, .observations = evidence.observations }, .{});
-        try result.writeNew(init.io, logical_path, logical_raw);
+        try binding.retain(a, init.io, args[4], f, m, evidence.observations, evidence.comparisons, sharded, &runtime_hash);
         std.debug.print("PASS glm-replay validation: {d} both-rank forward comparisons; default-server neutrality remains external\n", .{evidence.comparisons});
         return;
     }
-    try measureBlock(init, args[4], s, f, budget, m, sharded, prep, compiled, g, &runtime_hash);
+    try measureBlock(init, args[4], s, f, budget, m, sharded, prep, compiled, g, &runtime_hash, reference.?.observations);
 }
 
-pub fn measureBlock(init: std.process.Init, output: []const u8, s: *replay.Session, f: fixture.Fixture, budget: @import("glm_replay_control.zig").Budget, m: metadata.Metadata, sharded: bool, prep: []exec.Compiled, compiled: []exec.Compiled, g: @import("glm_replay_control.zig").Geometry, runtime_hash: []const u8) !void {
+pub fn measureBlock(init: std.process.Init, output: []const u8, s: *replay.Session, f: fixture.Fixture, budget: @import("glm_replay_control.zig").Budget, m: metadata.Metadata, sharded: bool, prep: []exec.Compiled, compiled: []exec.Compiled, g: @import("glm_replay_control.zig").Geometry, runtime_hash: []const u8, reference: []const validation.Observed) !void {
     const a = init.arena.allocator();
-    try s.enableTiming(true);
-    try exec.prepare(s, f, budget, prep);
-    try exec.checkCompletion(try exec.block(s, compiled), f.forwards, sharded, g);
-    const before = clock(init.io);
-    try exec.prepare(s, f, budget, prep);
-    const preparation_ns: u64 = @intCast(clock(init.io) - before);
-    const completed = try exec.block(s, compiled);
-    try exec.checkCompletion(completed, f.forwards, sharded, g);
+    const measured = try @import("glm_replay_measure.zig").run(a, init.io, s, f, budget, prep, compiled, sharded, g, reference);
+    defer measured.deinit(a);
     try metadata.checkTelemetry(a, init.io, m);
-    try result.write(a, init.io, output, f, budget, m, completed, preparation_ns, sharded, s.owned.e, g, runtime_hash);
+    const completed = measured.headline;
+    const anchor_hash = try result.anchor(a, init.io, output, f, m, measured.anchor, completed, sharded, runtime_hash);
+    try result.write(a, init.io, output, f, budget, m, completed, measured.anchor, &anchor_hash, measured.preparation_ns, sharded, s.owned.e, g, runtime_hash);
     const seconds = @as(f64, @floatFromInt(completed.elapsed_ns)) / 1e9;
     const rate = @as(f64, @floatFromInt(completed.ranks[0].rows)) / seconds;
     std.debug.print("PASS glm-replay: both ranks completed {d} forwards; replay throughput {d:.3} forced tokens/s\n", .{ f.forwards.len, rate });
@@ -141,11 +137,4 @@ fn failure(init: std.process.Init, cmd: []const u8, args: []const [:0]const u8, 
     const path = std.fmt.allocPrint(a, "{s}.failed.json", .{args[4]}) catch return;
     const raw = std.json.Stringify.valueAlloc(a, .{ .schema = "glm-replay-native-attempt-v1", .status = "failed", .mode = args[0], .failure = @errorName(err), .measurement_complete = false }, .{}) catch return;
     result.writeNew(init.io, path, raw) catch {};
-}
-
-fn agreement(config_hash: []const u8, settings_hash: []const u8) [32]u8 {
-    var sha = std.crypto.hash.sha2.Sha256.init(.{});
-    sha.update(config_hash);
-    sha.update(settings_hash);
-    return sha.finalResult();
 }

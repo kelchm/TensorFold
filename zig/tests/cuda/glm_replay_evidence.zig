@@ -12,6 +12,7 @@ pub const Observed = struct {
 
 pub const Logical = struct {
     schema: []const u8,
+    coverage: []const u8,
     fixture_sha256: []const u8,
     config_sha256: []const u8,
     binary_sha256: []const u8,
@@ -25,6 +26,7 @@ pub const Logical = struct {
 pub fn load(a: std.mem.Allocator, raw: []const u8, f: fixture.Fixture, binary: []const u8, sharded: bool) !Logical {
     const v = try std.json.parseFromSliceLeaky(Logical, a, raw, .{});
     if (!std.mem.eql(u8, v.schema, "glm-replay-native-logical-v1")) return error.Schema;
+    if (!std.mem.eql(u8, v.coverage, @import("glm_replay_metadata.zig").coverage)) return error.ReferenceCoverage;
     try fixture.hex(v.runtime_sha256, 64);
     if (!std.mem.eql(u8, v.fixture_sha256, f.fixture_sha256) or !std.mem.eql(u8, v.config_sha256, f.config_sha256) or
         !std.mem.eql(u8, v.binary_sha256, binary) or v.kv_shard != sharded) return error.ReferenceIdentity;
@@ -36,6 +38,14 @@ pub fn load(a: std.mem.Allocator, raw: []const u8, f: fixture.Fixture, binary: [
         for (got.parts, want.parts) |gp, wp| if (!std.meta.eql(gp, wp)) return error.ReferenceSchedule;
     }
     try checkObservations(f.forwards, v.observations);
+    for (f.forwards, v.observations) |r, o| for (r.parts, 0..) |p, i| {
+        for (o.outputs[i][0..p.kept]) |id| if (id >= f.provenance.tokenizer.vocab_size) return error.ReferenceVocabulary;
+        for (o.shots[i], 0..) |shot, rank| {
+            const owns = !sharded or v.owners[p.stream_id] == rank;
+            if (shot.has_latent != @intFromBool(owns) or shot.ring_from > shot.position or
+                shot.index_from > shot.position) return error.ReferenceExtent;
+        }
+    };
     return v;
 }
 

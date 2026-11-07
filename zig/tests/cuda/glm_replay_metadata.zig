@@ -31,6 +31,7 @@ pub const Metadata = struct {
     sharding_equality: ?Artifact,
     timing_neutrality: ?Artifact,
     default_server_neutrality: ?Artifact,
+    logical_evidence: ?Artifact = null,
 };
 pub const Gate = struct {
     schema: []const u8,
@@ -43,7 +44,10 @@ pub const Gate = struct {
     comparisons: u64,
     kv_shard: bool,
     runtime_sha256: []const u8,
+    evidence_sha256: ?[]const u8 = null,
+    coverage: ?[]const u8 = null,
 };
+pub const coverage = "adversarial-and-whole-block-v1";
 
 pub fn read(a: std.mem.Allocator, io: std.Io, path: []const u8, f: fixture.Fixture, measure: bool, sharded: bool) !Metadata {
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
@@ -67,6 +71,7 @@ pub fn read(a: std.mem.Allocator, io: std.Io, path: []const u8, f: fixture.Fixtu
     try artifact(a, io, m.compiler);
     if (!eq(m.fatbin.sha256, m.source.fatbin_sha256) or !eq(m.compiler.sha256, m.source.compiler_sha256)) return error.ArtifactIdentity;
     if (measure) {
+        try artifact(a, io, m.logical_evidence orelse return error.LogicalEvidenceUnrun);
         try gate(a, io, m.sharding_equality orelse return error.ShardingEqualityUnrun, m, "sharding_equality", sharded, null);
         try gate(a, io, m.correctness orelse return error.CorrectnessUnrun, m, "correctness", sharded, null);
         try gate(a, io, m.timing_neutrality orelse return error.TimingNeutralityUnrun, m, "timing_neutrality", sharded, null);
@@ -131,6 +136,8 @@ fn gate(a: std.mem.Allocator, io: std.Io, v: Artifact, m: Metadata, name: []cons
 pub fn checkGate(g: Gate, m: Metadata, name: []const u8, sharded: bool, runtime_hash: ?[]const u8) !void {
     if (!eq(g.schema, "glm-replay-native-gate-v1") or !eq(g.gate, name) or !eq(g.status, "pass") or g.comparisons == 0 or g.kv_shard != sharded or (runtime_hash != null and !eq(g.runtime_sha256, runtime_hash.?)) or !std.mem.eql(u8, &g.completed_ranks, &.{ 0, 1 })) return error.GateUnproven;
     if (!eq(g.fixture_sha256, m.fixture_sha256) or !eq(g.config_sha256, m.config_sha256) or !eq(g.binary_sha256, m.source.binary_sha256)) return error.GateIdentity;
+    const proof = m.logical_evidence orelse return error.LogicalEvidenceUnrun;
+    if (!eq(g.coverage orelse "", coverage) or !eq(g.evidence_sha256 orelse "", proof.sha256)) return error.GateEvidence;
 }
 
 test "replay gates reject unrun, wrong arm and changed runtime evidence" {
@@ -138,8 +145,15 @@ test "replay gates reject unrun, wrong arm and changed runtime evidence" {
     m.fixture_sha256 = "fixture";
     m.config_sha256 = "config";
     m.source.binary_sha256 = "binary";
-    var g: Gate = .{ .schema = "glm-replay-native-gate-v1", .gate = "correctness", .status = "pass", .fixture_sha256 = "fixture", .config_sha256 = "config", .binary_sha256 = "binary", .completed_ranks = .{ 0, 1 }, .comparisons = 1, .kv_shard = false, .runtime_sha256 = "runtime" };
+    m.logical_evidence = .{ .path = "logical", .sha256 = "proof" };
+    var g: Gate = .{ .schema = "glm-replay-native-gate-v1", .gate = "correctness", .status = "pass", .fixture_sha256 = "fixture", .config_sha256 = "config", .binary_sha256 = "binary", .completed_ranks = .{ 0, 1 }, .comparisons = 1, .kv_shard = false, .runtime_sha256 = "runtime", .evidence_sha256 = "proof", .coverage = coverage };
     try checkGate(g, m, "correctness", false, "runtime");
+    g.evidence_sha256 = "changed";
+    try std.testing.expectError(error.GateEvidence, checkGate(g, m, "correctness", false, "runtime"));
+    g.evidence_sha256 = "proof";
+    g.coverage = null;
+    try std.testing.expectError(error.GateEvidence, checkGate(g, m, "correctness", false, "runtime"));
+    g.coverage = coverage;
     try std.testing.expectError(error.GateUnproven, checkGate(g, m, "correctness", true, "runtime"));
     try std.testing.expectError(error.GateUnproven, checkGate(g, m, "correctness", false, "changed"));
     g.status = "unrun";

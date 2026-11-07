@@ -31,6 +31,7 @@ fn reference(f: fixture.Fixture) [2]evidence.Observed {
             shot.position = p.position + p.kept;
             shot.device_position = @intCast(shot.position);
             shot.tap_rows = @intCast(p.kept);
+            shot.has_latent = 1;
         }
     };
     return observations;
@@ -128,10 +129,28 @@ test "replay typed logical preload refuses schedule or identity drift before dev
     f.fixture_sha256 = digest;
     f.config_sha256 = digest;
     const want = reference(f);
-    var v: evidence.Logical = .{ .schema = "glm-replay-native-logical-v1", .fixture_sha256 = digest, .config_sha256 = digest, .binary_sha256 = digest, .runtime_sha256 = digest, .kv_shard = false, .forwards = f.forwards, .owners = .{ 0, 0, 1, 1 }, .observations = &want };
+    var v: evidence.Logical = .{ .schema = "glm-replay-native-logical-v1", .coverage = @import("glm_replay_metadata.zig").coverage, .fixture_sha256 = digest, .config_sha256 = digest, .binary_sha256 = digest, .runtime_sha256 = digest, .kv_shard = false, .forwards = f.forwards, .owners = .{ 0, 0, 1, 1 }, .observations = &want };
     var raw = try std.json.Stringify.valueAlloc(a, v, .{});
     _ = try evidence.load(a, raw, f, digest, false);
     try std.testing.expectError(error.ReferenceIdentity, evidence.load(a, raw, f, digest, true));
+    const binding = @import("glm_replay_binding.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "logical.json", .data = raw });
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/logical.json", .{tmp.sub_path});
+    const sha = @import("glm_replay_hash.zig").bytes(raw);
+    var m = std.mem.zeroes(@import("glm_replay_metadata.zig").Metadata);
+    m.source.binary_sha256 = digest;
+    m.logical_evidence = .{ .path = path, .sha256 = &sha };
+    const loaded = try binding.load(a, std.testing.io, m, f, false);
+    try binding.runtime(loaded, digest);
+    try std.testing.expectError(error.ReferenceRuntime, binding.runtime(loaded, "other runtime"));
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "logical.json", .data = try std.fmt.allocPrint(a, "{s}\n", .{raw}) });
+    try std.testing.expectError(error.HashMismatch, binding.load(a, std.testing.io, m, f, false));
+    v.coverage = "old-incomplete-coverage";
+    raw = try std.json.Stringify.valueAlloc(a, v, .{});
+    try std.testing.expectError(error.ReferenceCoverage, evidence.load(a, raw, f, digest, false));
+    v.coverage = @import("glm_replay_metadata.zig").coverage;
     v.forwards = f.forwards[0..1];
     raw = try std.json.Stringify.valueAlloc(a, v, .{});
     try std.testing.expectError(error.ReferenceSchedule, evidence.load(a, raw, f, digest, false));
@@ -151,7 +170,20 @@ const BlockControl = struct {
     rows: u64 = 0,
     kept: u64 = 0,
     records: [4]replay.Forward = undefined,
+    timings: [4]replay.timing.Record = undefined,
     shots: [2]replay.Snapshot,
+    measurement: bool = false,
+    enabled: bool = false,
+    leak_observer: bool = false,
+    modes: [3]bool = undefined,
+    mode_count: usize = 0,
+
+    pub fn enableTiming(s: *BlockControl, enabled: bool) !void {
+        if (s.active or s.mode_count >= s.modes.len) return error.ReplayTimingOrder;
+        s.modes[s.mode_count] = enabled;
+        s.mode_count += 1;
+        s.enabled = enabled;
+    }
 
     pub fn prepare(_: *BlockControl, _: []const replay.Stream) !void {}
     pub fn beginBlock(s: *BlockControl) !void {
@@ -179,21 +211,50 @@ const BlockControl = struct {
     }
     pub fn complete(s: *BlockControl, expected: u64) !replay.Completion {
         if (!s.active or s.forwards != expected) return error.IncompleteReplay;
-        if (s.complete_calls == 1 and expected != 2) return error.PerForwardSyncControl;
+        if (!s.measurement and s.complete_calls == 1 and expected != 2) return error.PerForwardSyncControl;
         s.complete_calls += 1;
         s.active = false;
         @memcpy(s.records[s.forwards..][0..s.forwards], s.records[0..s.forwards]);
-        if (s.corrupt_output and s.complete_calls == 2) s.first.?[0] ^= 1;
+        if (s.corrupt_output and s.complete_calls == (if (s.measurement) @as(usize, 6) else 2)) s.first.?[0] ^= 1;
         const r: replay.Receipt = .{ .forwards = expected, .groups = expected, .rows = s.kept, .calls = 0, .lost = 0, .owner_layers = 0, .owner_rows = 0, .owner_bytes = 0, .carries = 0, .twins = 0 };
-        return .{ .ranks = .{ r, r }, .elapsed_ns = 1, .records = s.records[0 .. 2 * s.forwards], .timings = &.{} };
+        for (s.timings[0 .. 2 * s.forwards], 0..) |*t, i| t.* = .{ .id = i % s.forwards, .ms = @splat(if (s.enabled) @as(f32, 5) else 99) };
+        return .{ .ranks = .{ r, r }, .elapsed_ns = 1, .records = s.records[0 .. 2 * s.forwards], .timings = if (s.enabled or s.leak_observer) s.timings[0 .. 2 * s.forwards] else &.{} };
     }
     pub fn capture(s: *BlockControl, _: u32, _: usize) ![2]replay.Snapshot {
-        if (s.active or s.complete_calls != 2 or s.forwards != 2) return error.PerForwardSyncControl;
+        if (s.active or (!s.measurement and s.complete_calls != 2) or s.forwards != 2) return error.PerForwardSyncControl;
         var shots = s.shots;
         if (s.corrupt_final) shots[1].ring[31] ^= 1;
         return shots;
     }
 };
+
+test "replay measurement uses separate checked observer anchor and observer-off headline in one session" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f = sample();
+    f.preparation = f.forwards[0..1];
+    const compiled = try exec.compile(a, f, f.forwards);
+    const prep = try exec.compile(a, f, f.preparation);
+    const want = reference(f);
+    const budget: @import("glm_replay_control.zig").Budget = .{ .half_pages = 256, .logical_pages = 512, .page_argument = 512, .reservation = .{ 1, 1, 1, 1 }, .owner_pages = .{ 2, 2 }, .twin_headroom = 1 };
+    const g: @import("glm_replay_control.zig").Geometry = .{ .layers = 11, .heads = 32, .latent = 512 };
+    const measure = @import("glm_replay_measure.zig");
+    var control: BlockControl = .{ .measurement = true, .shots = want[1].shots[0] };
+    const measured = try measure.run(a, std.testing.io, &control, f, budget, prep, compiled, false, g, &want);
+    defer measured.deinit(a);
+    try std.testing.expectEqual(@as(usize, 6), control.complete_calls);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false }, &control.modes);
+    try std.testing.expectEqual(@as(usize, 0), measured.headline.timings.len);
+    try std.testing.expectEqual(@as(f32, 5), measured.anchor.timings[0].ms[0]);
+    try std.testing.expectEqual(@as(f32, 99), control.timings[0].ms[0]);
+    control = .{ .measurement = true, .shots = want[1].shots[0], .leak_observer = true };
+    try std.testing.expectError(error.HeadlineObserver, measure.run(a, std.testing.io, &control, f, budget, prep, compiled, false, g, &want));
+    control = .{ .measurement = true, .shots = want[1].shots[0], .corrupt_output = true };
+    try std.testing.expectError(error.MeasurementSelection, measure.run(a, std.testing.io, &control, f, budget, prep, compiled, false, g, &want));
+    control = .{ .measurement = true, .shots = want[1].shots[0], .corrupt_final = true };
+    try std.testing.expectError(error.ReferenceLogicalState, measure.run(a, std.testing.io, &control, f, budget, prep, compiled, false, g, &want));
+}
 
 test "replay whole-schedule gate has one completion and catches block-only outputs and final-state faults" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

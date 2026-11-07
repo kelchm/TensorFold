@@ -87,7 +87,7 @@ Every descriptor requires a complete `glm-replay-native-metadata-v1` file. Its e
 are `schema`, `run_id`, `pair_id`, `start_id`, `start_order` (integer 0 or 1), `block_id`
 (nonempty string), `cell_id`, `fixture_sha256`, `config_sha256`, `source`, `fatbin`,
 `compiler`, `telemetry`, `correctness`, `sharding_equality`, `timing_neutrality` and
-`default_server_neutrality`. IDs are nonempty strings. Fixture/config hashes must match
+`default_server_neutrality` and `logical_evidence`. IDs are nonempty strings. Fixture/config hashes must match
 the fully validated fixture. No fields are inferred from filenames or case indices.
 
 `source` has exactly `engine_commit`, `harness_commit`, `binary_sha256`, `fatbin_sha256`,
@@ -103,17 +103,22 @@ mandatory for `measure-many`; `null` is refused. Telemetry must already be a fro
 artifact and is checked before loading, then checked again after each block.
 This mode cannot emit validation gates or manufacture a passing hardware receipt.
 
-Each gate file has exactly these fields:
+The correctness, timing and sharding gate files have these fields:
 
 ```text
 schema="glm-replay-native-gate-v1", gate, status="pass", fixture_sha256,
 config_sha256, binary_sha256, completed_ranks=[0,1], comparisons>0,
-kv_shard, runtime_sha256
+kv_shard, runtime_sha256, evidence_sha256, coverage="adversarial-and-whole-block-v1"
 ```
 
 `gate` equals the corresponding artifact name. Hashes, arm and actual runtime must match.
-Existing per-fixture validation/compare commands produce their existing gates;
-default-server neutrality remains an external device check. Rebuilds require newly bound
+The evidence digest must match the authenticated logical artifact with the same schedule,
+owners and output extents. Old coverage or unbound gates fail before CUDA opens.
+Per-fixture validation/compare commands produce these gates. Default-server neutrality uses
+the separate server schema and offline producer documented in
+[SERVER_EVIDENCE.md](../../tools/perf/glm_replay/SERVER_EVIDENCE.md).
+It binds the actual original/instrumented server hashes, harness commit and fatbins, with
+retained token and counterbalanced performance evidence. Rebuilds require newly bound
 gates because `binary_sha256` changes.
 
 ## Execution and failures
@@ -127,14 +132,18 @@ Receipt/event capacity is the maximum forward count over every preparation and b
 After load, every gate is matched to the actual combined `Session.runtime_sha256` on each
 rank, followed by a rank agreement barrier before any preparation or inference.
 
-For each case the existing measurement helper runs fresh four-slot prefill plus prescribed
-preparation, a disposable warmup block, then another fresh four-slot prefill and identical
-preparation, then the reported block. Both warmup and reported completion are checked.
-The reported preparation duration excludes warmup. Verification, selection, keep and grouped
+For each case the measurement helper runs three independently prepared four-slot schedules:
+an observer-off warmup, an observer-on phase anchor, and the observer-off reported block.
+Every block's completion, kept outputs and final both-rank logical state are checked against
+the authenticated reference after completion. The reported preparation duration excludes warmup
+and the phase anchor. Verification, selection, keep and grouped
 ingest use existing production paths. No extra allocation, JSON/telemetry IO or diagnostic
 state readback is added inside the timed block. Existing all-rank completion and post-block
 timing readbacks precede the exclusive output write. Each output contains both rank JSONL
-records and uses string block IDs accepted by the common validator.
+records and uses string block IDs accepted by the common validator. The separate
+`OUTPUT.anchor.json` retains the anchor and headline completion records, including actual
+block layout-check deltas. Its file digest appears in both JSONL timing-source objects.
+Phase intervals come from the anchor and must not be summed into headline wall time.
 
 A caught failure attempts an exclusive
 `FAILURE_PREFIX.rank-R.failed.json` with schema

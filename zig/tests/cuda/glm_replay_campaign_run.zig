@@ -7,7 +7,8 @@ const runner = @import("glm_replay.zig");
 const exec = @import("glm_replay_execute.zig");
 const meta = @import("glm_replay_metadata.zig");
 const result = @import("glm_replay_result.zig");
-const Plan = struct { prep: []exec.Compiled, block: []exec.Compiled };
+const binding = @import("glm_replay_binding.zig");
+const Plan = struct { prep: []exec.Compiled, block: []exec.Compiled, reference: ?@import("glm_replay_evidence.zig").Logical = null };
 const Progress = struct {
     rank: ?usize = null,
     completed: usize = 0,
@@ -46,6 +47,7 @@ fn execute(init: std.process.Init, args: []const [:0]const u8, progress: *Progre
         p.* = for (all.cases[0..i], 0..) |prior, j| {
             if (std.mem.eql(u8, c.f.fixture_sha256, prior.f.fixture_sha256)) break plans[j];
         } else .{ .prep = try exec.compile(a, c.f, c.f.preparation), .block = try exec.compile(a, c.f, c.f.forwards) };
+        p.reference = try binding.load(a, init.io, c.m, c.f, sharded);
         max_forwards = @max(max_forwards, @max(p.prep.len, p.block.len));
     }
     const settings_hash = try glm.cuda_replay.runtime.settingsHash(a, set, &.{});
@@ -66,7 +68,7 @@ fn execute(init: std.process.Init, args: []const [:0]const u8, progress: *Progre
         .drafts = true,
         .drafter = args[3],
         .drafter_bits = 4,
-    }, .{ .fixture_hash = all.ordered_hash, .config_hash = config_hash, .half_pages = f.config.pool.h, .max_forwards = max_forwards, .observe = true });
+    }, .{ .fixture_hash = all.ordered_hash, .config_hash = config_hash, .half_pages = f.config.pool.h, .max_forwards = max_forwards, .observe = false });
     defer s.close();
     progress.session_open = true;
     drive(init, s, all.cases, plans, sharded, progress) catch |err| {
@@ -79,10 +81,11 @@ fn execute(init: std.process.Init, args: []const [:0]const u8, progress: *Progre
 
 fn drive(init: std.process.Init, s: *glm.cuda_replay.Session, cases: []const campaign.Case, plans: []const Plan, sharded: bool, progress: *Progress) !void {
     const runtime_hash = std.fmt.bytesToHex(s.runtime_sha256, .lower);
-    for (cases) |c| {
+    for (cases, plans) |c, p| {
         var gate_arena = std.heap.ArenaAllocator.init(init.gpa);
         defer gate_arena.deinit();
         try meta.checkRuntime(gate_arena.allocator(), init.io, c.m, sharded, &runtime_hash);
+        try binding.runtime(p.reference.?, &runtime_hash);
     }
     var accepted: [2][32]u8 = undefined;
     const owned = s.owned;
@@ -99,7 +102,7 @@ fn drive(init: std.process.Init, s: *glm.cuda_replay.Session, cases: []const cam
         defer block_arena.deinit();
         var block_init = init;
         block_init.arena = &block_arena;
-        try runner.measureBlock(block_init, c.output, s, c.f, c.budget, c.m, sharded, p.prep, p.block, g, &runtime_hash);
+        try runner.measureBlock(block_init, c.output, s, c.f, c.budget, c.m, sharded, p.prep, p.block, g, &runtime_hash, p.reference.?.observations);
         progress.completed += 1;
         progress.active = null;
     }
