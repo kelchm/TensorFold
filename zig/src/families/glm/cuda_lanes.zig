@@ -365,8 +365,10 @@ pub const Lanes = struct {
             return;
         };
         const at = l.fill orelse return;
-        try self.x.bind(l.slot);
         if (at <= s.cached or s.reuse.hook == null) return;
+        // A foreign partial must finish with its own marks/logprob owner before this lane announces a whole chunk.
+        try self.drainPartial();
+        try self.x.bind(l.slot);
         _ = self.x.chunk(s.prompt(), at, false, null, .{ .ptr = null, .check = cancelNow }, marksOf(s)) catch |err| {
             if (err == error.Cancelled) return;
             return err;

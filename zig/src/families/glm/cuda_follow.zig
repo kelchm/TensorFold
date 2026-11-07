@@ -289,6 +289,7 @@ pub const Leader = struct {
             try x.flush();
             const split = sparse.splitAt(start, x.e.settings.index_split, x.e.share.world);
             x.e.index_split = split;
+            defer x.e.index_split = false;
             x.e.prepareSlice(part, start, ids.len, from) catch |err| {
                 @import("cuda_slice_undo.zig").admissionError(err);
                 return err;
@@ -513,6 +514,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
         .slice_prepare => {
             const from: ?engine.Resume = if (h.seed != 0) .{ .id = h.seed, .at = h.depth } else null;
             e.index_split = indexSplit(h);
+            defer e.index_split = false;
             var failed: ?anyerror = null;
             e.prepareSlice(ids_in, h.depth, h.top_k, from) catch |err| {
                 failed = err;
