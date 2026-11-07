@@ -3,6 +3,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const audit_mod = @import("cuda_replay_audit.zig");
 const timing = @import("cuda_replay_timing.zig");
+const Counts = @import("cuda_kv_shard.zig").Counts;
 pub const Receipt = extern struct {
     forwards: u64,
     groups: u64,
@@ -12,6 +13,7 @@ pub const Receipt = extern struct {
     owner_layers: u64,
     owner_rows: u64,
     owner_bytes: u64,
+    checks: u64 = 0,
     carries: u64,
     twins: u64,
 };
@@ -29,6 +31,9 @@ pub const Boundary = struct {
     started: i96 = 0,
     elapsed_ns: i96 = 0,
     block: bool = false,
+    before: Counts = .{},
+    prompt_before: Counts = .{},
+    prompt_slot: ?u32 = null,
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, forwards: usize) !Boundary {
         if (forwards == 0) return error.EmptyReplay;
@@ -64,13 +69,22 @@ pub const Boundary = struct {
             b.audit.trace = if (action == 3) b.trace_store orelse return error.ReplayNoTimingStorage else null;
             return;
         }
+        if (action == 7) {
+            if (b.block or b.audit.pending or expected >= 4 or b.prompt_slot != null) return error.ReplayPreparation;
+            b.prompt_before = audit_mod.counts(e);
+            b.prompt_slot = @intCast(expected);
+            return;
+        }
         if (action == 5) {
-            if (b.block or b.audit.pending or expected >= 4) return error.ReplayPreparation;
+            if (b.block or b.audit.pending or expected >= 4 or b.prompt_slot != @as(u32, @intCast(expected)))
+                return error.ReplayPreparation;
+            if (e.settings.kv_shard.on) try audit_mod.checkTwin(b.prompt_before, audit_mod.counts(e));
             try e.giveTwin(@intCast(expected));
+            b.prompt_slot = null;
             return;
         }
         if (action == 1) {
-            if (b.block or b.audit.pending) return error.UnfinishedReplay;
+            if (b.block or b.audit.pending or b.prompt_slot != null) return error.UnfinishedReplay;
             if (b.audit.trace) |t| try t.reset();
             b.audit.used = 0;
             b.audit.forwards = 0;
@@ -82,6 +96,7 @@ pub const Boundary = struct {
             if (e.side) |side| try side.s.synchronize();
             try e.lib.check(e.lib.api.ncclAllGather(b.dev.ptr + e.share.rank, b.dev.ptr, 1, .u8, e.comm, e.stream.handle), "ncclAllGather");
             try e.stream.synchronize();
+            b.before = audit_mod.counts(e);
             b.block = true;
             b.started = std.Io.Clock.awake.now(e.io).toNanoseconds();
             return;
@@ -90,12 +105,12 @@ pub const Boundary = struct {
             b.audit.groups != expected) return error.UnfinishedReplay;
         try e.stream.synchronize();
         if (e.side) |side| try side.s.synchronize();
-        const c = audit_mod.counts(e);
+        const c = try audit_mod.delta(b.before, audit_mod.counts(e));
         var twins: u64 = 0;
         if (e.pages.?.shard) |sh| for (sh.parts.slots) |s| {
             twins += s.twin.items.len;
         };
-        const r: Receipt = .{ .forwards = b.audit.forwards, .groups = b.audit.groups, .rows = b.audit.rows, .calls = e.drafter.?.calls - b.audit.calls, .lost = e.drafter.?.lost - b.audit.lost, .owner_layers = c.owner_layers, .owner_rows = c.owner_rows, .owner_bytes = c.owner_bytes, .carries = c.carries, .twins = twins };
+        const r: Receipt = .{ .forwards = b.audit.forwards, .groups = b.audit.groups, .rows = b.audit.rows, .calls = e.drafter.?.calls - b.audit.calls, .lost = e.drafter.?.lost - b.audit.lost, .owner_layers = c.owner_layers, .owner_rows = c.owner_rows, .owner_bytes = c.owner_bytes, .checks = c.checks, .carries = c.carries, .twins = twins };
         const size = @sizeOf(Receipt);
         try b.dev.uploadAsync(e.share.rank * size, std.mem.asBytes(&r), e.stream.handle);
         try e.lib.check(e.lib.api.ncclAllGather(b.dev.ptr + e.share.rank * size, b.dev.ptr, size, .u8, e.comm, e.stream.handle), "ncclAllGather");
@@ -120,6 +135,15 @@ pub const Boundary = struct {
         }
         b.block = false;
     }
+
+    // Followers map real twin pages rather than allocating them; count that replay event once at begin.
+    pub fn noteMappedTwin(b: *Boundary, e: anytype, slot: u32) !void {
+        if (!e.settings.kv_shard.on) return;
+        if (b.prompt_slot != slot) return error.ReplayPreparation;
+        const sh = e.pages.?.shard orelse return error.ReplayPromptTwin;
+        if (sh.parts.slots[slot].twin.items.len == 0) return error.ReplayPromptTwin;
+        sh.parts.counts.twins_made += 1;
+    }
 };
 
 pub fn validateReceipts(receipts: [2]Receipt, expected: u64, rows: u64) !void {
@@ -136,4 +160,24 @@ test "replay completion rejects unfinished follower ingest and a proposer call o
     receipts[1] = good;
     receipts[0].calls = 1;
     try std.testing.expectError(error.ReplayCompletion, validateReceipts(receipts, 3, 8));
+}
+
+test "replay follower asserts the real mapped twin instead of accepting a host budget" {
+    const kvs = @import("cuda_kv_shard.zig");
+    const Sh = struct { parts: kvs.Parts };
+    const P = struct { shard: ?*Sh };
+    const E = struct { settings: struct { kv_shard: struct { on: bool = true } = .{} } = .{}, pages: ?*P };
+    var sh: Sh = .{ .parts = try kvs.Parts.init(std.testing.allocator, 8, 4096, 4, false) };
+    defer sh.parts.deinit();
+    var p: P = .{ .shard = &sh };
+    const e: E = .{ .pages = &p };
+    var b: Boundary = undefined;
+    b.prompt_slot = 0;
+    try sh.parts.map(0, &.{ 0, 1 }, &.{8});
+    const before = sh.parts.counts;
+    try b.noteMappedTwin(e, 0);
+    try audit_mod.checkTwin(before, sh.parts.counts);
+    sh.parts.slots[0].twin.clearRetainingCapacity();
+    try std.testing.expectError(error.ReplayPromptTwin, b.noteMappedTwin(e, 0));
+    try std.testing.expectError(error.ReplayPreparation, b.noteMappedTwin(e, 1));
 }

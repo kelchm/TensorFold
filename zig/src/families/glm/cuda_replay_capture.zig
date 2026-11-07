@@ -52,6 +52,16 @@ const Reader = struct {
 };
 
 pub fn capture(e: anytype, slot: u32, position: usize) !Snapshot {
+    return captureMode(e, slot, position, false);
+}
+
+pub fn captureRows(e: anytype, slot: u32, position: usize) !Snapshot {
+    return captureMode(e, slot, position, true);
+}
+
+fn captureMode(e: anytype, slot: u32, position: usize, comptime rows_only: bool) !Snapshot {
+    const audit = &(e.replay orelse return error.NotReplaySession).audit;
+    if (e.replay.?.block or audit.pending or audit.groups != audit.forwards) return error.ReplayStaleCapture;
     if (slot >= e.seqs.items.len) return error.ReplaySlot;
     const seq = e.seqs.items[slot] orelse return error.ReplaySlot;
     const st = &seq.st;
@@ -72,6 +82,16 @@ pub fn capture(e: anytype, slot: u32, position: usize) !Snapshot {
     try pos_view.download(0, std.mem.asBytes(&out.device_position));
     if (out.device_position != position) return error.ReplayCapturePosition;
     out.tap_rows = @intCast(n);
+    const logits = if (audit.n == 1) e.bd.logits else e.bs.?.logits;
+    for (0..n) |j| {
+        var h = Sha.init(.{});
+        try r.hash(&h, dr.taps_step + (ds.v_row0 + j) * dflash.TAP_ROW, dflash.TAP_ROW);
+        h.final(&out.taps[j]);
+        h = Sha.init(.{});
+        try r.hash(&h, logits + (ds.v_row0 + j) * e.share.vocab.len() * 2, e.share.vocab.len() * 2);
+        h.final(&out.logits[j]);
+    }
+    if (rows_only) return out;
     const owned = if (st.hold) |hold| hold.owner == e.share.rank else true;
     out.has_latent = @intFromBool(owned);
     var conv = Sha.init(.{});
@@ -115,15 +135,6 @@ pub fn capture(e: anytype, slot: u32, position: usize) !Snapshot {
         try r.hash(&ring, ds.ring.?.ptr + (j * @as(usize, @intCast(dflash.WIN)) + row) * width, width);
     };
     ring.final(&out.ring);
-    const logits = if (e.replay.?.audit.n == 1) e.bd.logits else e.bs.?.logits;
-    for (0..n) |j| {
-        var h = Sha.init(.{});
-        try r.hash(&h, dr.taps_step + (ds.v_row0 + j) * dflash.TAP_ROW, dflash.TAP_ROW);
-        h.final(&out.taps[j]);
-        h = Sha.init(.{});
-        try r.hash(&h, logits + (ds.v_row0 + j) * e.share.vocab.len() * 2, e.share.vocab.len() * 2);
-        h.final(&out.logits[j]);
-    }
     return out;
 }
 
@@ -152,4 +163,82 @@ test "replay logical page digests ignore physical IDs and discard future bytes" 
     try std.testing.expectEqual(a, b);
     h = Sha.init(.{});
     try std.testing.expectError(error.ReplayCapturePages, r.paged(&h, @intFromPtr(&second), 3, 1, &.{0}, 2, 2));
+}
+
+test "replay row capture reads positions taps logits only; full capture reads state and rejects stale ingest" {
+    const F = struct {
+        var bytes: usize = 0;
+        fn get(dst: ?*anyopaque, src: u64, n: usize) callconv(.c) cuda.abi.Result {
+            bytes += n;
+            const out: [*]u8 = @ptrCast(dst.?);
+            const in: [*]const u8 = @ptrFromInt(src);
+            @memcpy(out[0..n], in[0..n]);
+            return 0;
+        }
+        fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            return 0;
+        }
+        const Seq = struct { st: state.State };
+        const Dr = struct { slots: struct { items: []dflash.Slot }, verifies: u64 = 1, taps_step: u64 };
+        const Boundary = struct {
+            block: bool = false,
+            audit: struct { pending: bool = false, groups: u64 = 1, forwards: u64 = 1, n: usize = 1 } = .{},
+        };
+        const E = struct {
+            d: *const cuda.Driver,
+            seqs: struct { items: []?*Seq },
+            drafter: ?*Dr,
+            replay: ?*Boundary,
+            stream: cuda.Stream,
+            side: ?struct { s: cuda.Stream } = null,
+            share: struct { rank: usize = 0, vocab: @import("cuda_shard.zig").Span = .{ .lo = 0, .hi = 2 } } = .{},
+            c: struct { kv_lora: usize = 1, i_dim: usize = 1 } = .{},
+            bd: struct { logits: u64 },
+            bs: ?struct { logits: u64 } = null,
+        };
+    };
+    var d: cuda.Driver = undefined;
+    d.api.cuMemcpyDtoH_v2 = F.get;
+    d.api.cuStreamSynchronize = F.sync;
+    var position: i32 = 1;
+    const taps: [dflash.TAP_ROW]u8 = @splat(7);
+    const logits = [_]u16{ 3, 4 };
+    const conv = [_]u8{ 1, 2, 3, 4, 5, 6 };
+    const rec = [_]u32{ 7, 8 };
+    var banks = [_]u1{0};
+    var seq: F.Seq = .{ .st = undefined };
+    seq.st.pos = 1;
+    seq.st.mtp_len = 0;
+    seq.st.pos_dev = @intFromPtr(&position);
+    seq.st.hold = null;
+    seq.st.kda_layers = 1;
+    seq.st.conv_c = 1;
+    seq.st.conv = @intFromPtr(&conv);
+    seq.st.cur = &banks;
+    seq.st.rec = @intFromPtr(&rec);
+    seq.st.rec_layer = 4;
+    seq.st.base = 0;
+    seq.st.caches = &.{};
+    var seqs = [_]?*F.Seq{&seq};
+    var slots = [_]dflash.Slot{.{ .v_step = 1, .v_rows = 1, .v_pos0 = 0, .from = 1 }};
+    var dr: F.Dr = .{ .slots = .{ .items = &slots }, .taps_step = @intFromPtr(&taps) };
+    var b: F.Boundary = .{};
+    var e: F.E = .{ .d = &d, .seqs = .{ .items = &seqs }, .drafter = &dr, .replay = &b, .stream = .{ .d = &d, .handle = null }, .bd = .{ .logits = @intFromPtr(&logits) } };
+    F.bytes = 0;
+    const light = try captureRows(&e, 0, 1);
+    try std.testing.expectEqual(@as(usize, 4 + dflash.TAP_ROW + 4), F.bytes);
+    F.bytes = 0;
+    const full = try capture(&e, 0, 1);
+    try std.testing.expectEqual(@as(usize, 4 + dflash.TAP_ROW + 4 + conv.len + 4), F.bytes);
+    try std.testing.expectEqual(light.taps, full.taps);
+    try std.testing.expectEqual(light.logits, full.logits);
+    try std.testing.expect(!std.meta.eql(light.conv, full.conv));
+    b.audit.pending = true;
+    try std.testing.expectError(error.ReplayStaleCapture, captureRows(&e, 0, 1));
+    b.audit.pending = false;
+    dr.verifies += 1;
+    try std.testing.expectError(error.ReplayStaleCapture, captureRows(&e, 0, 1));
+    dr.verifies -= 1;
+    position = 0;
+    try std.testing.expectError(error.ReplayCapturePosition, captureRows(&e, 0, 1));
 }

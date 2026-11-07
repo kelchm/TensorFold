@@ -1,39 +1,63 @@
-//! Untimed one-row teacher-forced oracle and timing instrumentation neutrality.
+//! Untimed poisoned-lookahead, one-row oracle and synchronized whole-schedule validation.
 const std = @import("std");
 const replay = @import("glm_cuda").cuda_replay;
 const fixture = @import("glm_replay_fixture.zig");
 const ctl = @import("glm_replay_control.zig");
 const exec = @import("glm_replay_execute.zig");
-
-pub const Observed = struct {
-    shots: [4][2]replay.Snapshot = undefined,
-    outputs: [4][16]u32 = undefined,
-    records: [2]replay.Forward = undefined,
-};
-
+pub const evidence = @import("glm_replay_evidence.zig");
+pub const Observed = evidence.Observed;
+pub const checkMeasured = evidence.checkMeasured;
 pub const Evidence = struct { observations: []const Observed, comparisons: u64 };
 
 pub fn run(a: std.mem.Allocator, s: *replay.Session, f: fixture.Fixture, b: ctl.Budget, prep: []exec.Compiled, compiled: []exec.Compiled, sharded: bool) !Evidence {
     const expected = try a.alloc(Observed, compiled.len);
     const actual = try a.alloc(Observed, compiled.len);
+    const poison_prep = try exec.compileValidation(a, f, f.preparation);
+    const poisoned = try exec.compileValidation(a, f, f.forwards);
     const g = try exec.geometry(s.owned.e);
     try s.enableTiming(false);
     try batch(s, f, b, prep, compiled, expected, sharded, g);
-    try oracle(s, f, b, prep, compiled, expected);
+    var comparisons = try oracle(s, f, b, prep, expected);
+    try batch(s, f, b, poison_prep.rounds, poisoned.rounds, actual, sharded, g);
+    comparisons += try compareBatches(expected, actual, f.forwards);
     try s.enableTiming(true);
-    try batch(s, f, b, prep, compiled, actual, sharded, g);
-    for (expected, actual, f.forwards) |want, got, r| {
-        for (r.parts, 0..) |p, i| {
-            for (0..2) |rank| try compare(want.shots[i][rank], got.shots[i][rank], p.kept);
-            if (!std.mem.eql(u32, want.outputs[i][0..p.kept], got.outputs[i][0..p.kept])) return error.TimingChangedSelection;
-        }
-        for (0..2) |rank| if (!std.meta.eql(want.records[rank], got.records[rank])) return error.TimingChangedDispatch;
+    try batch(s, f, b, poison_prep.rounds, poisoned.rounds, actual, sharded, g);
+    comparisons += try compareBatches(expected, actual, f.forwards);
+    try s.enableTiming(false);
+    comparisons += try checkWhole(s, f, b, prep, compiled, expected, sharded, g, false);
+    comparisons += try checkWhole(s, f, b, poison_prep.rounds, poisoned.rounds, expected, sharded, g, true);
+    return .{ .observations = expected, .comparisons = comparisons };
+}
+
+fn prepare(s: anytype, f: fixture.Fixture, b: ctl.Budget, prep: []exec.Compiled) !void {
+    try exec.prepareStreams(s, f, b);
+    _ = try validationBlock(s, prep);
+}
+
+fn validationBlock(s: anytype, compiled: []exec.Compiled) !replay.Completion {
+    try s.beginBlock();
+    for (compiled, 0..) |*c, i| try s.round(i, c.parts[0..c.n]);
+    return s.complete(compiled.len);
+}
+
+pub fn checkWhole(s: anytype, f: fixture.Fixture, b: ctl.Budget, prep: []exec.Compiled, compiled: []exec.Compiled, expected: []const Observed, sharded: bool, g: ctl.Geometry, poisoned: bool) !u64 {
+    try prepare(s, f, b, prep);
+    const completed = if (poisoned) try validationBlock(s, compiled) else try exec.block(s, compiled);
+    try exec.checkCompletion(completed, f.forwards, sharded, g);
+    if (poisoned) try evidence.checkOutputs(compiled, f.forwards, expected) else try checkMeasured(compiled, f.forwards, expected);
+    const last = f.forwards[f.forwards.len - 1];
+    var seen: [4]bool = @splat(false);
+    for (last.parts, 0..) |p, i| {
+        seen[p.stream_id] = true;
+        const got = try s.capture(p.stream_id, p.position + p.kept);
+        for (0..2) |rank| try evidence.compare(expected[expected.len - 1].shots[i][rank], got[rank], p.kept);
     }
-    return .{ .observations = expected, .comparisons = 2 * compiled.len };
+    for (f.config.active_streams) |slot| if (!seen[slot]) return error.FinalForwardMissingStream;
+    return 2 * last.parts.len;
 }
 
 fn batch(s: *replay.Session, f: fixture.Fixture, b: ctl.Budget, prep: []exec.Compiled, compiled: []exec.Compiled, out: []Observed, sharded: bool, g: ctl.Geometry) !void {
-    try exec.prepare(s, f, b, prep);
+    try prepare(s, f, b, prep);
     for (compiled, f.forwards, out) |*c, r, *o| {
         o.* = std.mem.zeroes(Observed);
         try s.beginBlock();
@@ -51,9 +75,23 @@ fn batch(s: *replay.Session, f: fixture.Fixture, b: ctl.Budget, prep: []exec.Com
     }
 }
 
-fn oracle(s: *replay.Session, f: fixture.Fixture, b: ctl.Budget, prep: []exec.Compiled, compiled: []exec.Compiled, expected: []const Observed) !void {
+fn compareBatches(expected: []const Observed, actual: []const Observed, rounds: []const fixture.Round) !u64 {
+    var comparisons: u64 = 0;
+    for (expected, actual, rounds) |want, got, r| {
+        for (r.parts, 0..) |p, i| {
+            for (0..2) |rank| try evidence.compare(want.shots[i][rank], got.shots[i][rank], p.kept);
+            comparisons += 2;
+            if (!std.mem.eql(u32, want.outputs[i][0..p.kept], got.outputs[i][0..p.kept])) return error.ValidationSelection;
+        }
+        for (0..2) |rank| if (!std.meta.eql(want.records[rank], got.records[rank])) return error.TimingChangedDispatch;
+    }
+    return comparisons;
+}
+
+fn oracle(s: *replay.Session, f: fixture.Fixture, b: ctl.Budget, prep: []exec.Compiled, expected: []const Observed) !u64 {
+    var comparisons: u64 = 0;
     try exec.prepare(s, f, b, prep);
-    for (compiled, f.forwards, expected) |*c, r, want| for (r.parts, 0..) |p, i| {
+    for (f.forwards, expected) |r, want| for (r.parts, 0..) |p, i| {
         var last: [2]replay.Snapshot = undefined;
         for (0..p.kept) |row| {
             var selected: [1]u32 = undefined;
@@ -63,29 +101,14 @@ fn oracle(s: *replay.Session, f: fixture.Fixture, b: ctl.Budget, prep: []exec.Co
             try s.beginBlock();
             try s.round(0, &.{one});
             _ = try s.complete(1);
-            last = try s.capture(p.stream_id, p.position + row + 1);
+            const end = row + 1 == p.kept;
+            last = if (end) try s.capture(p.stream_id, p.position + row + 1) else try s.captureRows(p.stream_id, p.position + row + 1);
             if (selected[0] != want.outputs[i][row]) return error.ReferenceSelection;
-            for (0..2) |rank| {
-                if (!std.mem.eql(u8, &last[rank].taps[0], &want.shots[i][rank].taps[row])) return error.ReferenceTaps;
-                if (!std.mem.eql(u8, &last[rank].logits[0], &want.shots[i][rank].logits[row])) return error.ReferenceLogits;
-            }
+            for (0..2) |rank| try evidence.rows(last[rank], 0, want.shots[i][rank], row);
+            comparisons += 2;
         }
-        for (0..2) |rank| try logical(last[rank], want.shots[i][rank]);
-        _ = c;
+        for (0..2) |rank| try evidence.logical(last[rank], want.shots[i][rank]);
+        comparisons += 2;
     };
-}
-
-fn logical(a: replay.Snapshot, b: replay.Snapshot) !void {
-    inline for (.{ "position", "device_position", "ring_from", "index_from", "has_latent", "conv", "recurrent", "latent_codes", "latent_scales", "index_keys", "index_gates", "pooled_keys", "ring" }) |field| {
-        if (!std.meta.eql(@field(a, field), @field(b, field))) return error.ReferenceLogicalState;
-    }
-}
-
-fn compare(a: replay.Snapshot, b: replay.Snapshot, kept: usize) !void {
-    try logical(a, b);
-    if (a.tap_rows != kept or b.tap_rows != kept) return error.TapExtent;
-    for (0..kept) |i| {
-        if (!std.mem.eql(u8, &a.taps[i], &b.taps[i])) return error.TimingChangedTaps;
-        if (!std.mem.eql(u8, &a.logits[i], &b.logits[i])) return error.TimingChangedLogits;
-    }
+    return comparisons;
 }

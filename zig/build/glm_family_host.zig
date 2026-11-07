@@ -2,6 +2,7 @@
 const std = @import("std");
 
 pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mods: anytype, step: *std.Build.Step) void {
+    @import("glm_replay.zig").correctness(b, cuda, glm, step);
     const host = b.graph.host;
     const startup = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/cuda_start_test.zig"), .target = host, .optimize = .debug });
     const startup_run = b.addRunArtifact(b.addTest(.{ .root_module = startup }));

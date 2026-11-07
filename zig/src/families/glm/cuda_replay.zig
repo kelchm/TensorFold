@@ -25,7 +25,24 @@ pub const Options = struct {
 };
 pub const Stream = struct { slot: u32, prompt: []const u32, continuation: usize, owner: u8 };
 pub const Part = struct { slot: u32, position: usize, ids: []const u32, keep: usize, anchor: u32, out: []u32 };
-pub const Completion = struct { ranks: [2]Receipt, elapsed_ns: i96, records: []const Forward, timings: []const timing.Record };
+pub const Completion = struct {
+    ranks: [2]Receipt,
+    elapsed_ns: i96,
+    records: []const Forward,
+    timings: []const timing.Record,
+
+    // Session completion slices expire at the next complete; copy outside the block before another run.
+    pub fn copy(c: Completion, a: std.mem.Allocator) !Completion {
+        const records = try a.dupe(Forward, c.records);
+        errdefer a.free(records);
+        return .{ .ranks = c.ranks, .elapsed_ns = c.elapsed_ns, .records = records, .timings = try a.dupe(timing.Record, c.timings) };
+    }
+
+    pub fn deinitCopy(c: Completion, a: std.mem.Allocator) void {
+        a.free(c.records);
+        a.free(c.timings);
+    }
+};
 
 const Preflight = struct {
     options: Options,
@@ -169,6 +186,7 @@ pub const Session = struct {
         }
         if (s.prepared) for (streams) |st| try x.release(st.slot);
         for (streams) |st| {
+            try x.developer(7, st.slot);
             try x.bind(st.slot);
             const ids = try e.pages.?.openFor(st.slot, st.prompt.len, st.continuation, st.owner);
             if (e.pages.?.shard) |sh| if (sh.parts.slots[st.slot].part != st.owner) return error.ReplayOwnerFallback;
@@ -233,10 +251,19 @@ pub const Session = struct {
     }
 
     pub fn capture(s: *Session, slot: u32, position: usize) ![2]Snapshot {
+        return s.captureMode(slot, position, false);
+    }
+
+    // Only position, device_position, tap_rows, taps and logits are meaningful in a row capture.
+    pub fn captureRows(s: *Session, slot: u32, position: usize) ![2]Snapshot {
+        return s.captureMode(slot, position, true);
+    }
+
+    fn captureMode(s: *Session, slot: u32, position: usize, rows_only: bool) ![2]Snapshot {
         if (s.state.block) return error.ReplayCaptureWhileTimed;
         const x = try s.leader();
         errdefer s.fail();
-        try x.capture(slot, position);
+        if (rows_only) try x.captureRows(slot, position) else try x.capture(slot, position);
         return s.captures;
     }
 
@@ -245,10 +272,10 @@ pub const Session = struct {
         cuda.tp_watch.fail("GLM replay session failed");
     }
 
-    fn captureRank(ptr: *anyopaque, slot: u32, position: usize) !void {
+    fn captureRank(ptr: *anyopaque, slot: u32, position: usize, rows_only: bool) !void {
         const s: *Session = @ptrCast(@alignCast(ptr));
         const e = s.owned.e;
-        const shot = try capture_mod.capture(e, slot, position);
+        const shot = if (rows_only) try capture_mod.captureRows(e, slot, position) else try capture_mod.capture(e, slot, position);
         const size = @sizeOf(Snapshot);
         try s.capture_dev.uploadAsync(e.share.rank * size, std.mem.asBytes(&shot), e.stream.handle);
         try e.lib.check(e.lib.api.ncclAllGather(s.capture_dev.ptr + e.share.rank * size, s.capture_dev.ptr, size, .u8, e.comm, e.stream.handle), "ncclAllGather");
@@ -273,4 +300,18 @@ test {
     _ = capture_mod;
     _ = timing;
     _ = runtime;
+}
+
+test "replay completion copy survives the next block overwriting borrowed records and timings" {
+    var records = [_]Forward{.{ .id = 0, .rows = 4, .kept = 2, .counts = .{} }};
+    var timings = [_]timing.Record{.{ .id = 0, .ms = @splat(1) }};
+    const receipt: Receipt = .{ .forwards = 1, .groups = 1, .rows = 2, .calls = 0, .lost = 0, .owner_layers = 0, .owner_rows = 0, .owner_bytes = 0, .carries = 0, .twins = 0 };
+    const borrowed: Completion = .{ .ranks = .{ receipt, receipt }, .elapsed_ns = 10, .records = &records, .timings = &timings };
+    const saved = try borrowed.copy(std.testing.allocator);
+    defer saved.deinitCopy(std.testing.allocator);
+    records[0].rows = 32;
+    timings[0].ms[0] = 99;
+    try std.testing.expectEqual(@as(u64, 4), saved.records[0].rows);
+    try std.testing.expectEqual(@as(f32, 1), saved.timings[0].ms[0]);
+    try std.testing.expectEqual(@as(u64, 32), borrowed.records[0].rows);
 }

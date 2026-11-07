@@ -378,9 +378,17 @@ pub const Leader = struct {
 
     /// Untimed developer logical capture, on both ranks before another forward overwrites the taps.
     pub fn capture(x: Leader, slot: u32, position: usize) !void {
+        return x.captureMode(slot, position, false);
+    }
+
+    pub fn captureRows(x: Leader, slot: u32, position: usize) !void {
+        return x.captureMode(slot, position, true);
+    }
+
+    fn captureMode(x: Leader, slot: u32, position: usize, rows_only: bool) !void {
         const c = x.e.replay_capture orelse return error.NotReplaySession;
-        try x.send(.{ .kind = @backingInt(Kind.developer), .flags = 2, .depth = slot, .a = position }, &.{});
-        try c.run(c.ptr, slot, position);
+        try x.send(.{ .kind = @backingInt(Kind.developer), .flags = if (rows_only) 6 else 2, .depth = slot, .a = position }, &.{});
+        try c.run(c.ptr, slot, position, rows_only);
     }
 
     /// The other ranks leave their loops.
@@ -439,6 +447,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
     switch (kind) {
         .begin => {
             if (ids_in.len > 0) try (e.pages orelse return error.BadStep).mapWith(h.slot, ids_in, h.depth);
+            if (e.replay) |r| try r.noteMappedTwin(e, h.slot);
             try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null);
         },
         .pool => {
@@ -518,9 +527,9 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
         .snapshots => _ = try @import("cuda_snapshots.zig").agreeTiers(e, h.a, h.seed),
         .disk => try @import("cuda_disk_ranks.zig").step(e, link, h, ids_in),
         .layout => try checkLayout(e, h.a),
-        .developer => if (h.flags == 2) {
+        .developer => if (h.flags == 2 or h.flags == 6) {
             const c = e.replay_capture orelse return error.NotReplaySession;
-            try c.run(c.ptr, h.depth, @intCast(h.a));
+            try c.run(c.ptr, h.depth, @intCast(h.a), h.flags == 6);
         } else try (e.replay orelse return error.NotReplaySession).apply(e, h.flags, h.a),
         .drop => for (ids_in) |id| e.dropState(id),
         .release => e.release(h.slot),

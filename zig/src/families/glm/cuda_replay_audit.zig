@@ -72,8 +72,7 @@ pub const Audit = struct {
             kept += p.kept;
         }
         const after = counts(e);
-        var delta: kvs.Counts = .{};
-        inline for (@typeInfo(kvs.Counts).@"struct".field_names) |f| @field(delta, f) = @field(after, f) - @field(a.before, f);
+        const change = try delta(a.before, after);
         var layers: u64 = 0;
         var bytes: u64 = 0;
         for (e.w.layers) |layer| if (layer.mixer == .mla) {
@@ -81,11 +80,11 @@ pub const Audit = struct {
             bytes += offered * @import("cuda_kv_shard_attn.zig").rowBytes(layer.mixer.mla);
         };
         if (e.settings.kv_shard.on) {
-            if (delta.owner_layers != layers or delta.owner_rows != layers * offered or delta.owner_bytes != bytes)
+            if (change.owner_layers != layers or change.owner_rows != layers * offered or change.owner_bytes != bytes)
                 return error.ReplayOwnerCounters;
-        } else if (delta.owner_layers != 0 or delta.owner_rows != 0 or delta.owner_bytes != 0)
+        } else if (change.owner_layers != 0 or change.owner_rows != 0 or change.owner_bytes != 0)
             return error.ReplayOwnerCounters;
-        a.records[a.used] = .{ .id = a.forwards - 1, .rows = offered, .kept = kept, .counts = delta };
+        a.records[a.used] = .{ .id = a.forwards - 1, .rows = offered, .kept = kept, .counts = change };
         a.used += 1;
         a.groups += 1;
         a.rows += kept;
@@ -96,6 +95,20 @@ pub const Audit = struct {
 
 pub fn counts(e: anytype) kvs.Counts {
     return if (e.pages) |p| (if (p.shard) |sh| sh.parts.counts else .{}) else .{};
+}
+
+pub fn delta(before: kvs.Counts, after: kvs.Counts) !kvs.Counts {
+    var out: kvs.Counts = .{};
+    inline for (@typeInfo(kvs.Counts).@"struct".field_names) |f| {
+        if (@field(after, f) < @field(before, f)) return error.ReplayCounterRegressed;
+        @field(out, f) = @field(after, f) - @field(before, f);
+    }
+    return out;
+}
+
+pub fn checkTwin(before: kvs.Counts, after: kvs.Counts) !void {
+    const d = try delta(before, after);
+    if (d.twins_made != 1 or d.twins_refused != 0 or d.owner_prompts != 0) return error.ReplayPromptTwin;
 }
 
 test "replay ingest rejects duplicates and stale generation before dispatch" {
@@ -120,4 +133,36 @@ test "replay ingest rejects duplicates and stale generation before dispatch" {
     reqs[1].pos = 10;
     dr.verifies = 2;
     try std.testing.expectError(error.ReplayStaleIngest, audit.validate(e, &reqs));
+}
+
+test "replay prompt twins reject allocator refusal and owner prompt fallback on either rank" {
+    const before: kvs.Counts = .{ .twins_made = 10, .twins_refused = 3, .owner_prompts = 7 };
+    var after = before;
+    after.twins_made += 1;
+    try checkTwin(before, after);
+    after.twins_refused += 1;
+    try std.testing.expectError(error.ReplayPromptTwin, checkTwin(before, after));
+    after.twins_refused -= 1;
+    after.owner_prompts += 1;
+    try std.testing.expectError(error.ReplayPromptTwin, checkTwin(before, after));
+    try std.testing.expectError(error.ReplayPromptTwin, checkTwin(before, before));
+    try std.testing.expectError(error.ReplayCounterRegressed, delta(after, before));
+}
+
+test "replay block delta includes layout checks before the perforward audit and excludes earlier blocks" {
+    const start: kvs.Counts = .{ .owner_layers = 99, .owner_rows = 100, .owner_bytes = 5000, .checks = 7 };
+    var layout = start;
+    layout.checks += 1;
+    var end = layout;
+    end.owner_layers += 11;
+    end.owner_rows += 44;
+    end.owner_bytes += 1441792;
+    const block = try delta(start, end);
+    const forward = try delta(layout, end);
+    try std.testing.expectEqual(@as(u64, 11), block.owner_layers);
+    try std.testing.expectEqual(@as(u64, 44), block.owner_rows);
+    try std.testing.expectEqual(@as(u64, 1441792), block.owner_bytes);
+    try std.testing.expectEqual(@as(u64, 1), block.checks);
+    try std.testing.expectEqual(@as(u64, 0), forward.checks);
+    try std.testing.expectEqual(@as(u64, 0), (try delta(end, end)).owner_rows);
 }

@@ -78,7 +78,7 @@ test "GLM heads: no MTP layer and no drafter loads no head and decodes plain; DF
 }
 
 pub const Engine = struct {
-    replay_capture: ?struct { ptr: *anyopaque, run: *const fn (*anyopaque, u32, usize) anyerror!void } = null,
+    replay_capture: ?struct { ptr: *anyopaque, run: *const fn (*anyopaque, u32, usize, bool) anyerror!void } = null,
     replay: ?*@import("cuda_replay_boundary.zig").Boundary = null,
     gpa: std.mem.Allocator,
     io: std.Io,
