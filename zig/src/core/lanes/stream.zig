@@ -112,6 +112,7 @@ pub const Image = struct {
     pixels: []const f32,
     deferred: ?Deferred = null,
     deadline: ?struct { io: std.Io, at: std.Io.Timestamp } = null,
+    preparation_budget: ?*PreparationBudget = null,
 
     gh: u32,
     gw: u32,
@@ -126,21 +127,51 @@ pub const Image = struct {
 
     pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) bool };
 
+    /// Request-owned, owner-thread accounting for active preparation time only.
+    /// Queue waits, text prefill, and GPU tower execution do not consume this CPU/fetch budget.
+    pub const PreparationBudget = struct {
+        io: std.Io,
+        remaining_ns: i96,
+        clock: ?struct { ctx: *anyopaque, read: *const fn (*anyopaque) i96 } = null,
+
+        pub fn now(b: *const PreparationBudget) i96 {
+            return if (b.clock) |c| c.read(c.ctx) else std.Io.Clock.awake.now(b.io).nanoseconds;
+        }
+        pub fn begin(b: *const PreparationBudget) error{MediaDeadline}!i96 {
+            if (b.remaining_ns <= 0) return error.MediaDeadline;
+            return b.now();
+        }
+        pub fn check(b: *const PreparationBudget, start: i96) error{MediaDeadline}!void {
+            if (@max(0, b.now() - start) >= b.remaining_ns) return error.MediaDeadline;
+        }
+        pub fn finish(b: *PreparationBudget, start: i96) void {
+            b.remaining_ns = @max(0, b.remaining_ns - @max(0, b.now() - start));
+        }
+        pub fn deadline(b: *const PreparationBudget) std.Io.Timestamp {
+            return .{ .nanoseconds = b.now() + @max(0, b.remaining_ns) };
+        }
+    };
+
     pub fn checkWork(img: Image, cancel: ?Cancel) !void {
         if (cancel) |c| if (c.check(c.ptr)) return error.Cancelled;
         if (img.deadline) |d| if (std.Io.Clock.awake.now(d.io).nanoseconds >= d.at.nanoseconds) return error.MediaDeadline;
+        if (img.preparation_budget) |b| if (b.remaining_ns <= 0) return error.MediaDeadline;
     }
 
     pub fn materializeChecked(img: Image, a: Allocator, cancel: ?Cancel) ![]const f32 {
         const Check = struct {
             image: Image,
             cancel: ?Cancel,
+            started: ?i96,
             fn run(ptr: ?*anyopaque) anyerror!void {
                 const c: *@This() = @ptrCast(@alignCast(ptr.?));
                 try c.image.checkWork(c.cancel);
+                if (c.image.preparation_budget) |b| try b.check(c.started.?);
             }
         };
-        var c: Check = .{ .image = img, .cancel = cancel };
+        const start = if (img.preparation_budget) |b| try b.begin() else null;
+        defer if (img.preparation_budget) |b| b.finish(start.?);
+        var c: Check = .{ .image = img, .cancel = cancel, .started = start };
         try Check.run(&c);
         const pixels = if (img.deferred) |d|
             if (d.checked) |f| try f(d.ctx, a, &c, Check.run) else try d.prepare(d.ctx, a)
@@ -150,6 +181,52 @@ pub const Image = struct {
         return pixels;
     }
 };
+
+test "media compatibility: lazy preparation charges active work across images without queue or prefill time" {
+    const t = std.testing;
+    const Clock = struct {
+        ns: i96 = 0,
+        calls: usize = 0,
+        cost: i96 = 3,
+        fail: bool = false,
+        fn now(ptr: *anyopaque) i96 {
+            return @as(*@This(), @ptrCast(@alignCast(ptr))).ns;
+        }
+        fn prepare(_: *const anyopaque, _: Allocator) anyerror![]const f32 {
+            return error.ExpectedCheckedPath;
+        }
+        fn checked(ptr: *const anyopaque, _: Allocator, ctx: ?*anyopaque, check: *const fn (?*anyopaque) anyerror!void) anyerror![]const f32 {
+            const c: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            c.calls += 1;
+            try check(ctx);
+            c.ns += c.cost;
+            try check(ctx);
+            if (c.fail) return error.RecordedDecodeFailure;
+            return &.{};
+        }
+    };
+    var clock: Clock = .{};
+    var budget: Image.PreparationBudget = .{ .io = t.io, .remaining_ns = 10, .clock = .{ .ctx = &clock, .read = Clock.now } };
+    var img: Image = .{ .pixels = &.{}, .gh = 2, .gw = 2, .at = 0, .tokens = 1, .preparation_budget = &budget, .deferred = .{ .ctx = &clock, .prepare = Clock.prepare, .checked = Clock.checked } };
+    clock.ns += 1000 * std.time.ns_per_s; // a long admission wait before any lazy decode
+    _ = try img.materializeChecked(t.allocator, null);
+    try t.expectEqual(@as(i96, 7), budget.remaining_ns);
+    clock.ns += 1000 * std.time.ns_per_s; // text prefill or another stream between two images
+    try img.checkWork(null);
+    img.hash = 2;
+    _ = try img.materializeChecked(t.allocator, null);
+    try t.expectEqual(@as(i96, 4), budget.remaining_ns);
+    clock.cost = 2;
+    clock.fail = true;
+    try t.expectError(error.RecordedDecodeFailure, img.materializeChecked(t.allocator, null));
+    try t.expectEqual(@as(i96, 2), budget.remaining_ns);
+    clock.cost = 3;
+    clock.fail = false;
+    try t.expectError(error.MediaDeadline, img.materializeChecked(t.allocator, null));
+    try t.expectEqual(@as(i96, 0), budget.remaining_ns);
+    try t.expectError(error.MediaDeadline, img.materializeChecked(t.allocator, null));
+    try t.expectEqual(@as(usize, 4), clock.calls);
+}
 
 pub const Spec = struct {
     id: []const u8,

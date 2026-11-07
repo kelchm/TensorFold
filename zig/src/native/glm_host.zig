@@ -118,7 +118,7 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, window: u32, speed_up: 
         h.markers = .{ v.c.image_start, v.c.image_token, v.c.image_end };
         h.video_open = o;
         offer = .{ .ctx = h, .prepare = prepareImage, .image_token = v.c.image_token, .markers = &h.markers, .image_tokens = o.image_tokens, .max_images = o.max_images, .explain = glm.image.decoderProblem };
-        offer.?.image_limits = .{ .io = io, .per_image_tokens = 2048, .max_request_bytes = 64 << 20, .max_request_pixels = 400 << 20, .prepare_seconds = 100, .render_order = true };
+        offer.?.image_limits = .{ .io = io, .per_image_tokens = 2048, .max_request_bytes = 64 << 20, .max_request_pixels = 400 << 20, .prepare_seconds = 100, .render_order = true, .honor_low_detail = false };
         if (v.c.video) |vm| {
             h.video_markers = vm;
             offer.?.video = .{ .per_video_tokens = 16384, .prepare = prepareVideo, .video_token = vm[1], .group_open = v.c.image_start, .group_close = v.c.image_end, .markers = &h.video_markers, .video_tokens = o.video_tokens, .max_videos = o.max_videos, .max_frames = @min(o.max_frames, 128) };

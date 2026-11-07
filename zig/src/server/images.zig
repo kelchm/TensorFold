@@ -176,6 +176,16 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
     if (n_images > 0 and budget < 1) return cx.refuse("the image count exceeds the visual-token budget");
     const prepared = try cx.a.alloc(api.PreparedImage, n_images);
     const clips = try cx.a.alloc(api.PreparedVideo, n_videos);
+    const image_work: ?*api.Image.PreparationBudget = if (v.image_limits) |l| if (n_images > 0) blk: {
+        const b = try cx.a.create(api.Image.PreparationBudget);
+        b.* = .{ .io = l.io, .remaining_ns = @as(i96, l.prepare_seconds) * std.time.ns_per_s };
+        break :blk b;
+    } else null else null;
+    const video_work: ?*api.Image.PreparationBudget = if (n_videos > 0 and v.video.?.lazy and io != null) blk: {
+        const b = try cx.a.create(api.Image.PreparationBudget);
+        b.* = .{ .io = io.?, .remaining_ns = @as(i96, videos.total_s) * std.time.ns_per_s };
+        break :blk b;
+    } else null;
     var bytes_total: usize = 0;
     // every URL's download inside one request's seconds (images.py total_timeout_seconds, videos.py's)
     const deadline: std.Io.Timestamp = if (io) |i| std.Io.Clock.awake.now(i).addDuration(.fromSeconds(if (v.image_limits) |l| l.prepare_seconds else media_fetch.total_s)) else .{ .nanoseconds = 0 };
@@ -186,34 +196,40 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
     for (ps) |p| {
         if (p.video) {
             const o = v.video.?;
+            const phase = if (video_work) |b| b.begin() catch return cx.refuse("video preparation exceeded the configured time limit") else null;
+            defer if (video_work) |b| b.finish(phase.?);
+            if (video_work) |b| video_budget.deadline = b.deadline();
             const cap = videoTokenBudget(o, n_videos);
             clips[vi] = try videos.prepare(cx, o, v.ctx, fetch, p.url, vi, cap, &video_budget);
             try accountVideo(cx, o, clips[vi], cap, &video_tokens_total);
-            if (o.lazy) if (io) |video_io| for (clips[vi].groups) |*g| {
-                g.deadline = .{ .io = video_io, .at = video_budget.deadline };
-            };
+            if (video_work) |b| {
+                b.check(phase.?) catch return cx.refuse("video preparation exceeded the configured time limit");
+                for (clips[vi].groups) |*g| g.preparation_budget = b;
+            }
             vi += 1;
             continue;
         }
-        if (v.image_limits) |l| if (started.durationTo(std.Io.Clock.awake.now(l.io)).nanoseconds > @as(i96, l.prepare_seconds) * std.time.ns_per_s) return cx.refuse("image preparation exceeded the configured time limit");
+        const phase = if (image_work) |b| b.begin() catch return cx.refuse("image preparation exceeded the configured time limit") else null;
+        defer if (image_work) |b| b.finish(phase.?);
         const i = ii;
         ii += 1;
-        const bytes = try sourceBytes(cx, fetch, p.url, @min(max_image_bytes, request_bytes - bytes_total), deadline);
+        const bytes = try sourceBytes(cx, fetch, p.url, @min(max_image_bytes, request_bytes - bytes_total), if (image_work) |b| b.deadline() else deadline);
         bytes_total += bytes.len;
         switch (sniff(bytes)) { // the Python frontend's formats (images.py: JPEG, PNG, WebP)
             .png, .jpeg, .webp => {},
             .gif, .other => return cx.refuse(try std.fmt.allocPrint(cx.a, "image {d} is not PNG, JPEG or WebP; send one of those", .{i + 1})),
         }
-        const cap = if (p.low) @min(budget, low_detail_tokens) else budget;
+        const honor_low = if (v.image_limits) |l| l.honor_low_detail else true;
+        const cap = if (p.low and honor_low) @min(budget, low_detail_tokens) else budget;
         prepared[i] = v.prepare(v.ctx, cx.a, bytes, cap) catch |e| return refusal(cx, v, i, e);
         if (prepared[i].tokens == 0 or prepared[i].tokens > cap) return cx.refuse("the image processor exceeded the per-image visual-token budget");
         tokens_total += prepared[i].tokens;
         if (tokens_total > v.image_tokens) return cx.refuse("the request's images exceed the configured total visual-token budget");
         if (v.image_limits) |l| {
-            prepared[i].deadline = .{ .io = l.io, .at = deadline };
+            prepared[i].preparation_budget = image_work;
             pixels_total += prepared[i].source_pixels;
             if (pixels_total > l.max_request_pixels) return cx.refuse("the request's images exceed the configured decoded pixel limit");
-            if (started.durationTo(std.Io.Clock.awake.now(l.io)).nanoseconds > @as(i96, l.prepare_seconds) * std.time.ns_per_s) return cx.refuse("image preparation exceeded the configured time limit");
+            if (image_work) |b| b.check(phase.?) catch return cx.refuse("image preparation exceeded the configured time limit");
         }
     }
     var out_ids: std.ArrayList(u32) = .empty;
@@ -267,9 +283,38 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
     return .{ .ids = out_ids.items, .history_len = hist, .images = imgs.items, .cache_key = key.items };
 }
 
-/// GLM fixes each clip's ceiling; families without that policy keep their existing shared-budget behavior.
+/// Preserve GLM's Python policy: each clip has a ceiling and shares the request total.
 pub fn videoTokenBudget(o: api.VideoOffer, count: usize) u32 {
-    return o.per_video_tokens orelse (o.video_tokens / @as(u32, @intCast(count)));
+    const share = o.video_tokens / @as(u32, @intCast(@max(1, count)));
+    return if (o.per_video_tokens) |cap| @min(cap, share) else share;
+}
+
+test "media compatibility: GLM preserves its fixed detail while other image offers retain low detail" {
+    const t = std.testing;
+    const Fake = struct {
+        cap: u32 = 0,
+        fn prepare(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, cap: u32) anyerror!api.PreparedImage {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.cap = cap;
+            return .{ .pixels = &.{}, .gh = 2, .gw = 2 * cap, .tokens = cap, .hash = 1, .source_pixels = 1 };
+        }
+    };
+    for ([_]bool{ false, true }) |honor_low| {
+        var arena: std.heap.ArenaAllocator = .init(t.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var cx: Cx = .{ .a = a };
+        var fake: Fake = .{};
+        var v: api.Vision = .{ .ctx = &fake, .prepare = Fake.prepare, .image_token = 9, .image_tokens = 102400, .max_images = 50 };
+        v.image_limits = .{ .io = t.io, .per_image_tokens = 2048, .max_request_bytes = 64 << 20, .max_request_pixels = 400 << 20, .prepare_seconds = 100, .honor_low_detail = honor_low };
+        const messages = (try json.parse(a,
+            \\[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:,%FF%D8%FFab","detail":"low"}}]}]
+        )).ok;
+        const out = (try expand(v, null, MarkText.text(), &cx, messages, &.{9}, 0)).?;
+        const expected: u32 = if (honor_low) 256 else 2048;
+        try t.expectEqual(expected, fake.cap);
+        try t.expectEqual(expected, out.images[0].tokens);
+    }
 }
 
 /// Count actual prepared rows, rejecting any per-clip or request excess rather than reducing earlier media.
@@ -301,7 +346,7 @@ pub fn both(a: std.mem.Allocator, ids: *std.ArrayList(u32), key: *std.ArrayList(
 /// Appends one image's rows, its engine entry and its cache words; `named`: the word before them is its marker's.
 fn placeImage(a: std.mem.Allocator, ids: *std.ArrayList(u32), key: *std.ArrayList(u32), imgs: *std.ArrayList(api.Image), token: u32, img: api.PreparedImage, named: bool) !void {
     if (named) key.items[key.items.len - 1] = image_key.open(img.hash);
-    try imgs.append(a, .{ .pixels = img.pixels, .deferred = img.deferred, .deadline = img.deadline, .gh = img.gh, .gw = img.gw, .at = @intCast(ids.items.len), .tokens = img.tokens, .hash = img.hash });
+    try imgs.append(a, .{ .pixels = img.pixels, .deferred = img.deferred, .deadline = img.deadline, .preparation_budget = img.preparation_budget, .gh = img.gh, .gw = img.gw, .at = @intCast(ids.items.len), .tokens = img.tokens, .hash = img.hash });
     for (0..img.tokens) |j| {
         try ids.append(a, token);
         try key.append(a, image_key.row(img.hash, j));

@@ -12,6 +12,7 @@ pub const PreparedImage = struct {
     source_pixels: u64 = 0,
     deferred: ?@import("lanes").stream.Image.Deferred = null,
     deadline: @FieldType(@import("lanes").stream.Image, "deadline") = null,
+    preparation_budget: @FieldType(@import("lanes").stream.Image, "preparation_budget") = null,
     /// The image as tower inputs in order, each image tokens between `before` and `after`; empty: `pixels` alone.
     pieces: []const Piece = &.{},
 };
@@ -42,6 +43,7 @@ pub const Vision = struct {
         max_request_pixels: u64,
         prepare_seconds: u32,
         render_order: bool = false,
+        honor_low_detail: bool = true,
     } = null,
     /// Video input, when the engine's family reads it.
     video: ?VideoOffer = null,
