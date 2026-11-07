@@ -113,6 +113,8 @@ pub const Experts = struct {
     grouped: [3]Function, // one per codebook
     grouped_nt4: Function, // mcg at 4 tiles a block (the same bits as grouped[1])
     grouped_r8: [2]Function, // mcg at one width (3-bit, 4-bit), 4 tiles, 8 reduction rows: windows of up to 8 rows
+    grouped_s: [2]Function = undefined, // 4-bit mcg, every trellis word read once: 8 and 16 reduction rows (k8r8s, k8r16s)
+    shfl: bool = true, // TF_EXL3_SHFL=0: 4-bit windows keep the lane-window loads (k8r8, nt4); the same bits either way
     gateup: Function,
     down_combine: Function,
     prompt: prompt.Kernels = undefined,
@@ -145,6 +147,8 @@ pub const Experts = struct {
         };
         e.grouped_nt4 = try e.mod.function("tf_exl3_grouped_1_nt4");
         e.grouped_r8 = .{ try e.mod.function("tf_exl3_grouped_1_k6r8"), try e.mod.function("tf_exl3_grouped_1_k8r8") };
+        e.grouped_s = .{ try e.mod.function("tf_exl3_grouped_1_k8r8s"), try e.mod.function("tf_exl3_grouped_1_k8r16s") };
+        e.shfl = envOn("TF_EXL3_SHFL");
         e.gateup = try e.mod.function("tf_exl3_gateup_epilogue");
         e.down_combine = try e.mod.function("tf_exl3_down_combine");
         return e;
@@ -270,10 +274,13 @@ pub const Experts = struct {
     /// gives the same bits. Chosen where each measured faster on sm_120 (decode2_bench/results_exl3_*.txt, cold weights):
     /// windows of up to 8 rows on a projection whose every expert is 3- or 4-bit take the one-width, 8-row form; wider
     /// windows to 32 rows 4 tiles where it led (down at 1 or 8+ rows, gate/up from 3); else, and other codebooks, 8 tiles.
+    /// A projection the loader verified 4-bit takes the read-once loads at every window to 32 rows (exl3r's cold-weight
+    /// bench, sm_120, 400 W: gate/up 0, -4, -6, -6, -10% and down 0, -1, -1, -5, -10% at 1, 2, 4, 8, 16 rows).
     fn tilesFor(e: *const Experts, l: Layer, rows: usize, which: enum { gate_up, down }) struct { f: Function, nt: usize } {
         const n = if (which == .gate_up) l.width else l.dims;
         if (l.codebook != .mcg or rows > 32 or n % 64 != 0) return .{ .f = e.grouped[@backingInt(l.codebook)], .nt = 8 };
         const k2 = if (which == .gate_up) l.uniform_k2_gu else l.uniform_k2_d;
+        if (e.shfl and k2 == 8) return .{ .f = e.grouped_s[@intFromBool(rows > 8)], .nt = 4 };
         if (rows <= 8 and (k2 == 6 or k2 == 8)) return .{ .f = e.grouped_r8[@intFromBool(k2 == 8)], .nt = 4 };
         const four = switch (which) {
             .gate_up => rows >= 3,
@@ -328,6 +335,11 @@ const Geometry = struct {
 
 fn i32d(v: usize) i32 {
     return @intCast(v);
+}
+
+fn envOn(name: [*:0]const u8) bool {
+    const v = std.c.getenv(name) orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
 }
 
 test "the plan matches experts.py's for known shapes" {

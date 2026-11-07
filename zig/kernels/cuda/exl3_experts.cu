@@ -39,6 +39,20 @@ extern "C" __global__ void tf_exl3_grouped_1_k8r8(tf_exl3::GroupedArgs a) {
     tf_exl3::grouped_body_v2<1, 4, 4, GROUPED_LOAD, 8, 8>(a, blockIdx.x, blockIdx.y, blockIdx.z);
 }
 
+// 4-bit mcg decode windows with every trellis word read once (warp_tiles_shfl, sm_120 up; main's loop below): the same
+// k slices, MMA chains and warp-order sums, so the bits of tf_exl3_grouped_1_k8r8 (<= 8 rows) and _nt4 (9 to 32 rows).
+#if __CUDA_ARCH__ >= 1200
+constexpr int GROUPED_SHFL = tf_exl3::SHFL;
+#else
+constexpr int GROUPED_SHFL = tf_exl3::PLAIN;
+#endif
+extern "C" __global__ void tf_exl3_grouped_1_k8r8s(tf_exl3::GroupedArgs a) {
+    tf_exl3::grouped_body_v2<1, 4, 4, GROUPED_SHFL, 8, 8>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+extern "C" __global__ void tf_exl3_grouped_1_k8r16s(tf_exl3::GroupedArgs a) {
+    tf_exl3::grouped_body_v2<1, 4, 4, GROUPED_SHFL, 8, 16>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
 extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1, any width (RED-SNOW's experts)
     tf_exl3::grouped_body<2, 8, 4, GROUPED_LOAD>(a, blockIdx.x, blockIdx.y, blockIdx.z);
 }
