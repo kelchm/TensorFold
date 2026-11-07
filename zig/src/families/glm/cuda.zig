@@ -40,6 +40,7 @@ pub const lanes = @import("cuda_lanes.zig");
 pub const native = @import("cuda_native.zig");
 pub const snapshots = @import("cuda_snapshots.zig");
 pub const checkpoint = @import("cuda_checkpoint.zig");
+pub const checkpoint_restore = @import("cuda_checkpoint_restore.zig");
 pub const checkpoint_freeze = @import("cuda_checkpoint_freeze.zig");
 
 test {

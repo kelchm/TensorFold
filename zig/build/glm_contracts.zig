@@ -2,6 +2,7 @@
 const std = @import("std");
 pub fn tests(b: *std.Build, glm: *std.Build.Module, lanes: *std.Build.Module, cuda: *std.Build.Module, core: *std.Build.Module) void {
     const host = b.graph.host;
+    @import("checkpoint_restore.zig").tests(b);
     const checkpoint = b.step("test-checkpoint-bounded-host", "Bounded native checkpoint ownership, GLM geometry and streaming credits");
     checkpoint.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = core, .filters = &.{"checkpoint bounded:"} })).step);
     checkpoint.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/core/kv_pool.zig"), .target = host, .optimize = .debug, .link_libc = true }) })).step);

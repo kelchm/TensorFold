@@ -199,7 +199,9 @@ pub fn open(file: [:0]const u8, kind: Kind, name: ?Name) !Opened {
     if (n < @as(isize, @intCast(@as(u64, @intCast(end)) - lo))) return error.RowsRead;
     @memcpy(std.mem.asBytes(&t), raw[@intCast(at - lo)..][0..@sizeOf(Trailer)]);
     if (t.magic != MAGIC or t.version != VERSION or t.kind != @backingInt(kind)) return error.RowsRead;
-    if (t.payload + t.meta + @sizeOf(Trailer) != @as(u64, @intCast(end))) return error.RowsRead;
+    const body = std.math.add(u64, t.payload, t.meta) catch return error.RowsRead;
+    const whole = std.math.add(u64, body, @sizeOf(Trailer)) catch return error.RowsRead;
+    if (whole != @as(u64, @intCast(end))) return error.RowsRead;
     if (name) |want| if (!std.mem.eql(u8, &want, &t.name)) return error.RowsRead;
     return .{ .fd = fd, .trailer = t };
 }
@@ -235,7 +237,7 @@ pub fn meta(o: *const Opened, a: std.mem.Allocator) ![]u8 {
 }
 
 /// `dest.len` bytes at `at` of `fd`, through an aligned bounce buffer (O_DIRECT allows no other).
-fn readUnaligned(fd: c_int, dest: []u8, at: u64) bool {
+pub fn readUnaligned(fd: c_int, dest: []u8, at: u64) bool {
     var bounce: [64 * 1024]u8 align(4096) = undefined;
     var done: usize = 0;
     while (done < dest.len) {

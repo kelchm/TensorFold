@@ -58,6 +58,7 @@ pub const checkpoint_weights = @import("checkpoint_weights.zig");
 pub const kv_pool = @import("kv_pool.zig");
 pub const checkpoint_capture = @import("checkpoint_capture.zig");
 pub const checkpoint_stream = @import("checkpoint_stream.zig");
+pub const checkpoint_epoch = @import("checkpoint_epoch.zig");
 pub const checkpoint_file = @import("checkpoint_file.zig");
 
 test {
