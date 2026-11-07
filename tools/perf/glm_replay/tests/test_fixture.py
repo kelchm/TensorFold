@@ -3,6 +3,7 @@ import copy
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from tools.perf.glm_replay import ReplayError, load_fixture, next_anchor, offered_tokens, validate_fixture
@@ -177,6 +178,25 @@ class FixtureTests(unittest.TestCase):
             write_json(manifest, value)
             with self.assertRaisesRegex(ReplayError, "unsafe tokenizer asset path"):
                 PinnedTokenizer(directory, manifest)
+
+    def test_real_tokenizer_entries_can_be_fewer_than_padded_model_vocabulary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp) / "assets"
+            directory.mkdir()
+            for name in ("tokenizer.json", "tokenizer_config.json"):
+                (directory / name).write_text("{}", encoding="utf-8")
+            manifest = Path(temp) / "manifest.json"
+            assets = [{"path": p.name, "sha256": file_digest(p)} for p in sorted(directory.iterdir())]
+            write_json(manifest, {"schema": "glm-replay-tokenizer-assets-v1", "revision": TARGET_REVISION,
+                                  "files": assets})
+            vocabulary = {"ordinary": 0, "last-token": 154855}
+            codec = SimpleNamespace(get_vocab=lambda: vocabulary, get_chat_template=lambda: "pinned-template")
+            loader = SimpleNamespace(from_pretrained=lambda *a, **kw: codec)
+            with patch.dict("sys.modules", {"transformers": SimpleNamespace(AutoTokenizer=loader)}):
+                self.assertEqual(PinnedTokenizer(directory, manifest).vocab_size, 154880)
+                vocabulary["invalid"] = 154880
+                with self.assertRaisesRegex(ReplayError, "IDs exceed pinned model"):
+                    PinnedTokenizer(directory, manifest)
 
     def test_immutable_fixture_cli_and_load(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -57,7 +57,10 @@ class PinnedTokenizer:
         self.tokenizer = AutoTokenizer.from_pretrained(str(root), local_files_only=True, trust_remote_code=False)
         self.template = self.tokenizer.get_chat_template()
         require(isinstance(self.template, str) and self.template, "missing pinned chat template")
-        self.vocab_size = len(self.tokenizer)
+        vocabulary = self.tokenizer.get_vocab()
+        require(vocabulary and all(type(i) is int and 0 <= i < 154880 for i in vocabulary.values()),
+                "tokenizer IDs exceed pinned model vocabulary")
+        self.vocab_size = 154880
         self.revision = receipt["revision"]
         self.files = sorted(receipt["files"], key=lambda item: item["path"])
 

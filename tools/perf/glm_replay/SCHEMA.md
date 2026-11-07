@@ -36,7 +36,9 @@ prompt_encoding = {token_ids:[full one-time encoding of rendered_prompt], used_t
 prompt_tokens equals prompt_encoding.token_ids[:N]; N may be shorter than the rendered
 reservoir for exact 8K/32K/128K contexts. Retain full encoding to make slicing explicit.
 tape_tokens is the one-time encoding of rendered_tape (no token slicing/re-tokenization).
-All IDs are in [0,vocab_size); campaign vocab_size must equal pinned GLM 154880. Synthetic-byte fixtures never claim pinned model tokenization.
+All IDs are in [0,vocab_size); campaign vocab_size is the pinned model's 154880-row ID capacity,
+which may exceed the number of tokenizer entries. Every actual tokenizer ID must fit that capacity.
+Synthetic-byte fixtures never claim pinned model tokenization.
 Owners balanced=[0,0,1,1], reversed=[1,1,0,0]; actual admission must equal requested owner.
 
 preparation and forwards: arrays of {round_id, forward_id, parts:[part,...]}.
