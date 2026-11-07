@@ -73,6 +73,9 @@ effective_config_sha256, preparation_ns, wall_ns, completed_ranks:[0,1], forward
 checks, memory, telemetry_sha256, timing_source.
 timing_source={wall:"observer_off",phases:"separate_observer_on_anchor",anchor_sha256}.
 The actual combined-rank anchor artifact is retained separately; its hash covers its file bytes.
+Real result validation requires `--anchors-root` (repeatable) or actual in-memory anchor bytes.
+The validator authenticates each complete record's anchor IDs/source/runtime and phase values;
+a digest string alone is insufficient. Synthetic host controls may explicitly skip file checking.
 Headline wall time has no event observer. Phase intervals describe the separate identical-work
 anchor, and must not be subtracted from or summed into headline wall time.
 source={engine_commit,harness_commit,binary_sha256,fatbin_sha256,compiler_sha256,
@@ -87,7 +90,14 @@ combining both ranks in rank order. Only the sharding treatment is normalized aw
 must share this digest. Gate receipts bind it after startup and before replay preparation.
 A native q8 off; B native q8 on; P Python q4 off. Same source identities for native A/B.
 checks={correctness:true,timing_neutral:true,default_server_neutral:true,
-fresh_prefill:true,proposer_calls:0,lost:0,carries:0,twins:0}.
+fresh_prefill:true,proposer_calls:0,lost:0,carries:0,twins:0}. P uses the explicit
+default_server_neutral value `not_applicable_unmodified_engine` instead of a server comparison.
+Additional required fields: session_nonce (64-hex shared per actual rank session), campaign_sha256
+(ordered preflight content digest), checkpoints={scheme,target:[rank0,rank1],drafter:[rank0,rank1]},
+and rank-local layout_checks (nonnegative block delta). Native checkpoint scheme is
+tensorfold-full-identity-v1; P uses file-manifest-v1. Every checkpoint digest is 64-hex.
+One declared process start has exactly one session nonce and one ordered campaign digest;
+one nonce cannot be relabeled as multiple starts. The same provenance fields bind each anchor.
 memory={logical_pages,key_page_bytes,latent_page_bytes,row_page_bytes,
 tables_bytes,scratch_bytes,other_bytes,peak_physical_bytes}. logical_pages/key_page_bytes/latent_page_bytes/row_page_bytes
 are nonnegative integers; tables_bytes/scratch_bytes/other_bytes/peak_physical_bytes may be

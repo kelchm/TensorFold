@@ -1,51 +1,67 @@
-# Default-server neutrality evidence
+# Default-server comparison evidence
 
-Server neutrality compares the original server with the serving binary built from the replay
-patch. Its identities differ from the replay executable and its rank-session runtime digest.
-The receipt binds the harness commit, kernel bundle and actual server artifacts. The hardware
-comparison is **UNRUN** during host implementation.
+Native compares the pinned original server with the distinct serving binary built from the
+replay patch. These are different artifacts from `tf-cuda-test`. This device comparison is
+**UNRUN** during host implementation. The external Python adapter leaves its frozen engine
+unchanged and records `default_server_neutral="not_applicable_unmodified_engine"`; it must instead
+prove the installed-source equivalence required by its qualification gate.
 
-After the coordinator captures real device evidence, validate it offline:
+Before capturing any server comparison, freeze a policy and create a contract:
 
 ```sh
-python3 -m tools.perf.glm_replay.server_neutrality NEW_RECEIPT.json \
-  --source SOURCE.json --engine native \
-  --original-server ORIGINAL_SERVER --instrumented-server INSTRUMENTED_SERVER \
-  --tokens TOKENS.json --performance PERFORMANCE.json
+python3 -m tools.perf.glm_replay.server_neutrality declare CONTRACT.json \
+  --source SOURCE.json --engine native --policy POLICY.json \
+  --original-server ORIGINAL_SERVER --instrumented-server INSTRUMENTED_SERVER
 ```
 
-For Python, supply retained server artifact manifests and `--engine python`. The command hashes
-those files and validates retained evidence. It never launches a server, contacts an endpoint,
-performs inference or supplies missing measurements.
+Put the exact contract `{path,sha256}` in native metadata's `default_server_contract` before
+capture. Contract schema `glm-replay-server-contract-v1` has `schema`, `engine="native"`,
+`engine_commit` (historical e52), `image_digest` (original pinned image), `harness_commit`,
+`fatbin_sha256`, `original_server_sha256`, `instrumented_server_sha256`, `policy_sha256` and
+`declared_unix_ns`. The producer hashes actual server files and records declaration time.
+Original and instrumented hashes must differ. Retain provenance mapping the original file
+to its pinned deployment image; naming an arbitrary file is not deployment qualification.
 
-Receipt schema `glm-replay-server-neutrality-v1` has exactly `schema`, `status`, `execution`,
-`engine`, `harness_commit`, `fatbin_sha256`, `original_server_sha256`, `instrumented_server_sha256`,
-`completed_ranks`, `token_evidence`, `performance_evidence`. Only passed device evidence with
-both ranks admits measurement. Artifact references have exactly `path` and `sha256`; evidence
-paths must remain available during runner preflight.
+Policy fields are `schema="glm-replay-server-policy-v1"`, `minimum_pairs` (at least three),
+`max_slowdown_ppm` and `predeclared_policy_sha256` (canonical hash of the other fields).
+There is no automatically chosen acceptable slowdown. The coordinator must review and freeze
+the bound before capture; technical validation proves the declared bound, not its suitability.
+The contract separately pins that policy hash so recomputing a policy checksum after seeing
+results cannot change an already bound comparison. A 100% slowdown limit is refused.
 
-Both token/performance evidence carry identity fields `execution`, `engine`, `harness_commit`,
-`fatbin_sha256`, `original_server_sha256`, `instrumented_server_sha256`, `completed_ranks`.
-They must match the server receipt and source metadata.
+After the coordinator retains real evidence, produce the comparison receipt offline:
 
-Token evidence schema `glm-replay-server-tokens-v1` adds `cases`, a nonempty list with exactly
-`case_id`, `request_sha256`, `config_sha256`, `original_tokens`, `instrumented_tokens` per case.
-Tokens must match exactly, and IDs must fit the model vocabulary. Request/configuration hashes
-bind the same work in token and performance comparisons.
+```sh
+python3 -m tools.perf.glm_replay.server_neutrality produce NEW_RECEIPT.json \
+  --source SOURCE.json --engine native --contract CONTRACT.json \
+  --original-server ORIGINAL_SERVER --instrumented-server INSTRUMENTED_SERVER \
+  --tokens TOKENS.json --performance PERFORMANCE.json --receipts-root RECEIPTS_DIRECTORY
+```
 
-Performance schema `glm-replay-server-performance-v1` adds `policy` and `samples`. Every sample
-has `case_id`, `pair_id`, `start_order` (0 or 1), `request_sha256`, `config_sha256`,
-`original_elapsed_ns`, `instrumented_elapsed_ns`. Durations are positive integers. Every token
-case needs at least three distinct paired starts with counterbalanced order.
+Evidence and contract references emitted by this CLI are relative to the receipts root. Run
+native preflight from that directory, or retain equivalent resolvable process-relative paths
+on both ranks. Neither command starts a server, contacts an endpoint or supplies measurements.
+Contracts and passing receipts are distinct; no passing device gate is supplied by host work.
 
-Policy fields are `schema=glm-replay-server-policy-v1`, `minimum_pairs` (at least three),
-`max_slowdown_ppm` (an explicitly predeclared bound), and `predeclared_policy_sha256`. That hash
-is the canonical JSON hash of the other three policy fields. The coordinator freezes and retains
-this policy before the comparison. No universal slowdown threshold is invented. The sum of
-candidate times divided by the sum of original times must stay within the declared bound;
-all samples remain in the evidence.
+Receipt schema `glm-replay-server-neutrality-v2` contains `schema`, `status`, `execution`,
+`contract_sha256`, `engine`, `harness_commit`, `fatbin_sha256`, `original_server_sha256`,
+`instrumented_server_sha256`, `completed_ranks`, `token_evidence` and `performance_evidence`.
+Only passed device evidence with both ranks admits measurement. Every reference is exactly
+`{path,sha256}`. Source, distinct server identities and policy must match the frozen contract.
 
-Native independently checks receipt/evidence hashes, source/server identities, tokens, matched
-work and the performance policy. Python calls the shared offline validator. Neither binds this
-receipt to replay runtime or treats the replay executable as a server. A bare handwritten
-`status=pass` without the comparisons is insufficient.
+Token/performance evidence carry the same server/source identity fields, `execution="device"`,
+`completed_ranks=[0,1]`, `started_unix_ns` and `ended_unix_ns`. Capture must start after the
+contract declaration and end afterwards. These retained timestamps and the metadata pin are
+auditable ordering evidence, not a trusted timestamp service or protection against forged files.
+
+`glm-replay-server-tokens-v2` adds nonempty `cases` with `case_id`, `request_sha256`,
+`config_sha256`, `original_tokens` and `instrumented_tokens`. Tokens must match exactly and
+fit the model vocabulary. `glm-replay-server-performance-v2` adds the pinned `policy` and
+`samples` with `case_id`, `pair_id`, `start_order`, `request_sha256`, `config_sha256`,
+`original_elapsed_ns` and `instrumented_elapsed_ns`. Each token case needs at least the declared
+number of distinct counterbalanced paired starts. All durations are positive and work hashes
+match. The ratio of summed candidate times to summed original times must meet the frozen bound.
+
+Native independently checks the exact contract and evidence file hashes, identities, ordering,
+tokens, work and policy. Old unbound v1 receipts are refused. No replay runtime or replay-binary
+identity is substituted for a server identity.

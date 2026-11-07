@@ -51,6 +51,7 @@ Metadata schema `glm-replay-native-metadata-v1` requires:
 - `correctness`, `timing_neutrality`, `sharding_equality`, `default_server_neutrality`: null for
   validation, or local `{path,sha256}` gate artifacts for measurement.
 - `logical_evidence`: null for validation, or the exact retained logical artifact for measurement.
+- `default_server_contract`: null for validation, or the pre-capture server/policy contract artifact.
 
 The complete required metadata object also has `schema`. Source binary hashes are checked
 against the running executable; compiler/fatbin artifacts and tokenizer assets are hashed before

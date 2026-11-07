@@ -12,6 +12,7 @@ def main(argv=None):
     parser.add_argument("command", choices=("validate-fixture", "validate-results", "summarize"))
     parser.add_argument("--fixture", type=Path, action="append", required=True)
     parser.add_argument("--results", type=Path, action="append", default=[])
+    parser.add_argument("--anchors-root", type=Path, action="append", help="retained native/Python phase anchor directories")
     parser.add_argument("--allow-synthetic", action="store_true", help="host controls only; no device qualification")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
@@ -26,10 +27,10 @@ def main(argv=None):
     else:
         records = load_results(args.results)
         if args.command == "validate-results":
-            validate_results(records, fixtures, allow_synthetic=args.allow_synthetic)
+            validate_results(records, fixtures, allow_synthetic=args.allow_synthetic, anchors_root=args.anchors_root)
             result = {"validated_rank_receipts": len(records)}
         else:
-            result = summarize_paired(records, fixtures, allow_synthetic=args.allow_synthetic)
+            result = summarize_paired(records, fixtures, allow_synthetic=args.allow_synthetic, anchors_root=args.anchors_root)
     if args.output:
         require(not args.output.exists(), "refusing to overwrite report")
         write_json(args.output, result)

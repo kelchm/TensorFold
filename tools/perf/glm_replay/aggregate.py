@@ -30,6 +30,8 @@ def _start_summary(blocks, tokens):
     mean_wall = statistics.mean(b["wall_ns"] for b in blocks)
     forward_count = len(blocks[0]["phases_ns_by_rank"][0])
     return {"source": blocks[0]["source"], "effective_config": blocks[0]["effective_config"],
+            "session_nonce": blocks[0]["session_nonce"], "campaign_sha256": blocks[0]["campaign_sha256"],
+            "checkpoints": blocks[0]["checkpoints"],
             "start_id": blocks[0]["start_id"], "start_order": blocks[0]["start_order"],
             "block_count": len(blocks), "mean_wall_ns": mean_wall,
             "milliseconds_per_forward": mean_wall / 1e6 / forward_count,
@@ -39,6 +41,7 @@ def _start_summary(blocks, tokens):
                         "phases_ns_by_rank": b["phases_ns_by_rank"],
                         "owner_counters_by_rank": b["owner_counters_by_rank"],
                         "timing_source": b["timing_source"],
+                        "layout_checks_by_rank": b["layout_checks_by_rank"],
                         "memory_by_rank": b["memory_by_rank"], "telemetry_sha256_by_rank": b["telemetry_sha256_by_rank"]} for b in blocks]}
 
 
@@ -53,13 +56,15 @@ def _block(group):
             "telemetry_sha256_by_rank": [r["telemetry_sha256"] for r in ranks],
             "phases_ns_by_rank": [[f["phases_ns"] for f in r["forwards"]] for r in ranks],
             "timing_source": first["timing_source"],
+            "session_nonce": first["session_nonce"], "campaign_sha256": first["campaign_sha256"],
+            "checkpoints": first["checkpoints"], "layout_checks_by_rank": [r["layout_checks"] for r in ranks],
             "owner_counters_by_rank": [[f["owner"] for f in r["forwards"]] for r in ranks]}
 
 
-def summarize_paired(records, fixtures, minimum_pairs=3, minimum_blocks=5, allow_synthetic=False):
+def summarize_paired(records, fixtures, minimum_pairs=3, minimum_blocks=5, allow_synthetic=False, anchors_root=None):
     integer(minimum_pairs, "minimum pairs", 3)
     integer(minimum_blocks, "minimum blocks", 5)
-    validate_results(records, fixtures, allow_synthetic=allow_synthetic)
+    validate_results(records, fixtures, allow_synthetic=allow_synthetic, anchors_root=anchors_root)
     grouped = rank_blocks(records)
     native, python, exclusions = defaultdict(lambda: defaultdict(dict)), defaultdict(list), []
     all_pairs = defaultdict(set)

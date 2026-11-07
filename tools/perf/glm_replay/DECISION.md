@@ -25,6 +25,15 @@ can miss short overlaps. Describe limitations and mark unavailable statistics in
 serial traffic or treating a mean as a percentile. The user's Pi workload determines relevance;
 the synthetic benchmark mix is not evidence of production frequency.
 
+The completed local workload screen covers October 28 through November 7 before the trial/rerun.
+It observes more than one active request for about 6.06% of sampled wall time and 27.79% of busy
+time, at 98.83% coverage. Concurrency is not negligible when busy; exact arrival overlap remains
+unavailable, and the metric cannot distinguish earlier maintenance/test traffic. Retained Pi
+metadata records 7,845 of 10,423 positive-usage contexts above 128K. Its coverage and normalization
+writer have separate limits, so it is not a complete production census. The existing replay
+matrix ending at 128K is a diagnostic matrix, not a representative sample of those histories.
+Reconsider context coverage and cost before proposing a full campaign; do not silently expand it.
+
 ## Cheap served sharding screen
 
 The serving owner coordinates one window using the existing rerun harness's one-stream and

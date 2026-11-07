@@ -51,6 +51,7 @@ pub fn agreement(a: std.mem.Allocator, m: meta.Metadata, settings_hash: []const 
         .sharding_equality = if (m.sharding_equality) |v| v.sha256 else null,
         .timing_neutrality = if (m.timing_neutrality) |v| v.sha256 else null,
         .default_server_neutrality = if (m.default_server_neutrality) |v| v.sha256 else null,
+        .default_server_contract = if (m.default_server_contract) |v| v.sha256 else null,
         .telemetry = m.telemetry.sha256,
     }, .{});
     var sha = std.crypto.hash.sha2.Sha256.init(.{});

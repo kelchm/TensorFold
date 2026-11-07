@@ -90,7 +90,7 @@ Every descriptor requires a complete `glm-replay-native-metadata-v1` file. Its e
 are `schema`, `run_id`, `pair_id`, `start_id`, `start_order` (integer 0 or 1), `block_id`
 (nonempty string), `cell_id`, `fixture_sha256`, `config_sha256`, `source`, `fatbin`,
 `compiler`, `telemetry`, `correctness`, `sharding_equality`, `timing_neutrality` and
-`default_server_neutrality` and `logical_evidence`. IDs are nonempty strings. Fixture/config hashes must match
+`default_server_neutrality`, `default_server_contract` and `logical_evidence`. IDs are nonempty strings. Fixture/config hashes must match
 the fully validated fixture. No fields are inferred from filenames or case indices.
 
 `source` has exactly `engine_commit`, `harness_commit`, `binary_sha256`, `fatbin_sha256`,

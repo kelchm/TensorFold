@@ -7,6 +7,7 @@ from pathlib import Path
 from tools.perf.glm_replay import ReplayError
 from tools.perf.glm_replay.common import digest, file_digest, write_json
 from tools.perf.glm_replay.server_neutrality import produce, validate_server_gate
+from tools.perf.glm_replay.fixture import NATIVE_BASE
 
 
 class ServerGateTests(unittest.TestCase):
@@ -15,7 +16,7 @@ class ServerGateTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.source = {"harness_commit": "1" * 40, "fatbin_sha256": "2" * 64,
-                       "binary_sha256": "3" * 64}
+                       "binary_sha256": "3" * 64, "engine_commit": NATIVE_BASE, "image_digest": "sha256:" + "0" * 64}
         self.original, self.candidate = self.root / "original", self.root / "instrumented"
         self.original.write_bytes(b"invented original host-test server")
         self.candidate.write_bytes(b"invented instrumented host-test server")
@@ -24,15 +25,24 @@ class ServerGateTests(unittest.TestCase):
                     "instrumented_server_sha256": file_digest(self.candidate), "completed_ranks": [0, 1]}
         case = {"case_id": "host-control", "request_sha256": "4" * 64, "config_sha256": "5" * 64,
                 "original_tokens": [11, 22, 33], "instrumented_tokens": [11, 22, 33]}
-        self.tokens = {"schema": "glm-replay-server-tokens-v1", **identity, "cases": [case]}
+        self.tokens = {"schema": "glm-replay-server-tokens-v2", **identity, "started_unix_ns": 2,
+                       "ended_unix_ns": 3, "cases": [case]}
         policy = {"schema": "glm-replay-server-policy-v1", "minimum_pairs": 3, "max_slowdown_ppm": 50_000}
         policy["predeclared_policy_sha256"] = digest(policy)
-        self.performance = {"schema": "glm-replay-server-performance-v1", **identity, "policy": policy,
+        self.performance = {"schema": "glm-replay-server-performance-v2", **identity, "policy": policy,
+                            "started_unix_ns": 4, "ended_unix_ns": 5,
                             "samples": [{"case_id": "host-control", "pair_id": str(i), "start_order": i % 2,
                                          "request_sha256": "4" * 64, "config_sha256": "5" * 64,
                                          "original_elapsed_ns": 1000, "instrumented_elapsed_ns": 1020}
                                         for i in range(3)]}
         self.output = self.root / "gate.json"
+        self.contract = {"schema": "glm-replay-server-contract-v1", "engine": "native", "engine_commit": NATIVE_BASE,
+                         "image_digest": self.source["image_digest"], "harness_commit": self.source["harness_commit"],
+                         "fatbin_sha256": self.source["fatbin_sha256"], "original_server_sha256": file_digest(self.original),
+                         "instrumented_server_sha256": file_digest(self.candidate), "declared_unix_ns": 1,
+                         "policy_sha256": policy["predeclared_policy_sha256"]}
+        self.contract_path = self.root / "contract.json"
+        write_json(self.contract_path, self.contract)
 
     def ref(self, path):
         return {"path": str(path), "sha256": file_digest(path)}
@@ -42,12 +52,12 @@ class ServerGateTests(unittest.TestCase):
         write_json(token_path, self.tokens)
         write_json(perf_path, self.performance)
         return produce(self.output, self.ref(token_path), self.ref(perf_path), self.original,
-                       self.candidate, self.source, "native")
+                       self.candidate, self.source, "native", self.ref(self.contract_path))
 
     def test_offline_producer_binds_real_server_artifacts_not_replay_binary(self):
         gate = self.run_producer()
         self.assertNotEqual(gate["instrumented_server_sha256"], self.source["binary_sha256"])
-        self.assertEqual(validate_server_gate(self.ref(self.output), self.source, "native", [self.root]), gate)
+        self.assertEqual(validate_server_gate(self.ref(self.output), self.source, "native", [self.root], self.ref(self.contract_path)), gate)
         with self.assertRaisesRegex(ReplayError, "overwrite"):
             self.run_producer()
 
@@ -100,9 +110,29 @@ class ServerGateTests(unittest.TestCase):
         gate["token_evidence"]["sha256"] = "9" * 64
         write_json(self.output, gate)
         with self.assertRaisesRegex(ReplayError, "artifact hash"):
-            validate_server_gate(self.ref(self.output), self.source, "native", [self.root])
+            validate_server_gate(self.ref(self.output), self.source, "native", [self.root], self.ref(self.contract_path))
         with self.assertRaisesRegex(ReplayError, "permitted roots"):
-            validate_server_gate(self.ref(self.output), self.source, "native", [])
+            validate_server_gate(self.ref(self.output), self.source, "native", [], self.ref(self.contract_path))
+
+    def test_posthoc_policy_identical_servers_and_capture_before_contract_are_refused(self):
+        self.candidate.write_bytes(self.original.read_bytes())
+        self.contract["instrumented_server_sha256"] = file_digest(self.candidate)
+        write_json(self.contract_path, self.contract)
+        with self.assertRaisesRegex(ReplayError, "must differ"):
+            self.run_producer()
+        self.candidate.write_bytes(b"invented instrumented host-test server")
+        self.contract["instrumented_server_sha256"] = file_digest(self.candidate)
+        write_json(self.contract_path, self.contract)
+        policy = self.performance["policy"]
+        policy["max_slowdown_ppm"] = 900_000
+        policy["predeclared_policy_sha256"] = digest({k: v for k, v in policy.items() if k != "predeclared_policy_sha256"})
+        with self.assertRaisesRegex(ReplayError, "frozen contract"):
+            self.run_producer()
+        self.performance["policy"]["max_slowdown_ppm"] = 50_000
+        self.performance["policy"]["predeclared_policy_sha256"] = self.contract["policy_sha256"]
+        self.tokens["started_unix_ns"] = 1
+        with self.assertRaisesRegex(ReplayError, "integer"):
+            self.run_producer()
 
 
 if __name__ == "__main__":

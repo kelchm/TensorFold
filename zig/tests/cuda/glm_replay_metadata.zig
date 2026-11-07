@@ -32,6 +32,7 @@ pub const Metadata = struct {
     timing_neutrality: ?Artifact,
     default_server_neutrality: ?Artifact,
     logical_evidence: ?Artifact = null,
+    default_server_contract: ?Artifact = null,
 };
 pub const Gate = struct {
     schema: []const u8,
@@ -75,7 +76,7 @@ pub fn read(a: std.mem.Allocator, io: std.Io, path: []const u8, f: fixture.Fixtu
         try gate(a, io, m.sharding_equality orelse return error.ShardingEqualityUnrun, m, "sharding_equality", sharded, null);
         try gate(a, io, m.correctness orelse return error.CorrectnessUnrun, m, "correctness", sharded, null);
         try gate(a, io, m.timing_neutrality orelse return error.TimingNeutralityUnrun, m, "timing_neutrality", sharded, null);
-        try @import("glm_replay_server_gate.zig").read(a, io, m.default_server_neutrality orelse return error.DefaultServerNeutralityUnrun, m.source, fileHash);
+        try @import("glm_replay_server_gate.zig").read(a, io, m.default_server_neutrality orelse return error.DefaultServerNeutralityUnrun, m.default_server_contract orelse return error.ServerContractUnrun, m.source);
     }
     return m;
 }
@@ -126,8 +127,8 @@ pub fn checkTelemetry(a: std.mem.Allocator, io: std.Io, m: Metadata) !void {
 }
 
 fn gate(a: std.mem.Allocator, io: std.Io, v: Artifact, m: Metadata, name: []const u8, sharded: bool, runtime_hash: ?[]const u8) !void {
-    try artifact(a, io, v);
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, v.path, a, .limited(1 << 20));
+    try hash.matches(v.sha256, hash.bytes(raw));
     const g = try std.json.parseFromSliceLeaky(Gate, a, raw, .{});
     try fixture.hex(g.runtime_sha256, 64);
     try checkGate(g, m, name, sharded, runtime_hash);

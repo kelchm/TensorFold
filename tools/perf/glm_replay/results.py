@@ -13,7 +13,8 @@ CONFIG_FIELDS = ("engine speed tp slots dense_bits head_bits kv kv_shard multi_l
                  "query_bytes_per_row output_bytes_per_row graph_rows runtime_sha256")
 RECORD_FIELDS = ("schema fixture_sha256 schedule_sha256 tokens_sha256 config_sha256 run_id pair_id start_id "
                  "start_order block_id cell_id arm rank status exclusion_reason source effective_config "
-                 "effective_config_sha256 preparation_ns wall_ns completed_ranks forwards checks memory telemetry_sha256 timing_source")
+                 "effective_config_sha256 preparation_ns wall_ns completed_ranks forwards checks memory telemetry_sha256 timing_source "
+                 "session_nonce campaign_sha256 checkpoints layout_checks")
 FORWARD_FIELDS = ("forward_id round_id parts phases_ns owner graph_replays eager_fallbacks target_commits "
                   "context_commits ingest_calls proposer_calls lost")
 
@@ -158,6 +159,17 @@ def _record(record, fixtures):
     require(timing["phases"] == "separate_observer_on_anchor", "phase intervals need a separate observed anchor")
     hex_id(timing["anchor_sha256"], "anchor_sha256")
     hex_id(record["telemetry_sha256"], "telemetry_sha256")
+    hex_id(record["session_nonce"], "session_nonce")
+    hex_id(record["campaign_sha256"], "campaign_sha256")
+    integer(record["layout_checks"], "layout_checks")
+    checkpoints = record["checkpoints"]
+    fields(checkpoints, "scheme target drafter", "checkpoint identities")
+    require(checkpoints["scheme"] == ("file-manifest-v1" if record["arm"] == "P" else "tensorfold-full-identity-v1"),
+            "checkpoint identity scheme mismatch")
+    for key in ("target", "drafter"):
+        require(isinstance(checkpoints[key], list) and len(checkpoints[key]) == 2, "both-rank checkpoint identities required")
+        for value in checkpoints[key]:
+            hex_id(value, f"checkpoint {key}")
     _source(record)
     _config(record, fixture)
     _memory(record)
@@ -190,7 +202,8 @@ def _rank_agreement(group):
     require(len(group) == 2 and {r["rank"] for r in group} == {0, 1}, "incomplete or duplicate rank block")
     left, right = sorted(group, key=lambda r: r["rank"])
     keys = ("fixture_sha256 schedule_sha256 tokens_sha256 config_sha256 run_id pair_id start_id start_order "
-            "block_id cell_id arm status exclusion_reason source effective_config effective_config_sha256 checks timing_source")
+            "block_id cell_id arm status exclusion_reason source effective_config effective_config_sha256 checks timing_source "
+            "session_nonce campaign_sha256 checkpoints")
     for key in keys.split():
         require(digest(left[key]) == digest(right[key]), f"rank disagreement: {key}")
     require(len(left["forwards"]) == len(right["forwards"]), "rank schedule completion disagreement")
@@ -200,19 +213,19 @@ def _rank_agreement(group):
 def _pair_agreement(left, right):
     require(left["start_id"] != right["start_id"], "native arms reused process start")
     require(left["start_order"] != right["start_order"], "native paired order mismatch")
-    for key in ("fixture_sha256", "schedule_sha256", "tokens_sha256", "config_sha256", "source"):
+    for key in ("fixture_sha256", "schedule_sha256", "tokens_sha256", "config_sha256", "source", "checkpoints"):
         require(digest(left[key]) == digest(right[key]), f"unmatched native work/build: {key}")
     configs = [{k: v for k, v in r["effective_config"].items() if k not in ("kv_shard", "page_argument")}
                for r in (left, right)]
     require(digest(configs[0]) == digest(configs[1]), "native arms changed more than sharding/page argument")
 
 
-def validate_results(records, fixtures, allow_synthetic=False):
+def validate_results(records, fixtures, allow_synthetic=False, anchors_root=None, anchors=None):
     require(isinstance(records, list) and records, "empty result set")
     for key, fixture in fixtures.items():
         validate_fixture(fixture, allow_synthetic=allow_synthetic)
         require(key == fixture["fixture_sha256"], "fixture map hash mismatch")
-    seen, starts, cells, pairs = set(), {}, {}, defaultdict(dict)
+    seen, starts, cells, pairs, nonces = set(), {}, {}, defaultdict(dict), {}
     native_builds = {}
     for record in records:
         _record(record, fixtures)
@@ -226,9 +239,13 @@ def validate_results(records, fixtures, allow_synthetic=False):
         seen.add(identity)
         start = (record["run_id"], record["start_id"])
         definition = (record["pair_id"], record["arm"], record["start_order"], digest(record["source"]),
-                      record["effective_config_sha256"])
+                      record["effective_config_sha256"], record["session_nonce"], record["campaign_sha256"],
+                      digest(record["checkpoints"]))
         require(start not in starts or starts[start] == definition, "inconsistent process-start definition")
         starts[start] = definition
+        nonce = (record["run_id"], record["session_nonce"])
+        require(nonce not in nonces or nonces[nonce] == start, "one session nonce used for different process starts")
+        nonces[nonce] = start
         cell = (record["run_id"], record["cell_id"])
         require(cell not in cells or cells[cell] == record["fixture_sha256"], "cell changed fixture")
         cells[cell] = record["fixture_sha256"]
@@ -249,4 +266,12 @@ def validate_results(records, fixtures, allow_synthetic=False):
     for run_orders in orders.values():
         counts = list(run_orders.values())
         require(abs(counts.count(0) - counts.count(1)) <= 1, "native start order is not counterbalanced")
+    if not allow_synthetic or anchors_root is not None or anchors is not None:
+        from .anchors import Anchors
+
+        require(anchors_root is not None or anchors is not None, "retained phase anchors are required")
+        store = Anchors(anchors_root, anchors)
+        for record in records:
+            if record["status"] == "complete":
+                store.check(record)
     return records
