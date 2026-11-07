@@ -26,6 +26,54 @@ pub const Expanded = struct {
 
 const Part = struct { video: bool = false, url: []const u8, low: bool = false };
 
+/// One request's already validated videos. The parent owns every callback/canvas until warm completion.
+const VideoReuse = struct {
+    ctx: *anyopaque,
+    offer: api.VideoOffer,
+    parts: []const Part,
+    clips: []const api.PreparedVideo,
+
+    fn matches(r: *const VideoReuse, v: api.Vision, ps: []const Part) bool {
+        const o = v.video orelse return false;
+        if (v.ctx != r.ctx or o.prepare != r.offer.prepare or o.prepare_scratch != r.offer.prepare_scratch or
+            o.lazy != r.offer.lazy or o.video_tokens != r.offer.video_tokens or
+            o.per_video_tokens != r.offer.per_video_tokens or o.max_frames != r.offer.max_frames or
+            o.max_videos != r.offer.max_videos or ps.len != r.parts.len) return false;
+        for (ps, r.parts) |p, saved| {
+            if (p.video != saved.video or p.low != saved.low or !std.mem.eql(u8, p.url, saved.url)) return false;
+        }
+        return true;
+    }
+};
+
+test "video followup: request reuse requires identical media, context and processor policy" {
+    const Fake = struct {
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: api.VideoSource, _: u32, _: u32) anyerror!api.PreparedVideo {
+            return error.UnexpectedPrepare;
+        }
+    };
+    var ctx: u8 = 0;
+    var other: u8 = 0;
+    const offer: api.VideoOffer = .{ .prepare = Fake.prepare, .lazy = true, .video_token = 8, .group_open = 1, .group_close = 2, .video_tokens = 32768, .per_video_tokens = 16384, .max_videos = 4, .max_frames = 128 };
+    const ps: []const Part = &.{ .{ .video = true, .url = "data:,a" }, .{ .url = "data:,b" } };
+    const saved: VideoReuse = .{ .ctx = &ctx, .offer = offer, .parts = ps, .clips = &.{} };
+    var v: api.Vision = .{ .ctx = &ctx, .prepare = undefined, .image_token = 9, .image_tokens = 102400, .max_images = 50, .video = offer };
+    try std.testing.expect(saved.matches(v, ps));
+    try std.testing.expect(!saved.matches(v, &.{ ps[1], ps[0] }));
+    try std.testing.expect(!saved.matches(v, &.{.{ .video = true, .url = "data:,c" }}));
+    v.ctx = &other;
+    try std.testing.expect(!saved.matches(v, ps));
+    v.ctx = &ctx;
+    v.video.?.max_frames = 64;
+    try std.testing.expect(!saved.matches(v, ps));
+    v.video = offer;
+    v.video.?.video_tokens = 16384;
+    try std.testing.expect(!saved.matches(v, ps));
+    v.video = offer;
+    v.video.?.per_video_tokens = 8192;
+    try std.testing.expect(!saved.matches(v, ps));
+}
+
 /// The image and video parts of normalized `messages`, in the order the template meets them.
 fn parts(cx: *Cx, messages: Value, image_type: []const u8) errors.Refused![]const Part {
     var out: std.ArrayList(Part) = .empty;
@@ -158,6 +206,11 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
     var n_images: usize = 0;
     for (ps) |p| n_images += @intFromBool(!p.video);
     const n_videos = ps.len - n_images;
+    const owner = @import("prepare_memory.zig").current;
+    const reusable: ?*const VideoReuse = if (owner) |r| if (r.video_reuse) |raw| blk: {
+        const saved: *const VideoReuse = @ptrCast(@alignCast(raw));
+        break :blk if (saved.matches(v, ps)) saved else null;
+    } else null else null;
     const video_token: ?u32 = if (v.video) |o| o.video_token else null;
     // the template's placeholders alone, one per part (request text cannot match a marker)
     var marks: usize = 0;
@@ -202,6 +255,12 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
     for (ps) |p| {
         if (p.video) {
             const o = v.video.?;
+            if (reusable) |saved| {
+                clips[vi] = saved.clips[vi];
+                try accountVideo(cx, o, clips[vi], videoTokenBudget(o, n_videos), &video_tokens_total);
+                vi += 1;
+                continue;
+            }
             const phase = if (video_work) |b| b.begin() catch return cx.refuse("video preparation exceeded the configured time limit") else null;
             defer if (video_work) |b| b.finish(phase.?);
             if (video_work) |b| video_budget.deadline = b.deadline();
@@ -243,6 +302,15 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
             if (image_work) |b| b.check(phase.?) catch return cx.refuse("image preparation exceeded the configured time limit");
         }
     }
+    if (n_videos > 0 and v.video.?.lazy and v.video.?.prepare_scratch != null) if (owner) |r| {
+        const retained = r.arena.allocator();
+        // Only publish data allocated in the parent's retained arena, never a temporary expansion's data.
+        if (r.video_reuse == null and cx.a.ptr == retained.ptr and cx.a.vtable == retained.vtable) {
+            const saved = try cx.a.create(VideoReuse);
+            saved.* = .{ .ctx = v.ctx, .offer = v.video.?, .parts = ps, .clips = clips };
+            r.video_reuse = saved;
+        }
+    };
     var out_ids: std.ArrayList(u32) = .empty;
     var key: std.ArrayList(u32) = .empty;
     var imgs: std.ArrayList(api.Image) = .empty;

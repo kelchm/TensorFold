@@ -445,7 +445,6 @@ fn release(own: *Owned) void {
 pub fn requestProblem(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MediaDeadline => "image or video preparation exceeded its time budget",
-        error.BadVideo, error.Short, error.Decode => "the video's bytes are invalid or unsupported; use MP4 or WebM (H.264, HEVC, VP8, VP9 or MPEG-4)",
         else => null,
     };
 }
@@ -543,8 +542,8 @@ test "a small text context still sizes the link for every offered media span" {
 
 test "media request errors: GLM classifies only known media input failures" {
     const t = std.testing;
-    for ([_]anyerror{ error.MediaDeadline, error.BadVideo, error.Short, error.Decode }) |err|
+    for ([_]anyerror{error.MediaDeadline}) |err|
         try t.expect(requestProblem(null, err) != null);
-    for ([_]anyerror{ error.OutOfMemory, error.CudaError, error.RankMismatch, error.BadStep, error.BadChunk }) |err|
+    for ([_]anyerror{ error.OutOfMemory, error.CudaError, error.RankMismatch, error.BadStep, error.BadChunk, error.BadVideo, error.Short, error.Decode }) |err|
         try t.expect(requestProblem(null, err) == null);
 }

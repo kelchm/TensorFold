@@ -34,7 +34,7 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
     return renderIdsMedia(srv, cx, messages, tools, thinking, effort, generation, null);
 }
 
-fn renderIdsMedia(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, ordered: ?*Value) errors.Refused![]const u32 {
+pub fn renderIdsMedia(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, ordered: ?*Value) errors.Refused![]const u32 {
     var arena: std.heap.ArenaAllocator = .init(@import("prepare_memory.zig").scratch(.prompt));
     defer arena.deinit();
     var scratch: Cx = .{ .a = arena.allocator(), .clear_thinking = cx.clear_thinking };

@@ -26,6 +26,7 @@ const Pass = struct {
             .length => "done",
             .cancelled => "stepped aside",
             .failed => "failed",
+            .refused => "refused",
             else => "ended",
         }, if (f.message.len > 0) ": " else "", f.message, f.stats.queued_seconds });
         const parent = p.parent;
@@ -62,7 +63,7 @@ fn start(srv: *Server, input: chat.Input, message: Value, thinking: bool, effort
     var cx: errors.Cx = .{ .a = a, .clear_thinking = if (clear != null and clear.? == .bool) clear.?.bool else null };
     const warm_prompt = try shared(srv, &cx, input, message, thinking, effort);
     var prompt = warm_prompt.ids;
-    // an image conversation's pass holds its images as its turns did (data URLs only: no URL is fetched twice)
+    // The retained parent supplies matching validated video canvases; expansion never decodes them again.
     const pictures = try images.expand(srv.info.vision, null, srv.text, &cx, .{ .array = warm_prompt.messages }, prompt, prompt.len);
     if (pictures) |x| prompt = x.ids;
     if (prompt.len == 0 or (srv.info.context_window > 0 and prompt.len >= srv.info.context_window)) return;
@@ -95,8 +96,9 @@ fn shared(srv: *Server, cx: *errors.Cx, input: chat.Input, message: Value, think
         if (called) if (calls.?.array[0].get("id")) |id| if (id == .string) try next.put(cx.a, "tool_call_id", id);
         try next.put(cx.a, "content", .{ .string = text });
         list[before.len + 1] = .{ .object = next };
-        if (i == 0) first = list;
-        out.* = try prompt_mod.renderIds(srv, cx, .{ .array = list }, input.tools, thinking, effort, true);
+        var ordered: Value = .null;
+        out.* = try prompt_mod.renderIdsMedia(srv, cx, .{ .array = list }, input.tools, thinking, effort, true, if (i == 0) &ordered else null);
+        if (i == 0) first = if (ordered == .array) ordered.array else list;
     }
     const n = std.mem.indexOfDiff(u32, ids[0], ids[1]) orelse return .{ .ids = &.{}, .messages = first };
     return .{ .ids = ids[0][0..n], .messages = first };

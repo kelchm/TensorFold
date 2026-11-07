@@ -95,6 +95,7 @@ pub const Request = struct {
     reserve: u64,
     refs: std.atomic.Value(u32) = .init(1),
     arena: std.heap.ArenaAllocator,
+    video_reuse: ?*const anyopaque = null, // request-owned prepared clips; warm borrowers retain this Request
 
     pub fn create(a: Allocator, io: std.Io, ledger: *Ledger, held: ?*gate.Gate, reserve: u64) !*Request {
         const r = try a.create(Request);

@@ -38,7 +38,6 @@ pub fn For(comptime picture: type) type {
             frames: []u8, // [n, content_h, content_w, 3]
             scratch: std.mem.Allocator,
             got: usize = 0,
-            validate_tail: bool = false, // decode through the declared final frame without retaining an extra sample
             check_ctx: ?*anyopaque = null,
             check: ?*const fn (?*anyopaque) anyerror!void = null,
 
@@ -46,16 +45,12 @@ pub fn For(comptime picture: type) type {
             pub fn take(s: *Sink, k: usize, rgb: []const u8, w: u32, h: u32, stride: usize) anyerror!void {
                 if (s.check) |check| try check(s.check_ctx);
                 const p = s.plan;
-                if (k != s.got or k >= p.indices.len + @intFromBool(s.validate_tail) or w != p.width or h != p.height) return error.BadVideo;
+                if (k != s.got or k >= p.indices.len or w != p.width or h != p.height) return error.BadVideo;
                 const row = std.math.mul(usize, w, 3) catch return error.BadVideo;
                 if (stride < row or h == 0) return error.BadVideo;
                 const last = std.math.mul(usize, h - 1, stride) catch return error.BadVideo;
                 const required = std.math.add(usize, last, row) catch return error.BadVideo;
                 if (rgb.len < required) return error.BadVideo;
-                if (k == p.indices.len) {
-                    s.got += 1;
-                    return;
-                }
                 const dst = s.frames[k * p.frameBytes() ..][0..p.frameBytes()];
                 const frame: picture.resample.View = .{ .pixels = rgb, .width = w, .height = h, .stride = stride };
                 // torchvision's uint8 resize
@@ -280,17 +275,11 @@ pub fn For(comptime picture: type) type {
             const bytes = try planned.retainedBytes(max_tokens);
             const frames = try a.alloc(u8, bytes);
             errdefer a.free(frames);
-            const last = std.math.cast(u32, s.frames - 1) orelse return error.BadVideo;
-            const tail = planned.indices[planned.indices.len - 1] != last;
-            const decode_indices = if (tail) blk: {
-                const all = try arena.allocator().alloc(u32, planned.indices.len + 1);
-                @memcpy(all[0..planned.indices.len], planned.indices);
-                all[planned.indices.len] = last;
-                break :blk all;
-            } else planned.indices;
-            var sink: Sink = .{ .plan = &planned, .frames = frames, .scratch = scratch, .validate_tail = tail };
-            try s.decode(s.ctx, decode_indices, &sink);
-            if (sink.got != decode_indices.len) return error.BadVideo;
+            // Container frame counts can include edit-list-discarded frames. As Python's loader does,
+            // require every sampled frame, without demanding an unsampled declared tail frame.
+            var sink: Sink = .{ .plan = &planned, .frames = frames, .scratch = scratch };
+            try s.decode(s.ctx, planned.indices, &sink);
+            if (sink.got != planned.indices.len) return error.BadVideo;
             var p = planned;
             p.indices = try a.dupe(u32, planned.indices);
             errdefer a.free(p.indices);
