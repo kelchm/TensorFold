@@ -117,6 +117,11 @@ template <int M>
 __device__ __forceinline__ void partial_split(const __nv_bfloat16* x, const __nv_bfloat16* fn, float* part,
                                               int64_t wide, int nb) {
   static_assert(24 % M == 0, "whole dots a block");
+  // Dependent launch (decode windows, Set.pdl_hc): both roles read x, an earlier grid's rows (the squares block, which
+  // returns early, and the dot blocks), so every thread waits first, before any read, store or exit; then the next grid
+  // may launch (tf_glm_hc_partial8's pair).
+  pdl_wait();
+  pdl_trigger();
   __shared__ float dots[M][8];
   __shared__ float smem[4];
   const int64_t r = blockIdx.x, b = blockIdx.y, kb = wide / nb;
@@ -374,6 +379,10 @@ __device__ __forceinline__ void finish_split(const __nv_bfloat16* x, const float
   const int64_t r = blockIdx.x;
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
   const __nv_bfloat16* row = x + r * S * D;
+  // Dependent launch (decode windows, Set.pdl_hc): both warp roles read earlier grids' rows (warp 0 the partials,
+  // warps 1..7 x), so every thread waits first, before any read or store; then the next grid may launch.
+  pdl_wait();
+  pdl_trigger();
   if (warp == 0) {
     const float* p = part + r * NB * 32;
     float mix = 0.0f, ss = 0.0f;
