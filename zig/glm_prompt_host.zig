@@ -225,7 +225,8 @@ test "GLM prompt workflow: context window cut preserves sequence positions indep
     try t.expectEqual(@as(u64, 2000 + 11 * dr.TAP_ROW), shifted.taps);
     try t.expectEqual(@as(?dr.Run, null), try dr.promptRun(1000, 2000, 0, 2048, 5000, 0));
     try t.expectError(error.BadPromptContext, dr.promptRun(0, 0, 9, 2, 10, 0));
-    try t.expectError(error.DrafterContextTooWide, dr.promptRun(0, 0, 0, 5, 5, 2044));
+    try t.expect((try dr.promptRun(0, 0, 0, 5, 5, dr.MAX_CTX - 5)) != null);
+    try t.expectError(error.DrafterContextTooWide, dr.promptRun(0, 0, 0, 5, 5, dr.MAX_CTX - 4));
 }
 
 test "GLM prompt workflow: both ranks share exact packets and reject malformed batches" {

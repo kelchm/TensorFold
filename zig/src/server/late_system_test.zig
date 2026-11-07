@@ -162,8 +162,45 @@ fn exchangeAs(srv: *server.Server, method: []const u8, path: []const u8, body: [
     defer arena.deinit();
     const a = arena.allocator();
     if (try conn.readRequest(a, false) != .ready) return error.BadRequest;
-    routes.dispatch(srv, &conn, a);
-    const raw = try readReady(std.testing.allocator, pair[0]);
+    // Drain concurrently: an unread Unix socket can fill after only a few
+    // dozen SSE writes, turning a fixture's long reply into a write timeout.
+    const Reader = struct {
+        fd: platform.posix.socket_t,
+        data: []u8 = &.{},
+        failure: ?anyerror = null,
+        fn run(r: *@This()) void {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(std.heap.page_allocator);
+            var buffer: [4096]u8 = undefined;
+            while (true) {
+                const n = platform.posix.read(r.fd, &buffer) catch |err| {
+                    r.failure = err;
+                    return;
+                };
+                if (n == 0) break;
+                out.appendSlice(std.heap.page_allocator, buffer[0..n]) catch |err| {
+                    r.failure = err;
+                    return;
+                };
+            }
+            r.data = out.toOwnedSlice(std.heap.page_allocator) catch |err| {
+                r.failure = err;
+                return;
+            };
+        }
+    };
+    var reader: Reader = .{ .fd = pair[0] };
+    {
+        const thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+        defer {
+            _ = platform.posix.system.shutdown(pair[1], platform.posix.SHUT.WR);
+            thread.join();
+        }
+        routes.dispatch(srv, &conn, a);
+    }
+    defer std.heap.page_allocator.free(reader.data);
+    if (reader.failure) |err| return err;
+    const raw = try std.testing.allocator.dupe(u8, reader.data);
     errdefer std.testing.allocator.free(raw);
     const split = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.BadReply;
     const status = std.fmt.parseInt(u16, raw["HTTP/1.1 ".len..][0..3], 10) catch return error.BadReply;
