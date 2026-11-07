@@ -10,6 +10,7 @@ from tools.perf.glm_replay.common import ReplayError, file_digest, read_json, wr
 from tools.perf.glm_replay.fixture import load_fixture, seal_fixture
 from tools.perf.glm_replay.python_campaign import preflight_campaign, run_campaign
 from tools.perf.glm_replay.python_provenance import gate_binding
+from tools.perf.glm_replay.tests.python_evidence_doubles import CaptureRuntime, produced_validation
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -19,7 +20,7 @@ class CampaignTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.campaign = {"schema": "glm-replay-python-campaign-v1", "status": "ready", "arm": "P",
+        self.campaign = {"schema": "glm-replay-python-campaign-v2", "status": "ready", "arm": "P",
                          "run_id": "host-double", "pair_id": "host-pair", "start_id": "one-real-session",
                          "start_order": 0, "cases": []}
         self.fixtures, self.metadata = [], []
@@ -41,7 +42,7 @@ class CampaignTests(unittest.TestCase):
             self.metadata.append(meta)
             self.campaign["cases"].append({"fixture": {}, "metadata": {},
                 "blocks": [{"block_id": f"case-{i}-block-{j}",
-                            "telemetry": {"path": f"telemetry-{i}-{j}.json", "sha256": "3" * 64}}
+                            "telemetry": {"path": f"telemetry-{i}-{j}.json"}}
                            for j in range(5)]})
         self.path = self.root / "campaign.json"
         self.save()
@@ -65,7 +66,7 @@ class CampaignTests(unittest.TestCase):
     def test_all_cases_and_blocks_prevalidated_with_one_graph_bank(self):
         _, cases, report = self.preflight()
         self.assertEqual((report["cases"], report["blocks"]), (2, 10))
-        self.assertEqual(report["graph_rows"], [1, 4, 8, 16, 32])
+        self.assertEqual(report["graph_rows"], list(range(1, 33)))
         self.assertEqual(len(cases), 2)
         self.assertEqual(report["hardware_checks"], "unrun")
 
@@ -95,10 +96,10 @@ class CampaignTests(unittest.TestCase):
         with self.assertRaisesRegex(ReplayError, "genuine process-start"):
             self.preflight()
 
-    def test_duplicate_block_ids_across_cells_are_refused(self):
-        self.campaign["cases"][1]["blocks"][0]["block_id"] = "case-0-block-0"
+    def test_duplicate_block_ids_within_a_cell_are_refused(self):
+        self.campaign["cases"][0]["blocks"][1]["block_id"] = "case-0-block-0"
         self.save()
-        with self.assertRaisesRegex(ReplayError, "duplicate/invalid block"):
+        with self.assertRaisesRegex(ReplayError, "duplicate/invalid cell/block"):
             self.preflight()
 
     def test_integer_block_id_is_not_silently_coerced(self):
@@ -113,17 +114,20 @@ class CampaignTests(unittest.TestCase):
         with self.assertRaisesRegex(ReplayError, "unsafe telemetry path"):
             self.preflight()
 
-    def test_validation_keeps_unknown_future_telemetry_hash_unrun(self):
-        self.campaign["cases"][0]["blocks"][0]["telemetry"]["sha256"] = None
+    def test_future_telemetry_reference_refuses_prehashed_stubs(self):
+        self.campaign["cases"][0]["blocks"][0]["telemetry"]["sha256"] = "3" * 64
         self.save()
-        _, _, report = self.preflight()
-        self.assertEqual(report["hardware_checks"], "unrun")
+        with self.assertRaisesRegex(ReplayError, "future telemetry reference"):
+            self.preflight()
 
     def test_measurement_needs_five_blocks_in_each_cell(self):
         self.campaign["cases"][0]["blocks"].pop()
         self.save()
-        with self.assertRaisesRegex(ReplayError, "at least five"):
-            self.preflight(mode="measure")
+        with patch("tools.perf.glm_replay.python_campaign.artifact_receipt",
+                   return_value={"bindings": {"runtime_sha256": "5" * 64}}), \
+             patch("tools.perf.glm_replay.python_campaign.measurement_gates", return_value={}):
+            with self.assertRaisesRegex(ReplayError, "at least five"):
+                self.preflight(mode="measure")
 
     def test_unrun_later_gate_cannot_start_measurement(self):
         with patch("tools.perf.glm_replay.python_campaign.artifact_receipt",
@@ -132,6 +136,81 @@ class CampaignTests(unittest.TestCase):
                        side_effect=ReplayError("unrun hardware gate")):
                 with self.assertRaisesRegex(ReplayError, "unrun hardware"):
                     self.preflight(mode="measure")
+
+    def interleave(self):
+        first, second = self.campaign["cases"]
+        self.campaign["cases"] = [{**first, "blocks": first["blocks"][:2]}, second,
+                                  {**first, "blocks": first["blocks"][2:]}]
+        write_json(self.path, self.campaign)
+
+    def test_cell_may_repeat_in_order_with_total_replication_across_entries(self):
+        self.interleave()
+        with patch("tools.perf.glm_replay.python_campaign.artifact_receipt",
+                   return_value={"bindings": {"runtime_sha256": "5" * 64}}), \
+             patch("tools.perf.glm_replay.python_campaign.measurement_gates", return_value={}):
+            _, cases, report = self.preflight("measure")
+        self.assertEqual([c["metadata"]["ids"]["cell_id"] for c in cases], ["cell-0", "cell-1", "cell-0"])
+        self.assertEqual(report["blocks"], 10)
+
+    def test_cell_fixture_mapping_cannot_change_in_later_entry(self):
+        self.metadata[1]["ids"]["cell_id"] = "cell-0"
+        self.save()
+        with self.assertRaisesRegex(ReplayError, "cell changed fixture"):
+            self.preflight()
+
+    def test_block_id_can_repeat_in_distinct_cells(self):
+        self.campaign["cases"][1]["blocks"][0]["block_id"] = "case-0-block-0"
+        self.save()
+        _, _, report = self.preflight()
+        self.assertEqual(report["blocks"], 10)
+
+    def test_reused_telemetry_paths_are_refused(self):
+        self.campaign["cases"][1]["blocks"][0]["telemetry"] = self.campaign["cases"][0]["blocks"][0]["telemetry"]
+        self.save()
+        with self.assertRaisesRegex(ReplayError, "reused telemetry"):
+            self.preflight()
+
+    def validation_loop(self, fail_second=False):
+        campaign, cases, report = self.preflight()
+        created, calls = [], []
+        class FakeRuntime(CaptureRuntime):
+            def __init__(self, fixture, meta, roots, rank, master, port, report, **kwargs):
+                super().__init__(fixture, meta, rank)
+                created.append(kwargs)
+            def select_case(self, fixture, meta):
+                self.fixture, self.meta = fixture, meta
+        def validate(runtime, binding):
+            calls.append(runtime.fixture["fixture_sha256"])
+            if fail_second and len(calls) == 2:
+                raise ReplayError("planted later device failure")
+            return produced_validation(runtime.fixture, runtime.meta)
+        args = SimpleNamespace(output=str(self.root / "validations"), source_root="unused", rank=0,
+            master="reserved.invalid", port=12345, mode="validate", receipts_root=self.root)
+        with patch("tools.perf.glm_replay.python_runtime.Runtime", FakeRuntime), \
+             patch("tools.perf.glm_replay.python_runtime.exchange"), \
+             patch("tools.perf.glm_replay.python_provenance.install_import_boundary"), \
+             patch("tools.perf.glm_replay.python_validation.validate_device", side_effect=validate):
+            if fail_second:
+                with self.assertRaisesRegex(ReplayError, "planted later"):
+                    run_campaign(args, campaign, cases, report, {})
+            else:
+                run_campaign(args, campaign, cases, report, {})
+        return created, calls
+
+    def test_later_failure_preserves_prior_exclusively_published_validation(self):
+        _, calls = self.validation_loop(fail_second=True)
+        paths = list((self.root / "validations").glob("*.json"))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(read_json(paths[0])["bindings"]["fixture_sha256"], calls[0])
+
+    def test_interleaved_duplicate_validation_reuses_authenticated_successful_receipt(self):
+        self.interleave()
+        created, calls = self.validation_loop()
+        self.assertEqual(len(created), 1)
+        self.assertEqual(len(created[0]["fixtures"]), 2)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(list((self.root / "validations").glob("*.json"))), 2)
 
     def test_case_loop_uses_one_engine_and_exact_block_strings_in_one_start(self):
         campaign, cases, report = self.preflight()
@@ -148,13 +227,9 @@ class CampaignTests(unittest.TestCase):
             def run(self, enabled):
                 runs.append(copy.deepcopy(self.meta["ids"]))
                 return {}
-        def telemetry(spec, root):
-            i, j = [int(v) for v in Path(spec["path"]).stem.split("-")[1:]]
-            return {"bindings": gate_binding(cases[i]["fixture"], cases[i]["metadata"], "5" * 64),
-                    "completed_ranks": [0, 1], "block_id": f"case-{i}-block-{j}"}
         args = SimpleNamespace(output=str(self.root / "results.jsonl"), source_root="unused",
                                rank=0, master="reserved.invalid", port=12345, mode="measure", receipts_root=self.root)
-        def records(runtime, record):
+        def records(runtime, record, anchor):
             return [{**runtime.meta["ids"], "rank": r} for r in (0, 1)]
         def measured(runtime, checks, root):
             runtime.run(enabled=True)
@@ -165,7 +240,7 @@ class CampaignTests(unittest.TestCase):
              patch("tools.perf.glm_replay.results.CONFIG_FIELDS", "runtime_sha256"), \
              patch("tools.perf.glm_replay.results.RECORD_FIELDS", "timing_source"), \
              patch("tools.perf.glm_replay.python_campaign.measurement_gates", return_value={}), \
-             patch("tools.perf.glm_replay.python_campaign.artifact_receipt", side_effect=telemetry), \
+             patch("tools.perf.glm_replay.python_receipts.block_telemetry", return_value="3" * 64), \
              patch("tools.perf.glm_replay.python_receipts.build_record", return_value={}), \
              patch("tools.perf.glm_replay.python_receipts.measure_block", side_effect=measured), \
              patch("tools.perf.glm_replay.python_receipts.retain_anchor"), \

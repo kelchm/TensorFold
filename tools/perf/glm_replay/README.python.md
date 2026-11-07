@@ -7,10 +7,13 @@ Native A/B remains the primary sharding comparison. A native raw verify call inc
 selection/readback; a Python raw forward call does not. Their raw timings are not equivalent.
 
 **Status: host implementation and host doubles only. All device, TP transport, correctness,
-timing neutrality, default-server neutrality, physical-fit and performance gates are unrun.**
+timing neutrality, installed-source equivalence, physical-fit and performance gates are unrun.**
 No campaign fixtures, model assets or hardware gate passes ship here. Host tests cannot
-qualify device behavior. The parent must integrate `runtime_sha256`, `timing_source` and
-the shared server gate validator before device mode starts. No frozen engine patch is required.
+qualify device behavior. Arm P has no instrumented server: its server comparison is explicitly
+not applicable, conditional on frozen imports and full both-rank installed-source equivalence.
+Common authenticated-anchor and process-start provenance integration is required before device mode.
+Finish host work, then the workload/served screens in [DECISION.md](DECISION.md), before deciding
+on a full hardware campaign. No frozen engine patch is required.
 
 ## Host commands
 
@@ -33,8 +36,8 @@ prose fixture, with device status explicitly unrun. Synthetic fixtures are refus
 
 `python_sources.json` pins all 439 files in the inspected frozen `src/tensorfold` tree.
 Seven entries retain the earlier installed-manifest match. `segments.py`, `pool.py`, `l2pf.py`
-and every other newly pinned dependency remain **local-source-only**, requiring hardware
-qualification; the adapter does not invent earlier installed hashes. Paths are relative.
+and every other newly pinned dependency remain **local-source-only**, requiring retained complete
+installed-image listings from both ranks; the adapter does not invent earlier installed hashes. Paths are relative.
 Missing, changed, added, escaped or symlinked files fail closed. Imports are restricted to
 the verified tree, rehashed at import and compiled from source without reading cached bytecode
 or writing bytecode into the frozen tree. An already-imported torch/engine is refused.
@@ -42,8 +45,8 @@ or writing bytecode into the frozen tree. An already-imported torch/engine is re
 ## Metadata and provenance
 
 `python_metadata.example.json`, `python_validation.example.json` and
-`python_gate.example.json` and `python_server_gate.example.json` are **unrun templates** with null unknown
-identities. They cannot pass preflight or authorize device measurement. Populate a new
+`python_gate.example.json`, `python_activation.example.json` and `python_qualification.example.json`
+are **unrun templates** with null unknown identities. They cannot pass preflight or authorize device measurement. Populate a new
 metadata file from independently verified local evidence; never relabel an example as pass.
 
 Ready metadata binds the four common fixture hashes, pinned engine/kit/device identities,
@@ -88,7 +91,11 @@ the source tree, checkpoints, artifact identities, loaded native Python modules,
 module flags, actual transport class/limit, split settings, Torch/CUDA/cuDNN, numerical
 flags, loaded weight config, graph keys, and real production pool layout. It contains no
 sharding treatment in this off-only contextual arm. It is the same combined hash on both
-ranks and must match all validation/default-server/hardware receipts and common results.
+ranks and must match all validation/qualification receipts and common results. A fresh random
+`session_nonce` is agreed through the bootstrap store per real Runtime, outside this stable hash.
+Results and phase anchors also bind the actual ordered `campaign_sha256` (single-run: `digest(meta)`)
+and `checkpoints={scheme:"file-manifest-v1",target:[rank0,rank1],drafter:[rank0,rank1]}`. Each
+checkpoint digest hashes that role/rank's already verified file-manifest array. `layout_checks=0` for P.
 
 ## Device entry point, not executed by host checks
 
@@ -108,8 +115,11 @@ python3 -m tools.perf.glm_replay.python_adapter gpu-run CAMPAIGN.json \
 Every local fixture/config/source/checkpoint/artifact check precedes GPU import. The two
 ranks then agree fixture, source and metadata identities through the production NCCL
 bootstrap store before weights or inference. Both execute the same prescribed schedule
-symmetrically with production NCCL/RoCE, normal split connection warmup, loaders and engine
-initialization. There is no fake communicator or alternate follower implementation.
+symmetrically with production NCCL/RoCE, split connection warmup and loaders. The NCCL barrier
+precedes RoCE construction, matching production. Startup derives prefill rows from the actual
+`tensorfold.cuda.geometry.PREFILL_ROWS`/`TF_GLM_PREFILL_ROWS` and calls the frozen
+`engine.prompt_grid(rows)`, refusing metadata disagreement. Nonzero `display_kv.credit()` is
+refused, rather than silently discarded. There is no fake communicator or alternate follower implementation.
 
 The path is `Segment -> BatchedVerify.forward -> multi.sample_streams(..., None) ->
 BatchedVerify.commit -> MultiDrafter.commit([(context, taps[:keep]), ...])`. Selection includes
@@ -119,8 +129,9 @@ the production tap staging, FC/norm/KV computation and live ring writes. A faile
 cannot be reused. Guards refuse proposal entry points; stale positions or lost/incomplete
 context prevent a result rather than being counted as successful work.
 
-Capture keys are total offered rows: solo 1/4/8, shared 4/16/32, plus all preparation/unequal
-widths. Four-row preparation and the one-row reference are included. Every measured forward
+Capture calls the real `BatchedVerify.capture()` without a subset argument, preserving the full
+production bank **1 through 32** and its graph pool. All needed solo/shared/preparation/unequal
+widths must be a subset of that actual bank, which is bound in the runtime fingerprint. Every measured forward
 requires one actual graph replay and zero eager fallbacks. Production drafter allocation
 and both block/tap graph captures remain present, although the proposer is never called.
 
@@ -149,17 +160,25 @@ Their kept outputs and final state are checked after completion against oracle-v
 captures. Actual inline logical evidence is canonically SHA-bound and rehashed by the
 measurement gate; passing booleans without this evidence cannot authorize measurement.
 
-A generated validation receipt can mark only its fixture correctness, fresh-prefill and
-timing-neutrality checks as passed after actual device execution. It leaves default-server
-and general hardware qualification **unrun**. Measurement requires that receipt plus an
-independently retained hardware gate for production transport/kernel bundle, full/partial,
-solo/shared, permutations, page edges, repeated resets and owner-swap coverage. Correctness
-and hardware gates bind fixture/config/source, checkpoint, runtime and **arm P**.
-The separate server-neutrality artifact binds actual original/instrumented server binaries,
-harness commit, fatbin, token evidence and a predeclared performance policy. It does not
-equate server identities with the replay interpreter or runtime. Its deferred shared API is
-`server_neutrality.validate_server_gate(artifact, source, "python", roots=...)`.
-These gates are not cross-engine q8/q4 equality claims.
+A generated `glm-replay-python-validation-v2` receipt marks only its fixture correctness,
+fresh-prefill and timing-neutrality after actual device execution. It records the actual number
+of discarded rows poisoned in each run: zero on full-keep fixtures, positive exactly when partial
+coverage exists. Retained evidence includes typed initial states, one-row oracle captures,
+kept/final output hashes, dispatch and repeated/timed/unsynchronized run digests. The offline
+validator rechecks these hashes, positions, per-row types/counts, oracle agreement and graph/commit
+counts; old opaque or boolean-only receipts are refused.
+
+`default_server_neutral` is exactly **`not_applicable_unmodified_engine`**, never `true`, for P.
+Metadata v2 requires `server_gate=null`. No Python call uses `server_neutrality.py`. Measurement
+requires all 439 pinned source files to match both installed-image listings in the qualification
+below. Native still requires its actual server-neutrality gate. These gates do not claim q8/q4 equality.
+
+Production startup deviations are explicit and included in the runtime fingerprint. Fixed equal
+capacity and all-slot reservations replace production `admit`/automatic cache budgeting; physical
+fit is UNRUN. Full launch/environment store agreement and actual both-rank fingerprints replace
+server-specific settings/spill gathers. `GlmEngine._calibrate()` is omitted because it invokes
+`Drafter.propose`, forbidden here; no scheduler or draft-choice cost table is instantiated. Disposable
+fixed-work warmup remains. This is not a claim to reproduce all normal server startup work.
 
 Use `--mode measure` with the same metadata bindings, populated validation/external gate
 artifact references and a separate new output path. It performs disposable warmup followed
@@ -167,11 +186,38 @@ by another fresh block. `Runtime.run()` can repeat fresh blocks within one proce
 the `gpu-run` pilot emits one block. The campaign loop supplies distinct block IDs and
 external telemetry per block, preserving process-start identity across those calls.
 
-An external telemetry artifact is read/hashed only after both ranks finish the block. It
-must bind this runtime/fixture/arm and block ID and identify both ranks. The campaign caller
-must arrange for this receipt to exist before finalization; the adapter does not scrape
-telemetry or invent zero temperatures/footprints. Missing evidence fails without a complete
-measurement output. External gates/evidence live beneath `--receipts-root` and are hashed.
+Future telemetry references contain **only** `{"path":"blocks/cell-block.json"}`. Paths are
+canonical POSIX paths relative to `--receipts-root`; absolute, escaped, symlinked, reused and
+pre-existing measurement destinations are refused. No future telemetry SHA is predeclared.
+Both rank realtime start/end timestamps are read outside the timed headline; after completion
+the ranks exchange their windows. Rank 0 writes an exclusive `<path>.window.json` request for
+a future external controller. Only then does each rank wait (30 seconds, at most 60 via API),
+read actual telemetry, compute its file-byte SHA and agree that SHA across ranks.
+
+`telemetry.py` is a pure host parser with no device imports. Its API is:
+
+- `block_window(bindings, ids, ranks, session_nonce, campaign_sha256, checkpoints)` validates a request.
+- `reference(spec, root)` validates a path-only future reference; `write_request(spec, root, window)` writes exclusively.
+- `validate_telemetry(value, window)` rechecks the typed payload and coverage.
+- `wait_telemetry(spec, root, window, timeout_s=30, expected_sha256=None)` returns `(value, computed_file_sha256)`;
+  an optional known SHA is checked only for later offline authentication.
+
+`glm-replay-block-window-v1` has exactly `schema,bindings,ids,completed_ranks,ranks,session_nonce,
+campaign_sha256,checkpoints`. Bindings are the exact `gate_binding` object: fixture/config/schedule/
+tokens SHA256, arm, source SHA256, source-tree SHA256, runtime SHA256 and checkpoints SHA256.
+IDs are run/pair/start/order/cell/block. Ranks are ordered `[0,1]`, each exactly
+`{rank,realtime_start_ns,realtime_end_ns}` with positive ordered integer nanoseconds.
+
+`glm-replay-telemetry-v1` has exactly `schema,status,window_sha256,bindings,ids,completed_ranks,
+ranks,session_nonce,campaign_sha256,checkpoints`. Status is `measured`; `window_sha256` is the
+canonical `digest(window)`, not the request-file SHA. All identities must match. Each ordered rank
+contains exactly `rank,device_uuid,realtime_start_ns,realtime_end_ns,max_sample_gap_ns,samples`.
+Device UUIDs must match activation evidence. Each sample has exactly `realtime_ns,sm_clock_mhz,
+memory_clock_mhz,temperature_millicelsius,power_milliwatts,used_memory_bytes`, all integers with
+positive clocks/power/memory and temperature 0–150000. Samples must increase, bracket that rank's
+window, include an in-window sample and have gaps no greater than the declared maximum, itself
+at most five seconds. Empty prewritten stubs cannot qualify. Missing/invalid telemetry leaves
+the block incomplete; no telemetry collector or controller is implemented or run here.
 
 The primary metric is both-rank-completed replay-block wall time, never generation rate.
 The headline runs with the observer **off**. A separate fresh identical-work observer-on
@@ -202,8 +248,81 @@ unmeasured tables/scratch/other/physical peak are null. Existing files are never
 
 The module/API split is `python_provenance.preflight`, `python_runtime.Runtime`,
 `python_control.Controller`, `python_validation.validate_device`, and
-`python_receipts.{measurement_gates,build_record,publish_local}`. All are external tools;
+`python_receipts.{measurement_gates,build_record,publish_local}`. `collect_records(runtime,record,anchor)`
+and `publish_local(runtime,output,record,anchor)` pass the actual canonical anchor bytes to common
+`validate_results(...,anchors={sha:canonical_bytes(anchor)+b"\n"})` before publication. All are external tools;
 no native source or common schema ownership moves to this adapter.
+
+## Offline suite qualification
+
+`python_qualification.build_qualification(entries,activation,installed_sources,fixture,meta,runtime_sha256,root)`
+reopens and authenticates every reference. `validate_qualification(value,fixture,meta,runtime_sha256,root)`
+rebuilds the same result. Default APIs refuse synthetic fixtures; the explicit host-test opt-in does
+not change device entry points. No deployed installed-image listing or activation record is retained
+or claimed here, so real qualification remains **UNRUN**.
+
+Each suite entry is exactly `{"fixture":{"path":...,"sha256":...},"validation":{"path":...,"sha256":...}}`.
+Fixture files are immutable, byte-hashed and revalidated by the common parser. Each actual v2
+validation receipt is rechecked with that fixture and common source/tree/runtime/checkpoints.
+Both rank runtime digests must agree across the suite. The measured fixture must appear. Coverage
+is derived across the suite: solo/shared participation, full/partial forwards, multiple ordered
+permutations of the same participating stream set, committed 512-token page crossings and actual
+repeated-reset evidence. `owner_swap` is inapplicable to unsharded P and is absent. No individual
+solo fixture must attest shared or partial work it did not execute.
+
+The output `glm-replay-python-qualification-v2` has exactly `schema,status,bindings,completed_ranks,
+suite,coverage,activation,installed_sources`. Bindings are the common arm/source/source-tree/runtime/
+checkpoints subset of `gate_binding`. It has no coverage or hardware booleans supplied by the caller.
+The emitted coverage is recomputed on every validation. All retained evidence paths resolve
+beneath the receipts root, including the kernel bundle and its members; retain immutable copies
+at the metadata's same relative artifact paths when the artifact root differs.
+
+`installed_sources` is exactly two rank-ordered path/SHA references. Each
+`glm-replay-python-installed-source-v1` contains exactly `schema,status,rank,source,source_tree_sha256,files`.
+Status is `listed`; the entire source object (including engine, kit, interpreter/compiler/kernel and
+image/device-image identities) must equal measured metadata. The ordered file listing must match
+**all 439** pinned paths, byte counts and SHA256s, including source-only dependencies. Seven-file
+listings, missing entries or a mismatch on either rank fail. This driver-free command hashes an
+already extracted installed-image tree. The coordinator must establish the extraction/image
+identity; pointing it at a source checkout does not establish installed-image provenance.
+
+```sh
+python3 -m tools.perf.glm_replay.python_qualification installed-list \
+  --installed-root EXTRACTED_IMAGE/src/tensorfold --metadata READY_METADATA.json --rank RANK \
+  --image-digest sha256:ACTUAL_IMAGE_SHA256 --device-image-digest sha256:ACTUAL_DEVICE_IMAGE_SHA256 \
+  --output RECEIPTS/installed-rank-RANK.json
+```
+
+`activation` is a retained `glm-replay-python-activation-v1` observation, with exactly
+`schema,status,execution,bindings,completed_ranks,ranks`. It requires `status=observed,execution=device`.
+Each rank binds `rank,runtime_rank_sha256,source,environment,device,transport,kernels`. Environment
+must pass the adapter's production constraints and hash to that rank's launch environment.
+Device has UUID, PCI bus ID, compute capability and driver version; rank UUIDs must differ.
+Transport has the actual `kind`, production implementation/bootstrap class, TP world/peer, positive
+observed all-gather/barrier counts and send/receive bytes, and observed route-device names. The peer
+and transport mode must match that rank and environment. Kernels bind the exact retained bundle
+and each compiled artifact's path/bytes/SHA with nonempty launched symbols and positive observed
+launch counts; the observed set must equal the complete bundle. These are typed external
+observations, not an arbitrary JSON attachment or `production_transport=true`.
+
+The coordinator must collect actual loaded-kernel/transport observations in a later authorized
+device window. This host adapter neither observes those activations nor turns source inspection
+into a pass. `python_activation.example.json` remains UNRUN; nulls, empty launches, generic flags,
+host execution and stale runtime/source/image identities are rejected. The following offline
+producer is reproducible after actual evidence exists; running it with the shipped templates
+refuses qualification and cannot unblock measurement:
+
+```sh
+python3 -m tools.perf.glm_replay.python_qualification build \
+  --request QUALIFICATION_REQUEST.json --fixture MEASURED_FIXTURE.json --metadata READY_METADATA.json \
+  --runtime-sha256 ACTUAL_COMBINED_RUNTIME_SHA256 --receipts-root RECEIPTS --output RECEIPTS/hardware.json
+```
+
+The request is exactly `suite,activation,installed_sources`, as illustrated by the refusing template
+`python_qualification.example.json`. Outputs are exclusive. Authenticating hashes protects retained
+bytes and bindings; it does not independently prove the truth of an external controller's device
+observations. The later controller/activation collection remains a required, unimplemented part
+of hardware qualification. The workload/served screens and user decision still precede a full campaign.
 
 ## One-session campaigns
 
@@ -212,8 +331,9 @@ process start. `gpu-run` remains a single-block pilot. The campaign is a prevali
 ordered developer case/block list; it does not choose tokens, acceptance or scheduling policy.
 `python_campaign.example.json` is an unrun template with relative fixture/metadata references.
 Each reference hashes the exact file bytes, while each fixture also carries its canonical
-common hashes. Each block has its explicit unique string `block_id` and external telemetry
-artifact reference. Metadata carries the cell ID and the same genuine run/pair/start/order
+common hashes. Each block has an explicit string `block_id` and path-only future telemetry reference.
+A cell may recur in multiple entries for interleaved drift anchors. The cell-to-fixture map is
+stable and `(cell_id,block_id)` is unique; different cells may reuse a block string. Metadata carries the cell ID and the same genuine run/pair/start/order
 as the top-level campaign; those identifiers cannot change between cases.
 
 ```sh
@@ -225,14 +345,16 @@ python3 -m tools.perf.glm_replay.python_adapter campaign CAMPAIGN_LIST.json \
 
 For an independently authorized device window, add the existing bootstrap `--master` and
 `--port`, choose `--mode validate` or `--mode measure`, and supply a new `--output` path.
-Validate writes a new directory containing one bound validation JSON artifact per fixture.
+Validate writes each successful fixture receipt exclusively and immediately into a new directory.
+A later failure preserves earlier successes. Duplicate fixture entries in the same run reuse the
+retained success after revalidation and byte comparison, without a second run or overwrite.
 Measure writes common rank JSONL. Both ranks must consume the same ordered campaign file.
 
 All case files, fixture schedules, metadata, shared identities and measurement gates are
 checked before torch import. Shared source/checkpoint/artifact files are hashed once after
 all cases prove they refer to the same identity. Measurement requires at least five blocks
-in **each** case, and all case gates must name the same combined runtime hash. Every case
-uses fixed H, configured capacity, checkpoint/load/transport configuration and one union
+per **cell/start in total across ordered entries**, and all case gates must name the same combined runtime hash. Every case
+uses fixed H, configured capacity, checkpoint/load/transport configuration and the full production
 graph bank. The production pool reserves the maximum aligned extent required by each slot
 across the entire campaign; that joint reservation must fit before startup.
 

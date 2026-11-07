@@ -47,20 +47,24 @@ class Frame:
     context_commits: int = 0
     ingest_calls: int = 0
     lost: int = 0
+    poisoned_rows: int = 0
 
 
 def frames(fixture, schedule, states, segment_type, poison=False):
     out = []
     for forward in schedule:
         segments = [segment_type(states[p["stream_id"]], offered_tokens(fixture, p)) for p in forward["parts"]]
+        poisoned = 0
         if poison:
             vocab = fixture["provenance"]["tokenizer"]["vocab_size"]
             require(vocab > 1, "lookahead poisoning requires at least two tokens")
             for seg, part in zip(segments, forward["parts"]):
                 for row in range(part["kept"], part["offered"]):
                     seg.tokens[row] = (seg.tokens[row] + 1) % vocab
+                    poisoned += 1
         out.append(Frame(forward, segments, [p["kept"] for p in forward["parts"]],
-                         [list(range(p["position"], p["position"] + p["offered"])) for p in forward["parts"]]))
+                         [list(range(p["position"] + 1, p["position"] + 1 + p["offered"]))
+                          for p in forward["parts"]], poisoned_rows=poisoned))
     return out
 
 
@@ -136,7 +140,7 @@ class Controller:
             require(ctx.context_end == seg.st.pos, "stale/lost drafter context before forward")
             require(len(seg.tokens) == part["offered"] and keep == part["kept"]
                     and 1 <= keep <= len(seg.tokens), "invalid replay keep/window")
-            require(positions == list(range(part["position"], part["position"] + part["offered"])),
+            require(positions == list(range(part["position"] + 1, part["position"] + 1 + part["offered"])),
                     "selection position vector differs from prescribed rows")
             contexts.append(ctx)
         before = dict(self.verifier.replays) if graph else None

@@ -1,0 +1,77 @@
+{
+  "bindings": null,
+  "completed_ranks": [],
+  "execution": "unrun",
+  "ranks": [
+    {
+      "device": {
+        "compute_capability": null,
+        "driver_version": null,
+        "pci_bus_id": null,
+        "uuid": null
+      },
+      "environment": null,
+      "kernels": {
+        "bundle": {
+          "bytes": null,
+          "path": "compiled/kernels.json",
+          "sha256": null
+        },
+        "loaded": []
+      },
+      "rank": 0,
+      "runtime_rank_sha256": null,
+      "source": null,
+      "transport": {
+        "bootstrap": "tensorfold.cuda.comm.NCCL",
+        "collective_counts": {
+          "all_gather": null,
+          "barrier": null
+        },
+        "implementation": null,
+        "kind": null,
+        "peer_rank": 1,
+        "received_bytes": null,
+        "route_devices": [],
+        "sent_bytes": null,
+        "world": 2
+      }
+    },
+    {
+      "device": {
+        "compute_capability": null,
+        "driver_version": null,
+        "pci_bus_id": null,
+        "uuid": null
+      },
+      "environment": null,
+      "kernels": {
+        "bundle": {
+          "bytes": null,
+          "path": "compiled/kernels.json",
+          "sha256": null
+        },
+        "loaded": []
+      },
+      "rank": 1,
+      "runtime_rank_sha256": null,
+      "source": null,
+      "transport": {
+        "bootstrap": "tensorfold.cuda.comm.NCCL",
+        "collective_counts": {
+          "all_gather": null,
+          "barrier": null
+        },
+        "implementation": null,
+        "kind": null,
+        "peer_rank": 0,
+        "received_bytes": null,
+        "route_devices": [],
+        "sent_bytes": null,
+        "world": 2
+      }
+    }
+  ],
+  "schema": "glm-replay-python-activation-v1",
+  "status": "unrun"
+}

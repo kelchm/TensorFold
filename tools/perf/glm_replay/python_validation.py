@@ -90,6 +90,8 @@ def compare_oracle(fixture, batched, oracle, initial_states=None):
 
 
 def validate_device(runtime, binding):
+    from .python_evidence import VALIDATION_SCHEMA, fixture_coverage
+
     baseline = runtime.run(enabled=False, capture=True, poison=True)
     repeated = runtime.run(enabled=False, capture=True, poison=True)
     timed = runtime.run(enabled=True, capture=True, poison=True)
@@ -99,18 +101,25 @@ def validate_device(runtime, binding):
     require(baseline["snapshots"] == repeated["snapshots"], "fresh reset/repeated-run state mismatch")
     require(baseline["snapshots"] == timed["snapshots"], "timing changed outputs or logical state")
     def dispatch(run):
-        return [(f.graph_replays, f.eager_fallbacks, f.target_commits, f.context_commits, f.ingest_calls)
+        return [[f.graph_replays, f.eager_fallbacks, f.target_commits, f.context_commits, f.ingest_calls]
                 for f in run["frames"]]
     require(dispatch(baseline) == dispatch(repeated) == dispatch(timed), "timing changed dispatch/context lifecycle")
+    runs = [("baseline", baseline), ("repeat", repeated), ("timed", timed)]
     for poison in (True, False):
         whole = runtime.run(enabled=False, poison=poison, final_capture=True)
         require(whole["kept_outputs"] == baseline["kept_outputs"], "unsynchronized schedule changed kept outputs")
         require(whole["final"] == baseline["snapshots"][-1], "unsynchronized schedule changed final state/taps/logits")
         require(dispatch(whole) == dispatch(baseline), "unsynchronized schedule changed dispatch")
+        runs.append(("poisoned_whole" if poison else "natural_whole", whole))
+    retained_runs = [{"name": name, "snapshots_sha256": digest(run["snapshots"]) if not name.endswith("whole") else None,
+                      "dispatch_sha256": digest(dispatch(run)), "kept_outputs_sha256": digest(run["kept_outputs"]),
+                      "final_sha256": digest(run["final"] if name.endswith("whole") else run["snapshots"][-1]),
+                      "poisoned_rows": run["poisoned_rows"]} for name, run in runs]
     evidence = {"initial_states": baseline["initial_states"], "validated_forwards": baseline["snapshots"],
+                "oracle_initial_states": oracle["initial_states"],
                 "oracle_rows": oracle["snapshots"], "expected_kept_outputs": baseline["kept_outputs"],
                 "expected_final": baseline["snapshots"][-1], "dispatch": dispatch(baseline),
-                "poisoned_lookahead": True, "unsynchronized_poisoned_and_natural": True}
+                "poisoned_rows": baseline["poisoned_rows"], "runs": retained_runs}
     rank_receipt = {"rank": runtime.rank, "status": "pass", "snapshot_sha256": digest(baseline["snapshots"]),
                     "oracle_sha256": digest(oracle["snapshots"]), "dispatch_sha256": digest(dispatch(baseline)),
                     "runtime_rank_sha256": runtime.runtime_ranks[runtime.rank],
@@ -118,14 +127,14 @@ def validate_device(runtime, binding):
     ranks = exchange(runtime.nccl.store, f"validation/{runtime.block_number}", runtime.rank, rank_receipt)
     require([r["rank"] for r in ranks] == [0, 1] and all(r["status"] == "pass" for r in ranks),
             "device validation missing peer completion")
-    logical = {"schema": "glm-replay-python-logical-evidence-v1", "bindings": binding, "ranks": ranks}
-    return {"schema": "glm-replay-python-validation-v1", "status": "pass", "execution": "device",
+    logical = {"schema": "glm-replay-python-logical-evidence-v2", "bindings": binding, "ranks": ranks}
+    validation = {"schema": VALIDATION_SCHEMA, "status": "pass", "execution": "device",
             "bindings": binding, "completed_ranks": [0, 1], "ranks": ranks,
             "logical_evidence_sha256": digest(logical), "logical_evidence": logical,
             "checks": {"correctness": True, "timing_neutral": True, "fresh_prefill": True,
-                       "default_server_neutral": "unrun", "hardware_qualification": "unrun"},
-            "coverage": {"fixture_only": True, "full": all(p["kept"] == p["offered"]
-                         for f in runtime.fixture["forwards"] for p in f["parts"]),
-                         "partial": any(p["kept"] < p["offered"]
-                         for f in runtime.fixture["forwards"] for p in f["parts"]), "repeat_reset": True},
+                       "default_server_neutral": "not_applicable_unmodified_engine", "hardware_qualification": "unrun"},
+            "coverage": fixture_coverage(runtime.fixture),
             "performance": "unrun; validation reads occur outside individually completed forwards"}
+    from .python_evidence import validate_receipt
+
+    return validate_receipt(validation, runtime.fixture, runtime.meta, runtime.runtime_sha256)

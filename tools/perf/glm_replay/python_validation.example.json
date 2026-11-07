@@ -12,18 +12,19 @@
   },
   "checks": {
     "correctness": "unrun",
-    "default_server_neutral": "unrun",
+    "default_server_neutral": "not_applicable_unmodified_engine",
     "fresh_prefill": "unrun",
     "hardware_qualification": "unrun",
     "timing_neutral": "unrun"
   },
   "completed_ranks": [],
+  "coverage": null,
   "evidence": [],
   "execution": "unrun",
   "logical_evidence": null,
   "logical_evidence_sha256": null,
   "performance": "unrun",
   "ranks": [],
-  "schema": "glm-replay-python-validation-v1",
+  "schema": "glm-replay-python-validation-v2",
   "status": "unrun"
 }

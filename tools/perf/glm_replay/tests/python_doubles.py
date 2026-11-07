@@ -69,7 +69,7 @@ def setup(widths=(4, 4, 4, 4), keeps=(1, 2, 3, 4)):
     parts = [{"stream_id": i, "position": states[i].pos, "tape_offset": 0, "offered": n, "kept": k}
              for i, (n, k) in enumerate(zip(widths, keeps))]
     frame = Frame({"forward_id": 0, "round_id": 0, "parts": parts}, segments, list(keeps),
-                  [list(range(s.st.pos, s.st.pos + len(s.tokens))) for s in segments])
+                  [list(range(s.st.pos + 1, s.st.pos + 1 + len(s.tokens))) for s in segments])
     drafts, verify = Drafts(log, contexts), Verify(log)
     guard = ProposerGuard([drafts])
     def sample(weights, sampled_parts):

@@ -175,7 +175,13 @@ def _record(record, fixtures):
     _memory(record)
     checks = record["checks"]
     fields(checks, "correctness timing_neutral default_server_neutral fresh_prefill proposer_calls lost carries twins", "checks")
-    for key in ("correctness", "timing_neutral", "default_server_neutral", "fresh_prefill"):
+    if record["arm"] == "P":
+        require(checks["default_server_neutral"] == "not_applicable_unmodified_engine",
+                "P requires explicit unmodified-engine server N/A")
+    else:
+        value = checks["default_server_neutral"]
+        require(type(value) is bool and (value or not complete), "failed or unrun default_server_neutral")
+    for key in ("correctness", "timing_neutral", "fresh_prefill"):
         require(type(checks[key]) is bool and (checks[key] or not complete), f"failed or unrun {key}")
     for key in ("proposer_calls", "lost", "carries", "twins"):
         integer(checks[key], key)

@@ -1,0 +1,28 @@
+{
+  "activation": {
+    "path": "activation.json",
+    "sha256": null
+  },
+  "installed_sources": [
+    {
+      "path": "installed-rank-0.json",
+      "sha256": null
+    },
+    {
+      "path": "installed-rank-1.json",
+      "sha256": null
+    }
+  ],
+  "suite": [
+    {
+      "fixture": {
+        "path": "fixtures/solo.json",
+        "sha256": null
+      },
+      "validation": {
+        "path": "validation-solo.json",
+        "sha256": null
+      }
+    }
+  ]
+}

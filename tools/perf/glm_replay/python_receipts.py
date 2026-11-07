@@ -2,62 +2,44 @@
 import hashlib
 from pathlib import Path
 
-from .common import canonical_bytes, digest, file_digest, read_json, require
+from .common import canonical_bytes, digest, require
 from .python_control import forward_receipt
-from .python_provenance import HASHES, gate_binding, relative_file, require_gate
+from .python_provenance import HASHES, gate_binding
+from .python_evidence import artifact_receipt, validate_receipt
 from .python_runtime import exchange, module
-
-EXTERNAL_CHECKS = ("hardware_qualification", "full_commit", "partial_commit",
-                   "solo", "shared", "permutation", "page_edge", "repeat_reset", "owner_swap",
-                   "loaded_kernel_bundle", "production_transport")
-
-
-def artifact_receipt(spec, root):
-    require(isinstance(spec, dict) and set(spec) == {"path", "sha256"}, "bound receipt artifact required")
-    path = relative_file(Path(root), spec["path"])
-    require(file_digest(path) == spec["sha256"], "receipt artifact identity mismatch")
-    return read_json(path)
 
 
 def measurement_gates(fixture, meta, runtime_sha256, root):
-    binding = gate_binding(fixture, meta, runtime_sha256)
+    from .python_qualification import validate_qualification
+
     validation = artifact_receipt(meta["validation_gate"], root)
-    require_gate(validation, binding, ("correctness", "timing_neutral", "fresh_prefill"),
-                 "glm-replay-python-validation-v1")
-    require(len(validation.get("ranks", [])) == 2
-            and [r.get("rank") for r in validation["ranks"]] == [0, 1]
-            and all(r.get("status") == "pass" for r in validation["ranks"]),
-            "validation lacks actual both-rank receipts")
-    require(digest([r.get("runtime_rank_sha256") for r in validation["ranks"]]) == runtime_sha256,
-            "validation runtime rank identities disagree with combined digest")
-    logical = validation.get("logical_evidence")
-    require(isinstance(logical, dict) and logical.get("bindings") == binding
-            and logical.get("ranks") == validation["ranks"]
-            and digest(logical) == validation.get("logical_evidence_sha256"), "logical evidence hash/binding mismatch")
-    for rank in validation["ranks"]:
-        evidence = rank.get("evidence")
-        require(isinstance(evidence, dict) and digest(evidence) == rank.get("evidence_sha256"),
-                "rank logical evidence hash mismatch")
-        require(evidence.get("poisoned_lookahead") is True
-                and evidence.get("unsynchronized_poisoned_and_natural") is True,
-                "missing poisoned/unsynchronized validation evidence")
-        require(len(evidence.get("expected_kept_outputs", [])) == len(fixture["forwards"]),
-                "logical evidence missing actual kept outputs")
+    validate_receipt(validation, fixture, meta, runtime_sha256)
     external = artifact_receipt(meta["external_gate"], root)
-    require_gate(external, binding, EXTERNAL_CHECKS, "glm-replay-python-external-gate-v1")
-    evidence = external.get("evidence")
-    require(isinstance(evidence, list) and evidence, "external gates need retained hardware evidence")
-    for spec in evidence:
-        artifact_receipt(spec, root)
-    server_gate(meta, root)
-    return {"correctness": True, "timing_neutral": True, "default_server_neutral": True,
+    validate_qualification(external, fixture, meta, runtime_sha256, root)
+    require(meta["server_gate"] is None, "P server gate must be null: unmodified frozen engine")
+    return {"correctness": True, "timing_neutral": True,
+            "default_server_neutral": "not_applicable_unmodified_engine",
             "fresh_prefill": True, "proposer_calls": 0, "lost": 0, "carries": 0, "twins": 0}
 
 
-def server_gate(meta, root):
-    from .server_neutrality import validate_server_gate
+def block_telemetry(runtime, block, spec, root, timeout_s=30):
+    from .telemetry import block_window, wait_telemetry, write_request
 
-    return validate_server_gate(meta["server_gate"], meta["source"], "python", roots=(Path(root),))
+    binding = gate_binding(runtime.fixture, runtime.meta, runtime.runtime_sha256)
+    ranks = exchange(runtime.nccl.store, f"block-window/{digest(runtime.meta['ids'])}", runtime.rank,
+                     block["realtime_window"])
+    window = block_window(binding, runtime.meta["ids"], ranks, runtime.session_nonce,
+                          runtime.campaign_sha256, runtime.checkpoints)
+    if runtime.rank == 0:
+        write_request(spec, root, window)
+    telemetry, sha = wait_telemetry(spec, root, window, timeout_s)
+    qualification = artifact_receipt(runtime.meta["external_gate"], root)
+    activation = artifact_receipt(qualification["activation"], root)
+    require([r["device_uuid"] for r in telemetry["ranks"]] ==
+            [r["device"]["uuid"] for r in activation["ranks"]], "telemetry device identity mismatch")
+    agreed = exchange(runtime.nccl.store, f"telemetry/{digest(runtime.meta['ids'])}", runtime.rank, sha)
+    require(agreed == [sha, sha], "ranks read different telemetry bytes")
+    return sha
 
 
 def measure_block(runtime, checks, root):
@@ -75,6 +57,8 @@ def measure_block(runtime, checks, root):
     ranks = exchange(runtime.nccl.store, f"phase-anchor/{digest(runtime.meta['ids'])}", runtime.rank, local)
     require([r.get("rank") for r in ranks] == [0, 1], "phase anchor lacks both ranks")
     combined = {"schema": "glm-replay-python-phase-anchor-v1", "bindings": validation["bindings"],
+                "session_nonce": runtime.session_nonce, "campaign_sha256": runtime.campaign_sha256,
+                "checkpoints": runtime.checkpoints,
                 "ids": runtime.meta["ids"], "logical_evidence_sha256": validation["logical_evidence_sha256"],
                 "timing_source": "separate_observer_on_anchor", "completed_ranks": [0, 1], "ranks": ranks}
     return headline, combined
@@ -127,10 +111,14 @@ def build_record(runtime, block, checks, telemetry_sha256, anchor=None):
     phases = anchor["ranks"][runtime.rank]["phases_ns"]
     require(phases is not None and len(phases) == len(block["frames"])
             == len(fixture["forwards"]), "missing measured timings or incomplete schedule")
-    for key in ("correctness", "timing_neutral", "default_server_neutral", "fresh_prefill"):
+    for key in ("correctness", "timing_neutral", "fresh_prefill"):
         require(checks.get(key) is True, f"measurement gate not passed: {key}")
+    require(checks.get("default_server_neutral") == "not_applicable_unmodified_engine",
+            "P requires explicit unmodified-engine server N/A")
     config = effective_config(runtime)
     return {"schema": "glm-replay-result-v1", **{k: fixture[k] for k in HASHES.split()},
+            "session_nonce": runtime.session_nonce, "campaign_sha256": runtime.campaign_sha256,
+            "checkpoints": runtime.checkpoints, "layout_checks": 0,
             **meta["ids"], "arm": "P", "rank": runtime.rank, "status": "complete", "exclusion_reason": None,
             "source": meta["source"], "effective_config": config, "effective_config_sha256": digest(config),
             "preparation_ns": block["preparation_ns"], "wall_ns": block["wall_ns"], "completed_ranks": [0, 1],
@@ -146,18 +134,20 @@ def write_exclusive(path, records):
         stream.write(data)
 
 
-def collect_records(runtime, record):
+def collect_records(runtime, record, anchor):
     records = exchange(runtime.nccl.store, f"output/{digest(runtime.meta['ids'])}", runtime.rank, record)
     require([r.get("rank") for r in records] == [0, 1], "missing/duplicate rank output")
     for key in ("effective_config_sha256", "fixture_sha256", "source", "checks", "completed_ranks"):
         require(records[0][key] == records[1][key], f"rank output disagreement: {key}")
     from .results import validate_results
 
-    validate_results(records, {runtime.fixture["fixture_sha256"]: runtime.fixture})
+    sha = record["timing_source"]["anchor_sha256"]
+    validate_results(records, {runtime.fixture["fixture_sha256"]: runtime.fixture},
+                     anchors={sha: canonical_bytes(anchor) + b"\n"})
     return records
 
 
-def publish_local(runtime, output, record):
-    records = collect_records(runtime, record)
+def publish_local(runtime, output, record, anchor):
+    records = collect_records(runtime, record, anchor)
     if runtime.rank == 0:
         write_exclusive(output, records)

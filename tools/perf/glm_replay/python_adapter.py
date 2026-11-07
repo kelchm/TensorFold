@@ -46,7 +46,7 @@ def parser():
 
 
 def gpu_run(args, fixture, meta, report, roots):
-    from .python_receipts import (artifact_receipt, build_record, measurement_gates, measure_block,
+    from .python_receipts import (artifact_receipt, block_telemetry, build_record, measurement_gates, measure_block,
                                   publish_local, retain_anchor, write_exclusive)
     from .python_runtime import Runtime, exchange
     from .python_validation import validate_device
@@ -60,6 +60,11 @@ def gpu_run(args, fixture, meta, report, roots):
     require("runtime_sha256" in CONFIG_FIELDS.split(), "common runtime-binding integration is required")
     require("timing_source" in RECORD_FIELDS.split(), "common honest timing-source integration is required")
     if args.mode == "measure":
+        from .telemetry import reference, request_path
+
+        require(not reference(meta["telemetry"], args.receipts_root).exists()
+                and not request_path(meta["telemetry"], args.receipts_root).exists(),
+                "future telemetry/request path already exists")
         gate = artifact_receipt(meta["validation_gate"], args.receipts_root)
         expected_runtime = gate.get("bindings", {}).get("runtime_sha256")
         hex_id(expected_runtime, "prevalidated device runtime digest")
@@ -78,13 +83,11 @@ def gpu_run(args, fixture, meta, report, roots):
             write_exclusive(args.output, [validation])
         return
     block, anchor = measure_block(runtime, checks, args.receipts_root)
-    telemetry = artifact_receipt(meta["telemetry"], args.receipts_root)
-    require(telemetry.get("bindings") == binding and telemetry.get("completed_ranks") == [0, 1]
-            and telemetry.get("block_id") == meta["ids"]["block_id"], "telemetry does not bind this block")
-    record = build_record(runtime, block, checks, meta["telemetry"]["sha256"], anchor)
+    telemetry_sha = block_telemetry(runtime, block, meta["telemetry"], args.receipts_root)
+    record = build_record(runtime, block, checks, telemetry_sha, anchor)
     if runtime.rank == 0:
         retain_anchor(args.output, anchor)
-    publish_local(runtime, args.output, record)
+    publish_local(runtime, args.output, record, anchor)
 
 
 def main(argv=None):

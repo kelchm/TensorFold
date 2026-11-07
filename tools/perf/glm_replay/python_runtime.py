@@ -2,15 +2,17 @@
 import dataclasses
 import importlib
 import math
+import secrets
 import sys
 import time
 from datetime import timedelta
 from pathlib import Path
 
 from .capacity import reservations
-from .common import canonical_bytes, digest, file_digest, read_json, require
+from .common import canonical_bytes, digest, file_digest, hex_id, read_json, require
 from .python_control import Controller, ProposerGuard, QuietTrace, frames
 from .python_provenance import environment, graph_rows
+from .python_startup import capture_bank, launch_settings, open_transport
 
 PREFIX = "tensorfold.families.glm5_next.cuda."
 
@@ -36,6 +38,19 @@ def completed(payloads, expected):
     for rank, got in enumerate(payloads):
         require(got == [rank, *expected], "rank completion/count disagreement")
     return [0, 1]
+
+
+def session_provenance(store, rank, meta, campaign_sha256=None):
+    nonces = exchange(store, "session-nonce", rank, secrets.token_hex(32))
+    require(isinstance(nonces, list) and len(nonces) == 2, "missing rank session nonces")
+    for nonce in nonces:
+        hex_id(nonce, "session nonce")
+    campaign = campaign_sha256 or digest(meta)
+    hex_id(campaign, "campaign digest")
+    return {"session_nonce": digest(nonces), "campaign_sha256": campaign,
+            "checkpoints": {"scheme": "file-manifest-v1",
+                **{role: [digest(files) for files in meta["checkpoints"][role]["ranks"]]
+                   for role in ("target", "drafter")}}}
 
 
 class EventTrace:
@@ -77,6 +92,9 @@ class Runtime:
         torch.cuda.set_device(0)
         self.nccl = NCCL(rank, 2, master, port)
         self.comm = self.nccl
+        provenance = session_provenance(self.nccl.store, rank, meta, campaign_identity)
+        self.session_nonce, self.campaign_sha256 = provenance["session_nonce"], provenance["campaign_sha256"]
+        self.checkpoints = provenance["checkpoints"]
         identity = {"bindings": preflight["bindings"], "sources": preflight["source_tree_sha256"],
                     "metadata": digest(meta), "campaign": campaign_identity,
                     "execution_environment": {k: v for k, v in environment().items()
@@ -84,12 +102,11 @@ class Runtime:
                                  "CUDA_VISIBLE_DEVICES", "TORCH_EXTENSIONS_DIR", "TRITON_CACHE_DIR"}}}
         agreed = exchange(self.nccl.store, "preload", rank, identity)
         require(agreed[0] == agreed[1], "ranks disagree before engine load")
-        if environment().get("TF_GLM_COMM", "nccl") == "roce":
-            from tensorfold.cuda.roce import RoceComm
-
-            self.comm = RoceComm(self.nccl, rank, 2)
-        self.comm.barrier()
+        self.comm = open_transport(self.nccl, rank, environment().get("TF_GLM_COMM", "nccl"))
         production = module("engine")
+        self.startup = launch_settings(production, module("display_kv"), meta["launch"])
+        agreed = exchange(self.nccl.store, "startup", rank, self.startup)
+        require(agreed[0] == agreed[1], "ranks disagree on derived startup settings")
         require(production.MAX_ROWS == 16 and production.DRAFT_RING is True
                 and module("shard").ON is False, "recorded production window/ring/shard settings required")
         self.split = module("hcsplit").SplitSettings.from_env()
@@ -108,26 +125,25 @@ class Runtime:
         projections = [self.w.head] + [l.kda.proj if l.kind == "kda" else l.dsa.proj for l in self.w.layers]
         require(all(isinstance(p, q4) for p in projections), "loaded dense/head q4 identity mismatch")
         require(self.w.mtp is None, "target MTP must not be loaded with four configured slots")
-        self.graph_rows = sorted({row for case in self.fixtures for row in graph_rows(case)})
+        needed_rows = sorted({row for case in self.fixtures for row in graph_rows(case)})
         pool = fixture["config"]["pool"]
         self.pool_rows = 2 * pool["h"] * pool["page_tokens"]
         require(self.pool_rows % module("pool").ALIGN == 0, "pool must tile production aligned extents")
         self.drafter = module("dflash2").Drafter(Path(roots["drafter"]), self.w,
                     capacity=self.pool_rows, tap_rows=16, ring=True)
-        launch = meta["launch"]
+        launch = self.startup
         self.e = module("decode").Engine(self.w, capacity=self.pool_rows, max_rows=production.MAX_ROWS,
                     prefill_rows=launch["prefill_rows"], graphs=True,
                     graph_rows=production.GRAPH_ROWS + production.WIDE_GRAPHS,
                     long_context=True, taps=self.drafter.tap_layers, grid=launch["grid"], split=self.split,
-                    streams=4, pool_rows=self.pool_rows, kv="fp8")
+                    streams=4, pool_rows=self.pool_rows, kv="fp8", display=launch["display"])
         if self.e.pbuf.split is not None:
             self.e.pbuf.split.warm()
         self.drafter.capture()
         self.drafts = module("dflash2_multi").MultiDrafter(self.drafter, streams=4)
         self.drafts.capture()
         self.verifier = module("verify").BatchedVerify(self.e, taps=self.drafter.tap_layers, rows=32, segs=4)
-        self.verifier.capture(self.graph_rows)
-        require(set(self.verifier.graphs) == set(self.graph_rows), "capture omitted a required graph")
+        self.graph_rows = capture_bank(self.verifier, needed_rows)
         require(all(isinstance(g, torch.cuda.CUDAGraph) for g in self.verifier.graphs.values()),
                 "target graph implementation was substituted")
         require(self.drafts.tap_graphs and self.drafts.block_graphs, "production drafter graph allocation missing")
@@ -185,7 +201,7 @@ class Runtime:
                 flags[name] = {k: v for k, v in vars(mod).items() if k.isupper()
                                and (v is None or type(v) in (str, bool, int)
                                     or type(v) is float and math.isfinite(v))}
-        actual = {"environment": environment(), "launch": self.meta["launch"], "loaded": loaded,
+        actual = {"environment": environment(), "launch": self.meta["launch"], "startup": self.startup, "loaded": loaded,
                   "transport": transport, "torch": torch.__version__, "cuda": torch.version.cuda,
                   "cudnn": torch.backends.cudnn.version(), "capability": torch.cuda.get_device_capability(),
                   "split": dataclasses.asdict(self.split), "pool_rows": self.e.caches.rows,
@@ -320,8 +336,9 @@ class Runtime:
         self.comm.barrier()
         ctl.start()
         snapshots = []
+        prep = time.perf_counter_ns() - prep_begin
+        realtime_start = time.time_ns()
         begin = time.perf_counter_ns()
-        prep = begin - prep_begin
         wall = 0
         for index, frame in enumerate(plan):
             ctl.execute(frame, index, graph=not oracle)
@@ -338,12 +355,16 @@ class Runtime:
                 frame.verified = None
         if not capture:
             wall = self.finish(plan, begin)
+        realtime_end = time.time_ns()
         final = capture_forward(self, plan[-1], range(4)) if final_capture else None
         plan[-1].verified = None
         phases = trace.resolve() if trace is not None and enabled else None
         self.block_number += 1
         return {"preparation_ns": prep, "wall_ns": wall, "frames": plan, "phases": phases,
                 "snapshots": snapshots, "initial_states": initial, "final": final,
+                "poisoned_rows": sum(f.poisoned_rows for f in plan),
+                "realtime_window": {"rank": self.rank, "realtime_start_ns": realtime_start,
+                                    "realtime_end_ns": realtime_end},
                 "kept_outputs": [{str(p["stream_id"]): f.sampled[i][:p["kept"]]
                                  for i, p in enumerate(f.scheduled["parts"])} for f in plan],
                 "completed_ranks": [0, 1]}

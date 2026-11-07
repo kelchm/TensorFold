@@ -6,36 +6,31 @@
         {
           "block_id": "prose-solo-000",
           "telemetry": {
-            "path": "telemetry/prose-solo-000.json",
-            "sha256": null
+            "path": "telemetry/prose-solo-000.json"
           }
         },
         {
           "block_id": "prose-solo-001",
           "telemetry": {
-            "path": "telemetry/prose-solo-001.json",
-            "sha256": null
+            "path": "telemetry/prose-solo-001.json"
           }
         },
         {
           "block_id": "prose-solo-002",
           "telemetry": {
-            "path": "telemetry/prose-solo-002.json",
-            "sha256": null
+            "path": "telemetry/prose-solo-002.json"
           }
         },
         {
           "block_id": "prose-solo-003",
           "telemetry": {
-            "path": "telemetry/prose-solo-003.json",
-            "sha256": null
+            "path": "telemetry/prose-solo-003.json"
           }
         },
         {
           "block_id": "prose-solo-004",
           "telemetry": {
-            "path": "telemetry/prose-solo-004.json",
-            "sha256": null
+            "path": "telemetry/prose-solo-004.json"
           }
         }
       ],
@@ -51,7 +46,7 @@
   ],
   "pair_id": "context-unrun",
   "run_id": "context-unrun",
-  "schema": "glm-replay-python-campaign-v1",
+  "schema": "glm-replay-python-campaign-v2",
   "start_id": "context-start-unrun",
   "start_order": 0,
   "status": "unrun"

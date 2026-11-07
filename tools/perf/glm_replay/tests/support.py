@@ -46,7 +46,7 @@ def receipt(fixture, arm="A", pair=0, block=0, rank=0, wall=1_000_000):
                             "target": ["d" * 64, "d" * 64], "drafter": ["e" * 64, "e" * 64]},
             "source": source, "effective_config": cfg, "effective_config_sha256": digest(cfg),
             "preparation_ns": 500_000, "wall_ns": wall, "completed_ranks": [0, 1], "forwards": forwards,
-            "checks": {"correctness": True, "timing_neutral": True, "default_server_neutral": True,
+            "checks": {"correctness": True, "timing_neutral": True, "default_server_neutral": "not_applicable_unmodified_engine" if arm == "P" else True,
                        "fresh_prefill": True, "proposer_calls": 0, "lost": 0, "carries": 0, "twins": 0},
             "timing_source": {"wall": "observer_off", "phases": "separate_observer_on_anchor",
                               "anchor_sha256": "b" * 64},

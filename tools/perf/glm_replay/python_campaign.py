@@ -1,12 +1,13 @@
 """An ordered developer case loop inside one real production engine/rank session."""
 import copy
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from .capacity import reservations
 from .common import canonical_bytes, digest, fields, file_digest, hex_id, read_json, require
 from .fixture import load_fixture
 from .python_provenance import graph_rows, metadata_check, preflight, relative_file
 from .python_receipts import artifact_receipt, measurement_gates
+from .telemetry import reference, request_path
 
 
 def bound_file(root, spec):
@@ -20,10 +21,11 @@ def bound_file(root, spec):
 def preflight_campaign(path, root, source_root, roots, rank, receipts_root, mode):
     campaign = read_json(path)
     fields(campaign, "schema status arm run_id pair_id start_id start_order cases", "campaign")
-    require(campaign["schema"] == "glm-replay-python-campaign-v1" and campaign["status"] == "ready"
+    require(campaign["schema"] == "glm-replay-python-campaign-v2" and campaign["status"] == "ready"
             and campaign["arm"] == "P", "unrun/unsupported Python campaign")
     require(isinstance(campaign["cases"], list) and campaign["cases"], "empty campaign")
-    cases, cells, block_ids = [], set(), set()
+    cases, cells, block_ids, telemetry_paths = [], {}, set(), set()
+    counts = {}
     common = None
     expected_runtime = None
     for case in campaign["cases"]:
@@ -40,22 +42,22 @@ def preflight_campaign(path, root, source_root, roots, rank, receipts_root, mode
             require(type(meta["ids"][key]) is type(campaign[key]) and meta["ids"][key] == campaign[key],
                     f"campaign changed genuine process-start identity: {key}")
         cell = meta["ids"]["cell_id"]
-        require(cell not in cells, "duplicate campaign cell; put its blocks in one ordered case")
-        cells.add(cell)
-        require(isinstance(case["blocks"], list) and len(case["blocks"]) >= (5 if mode == "measure" else 1),
-                "campaign measurement needs at least five explicit blocks per cell/start")
+        require(cell not in cells or cells[cell] == fixture["fixture_sha256"], "campaign cell changed fixture")
+        cells[cell] = fixture["fixture_sha256"]
+        require(isinstance(case["blocks"], list) and case["blocks"], "campaign entry needs explicit blocks")
         for block in case["blocks"]:
             fields(block, "block_id telemetry", "campaign block")
             bid = block["block_id"]
-            require(isinstance(bid, str) and bid.strip() and bid not in block_ids, "duplicate/invalid block ID")
-            block_ids.add(bid)
-            fields(block["telemetry"], "path sha256", "post-block telemetry reference")
-            name = block["telemetry"]["path"]
-            p = PurePosixPath(name)
-            require(isinstance(name, str) and str(p) == name and not p.is_absolute()
-                    and ".." not in p.parts and "\\" not in name, "unsafe telemetry path")
-            if mode == "measure" or block["telemetry"]["sha256"] is not None:
-                hex_id(block["telemetry"]["sha256"], "telemetry digest")
+            require(isinstance(bid, str) and bid.strip() and (cell, bid) not in block_ids,
+                    "duplicate/invalid cell/block ID")
+            block_ids.add((cell, bid))
+            counts[cell] = counts.get(cell, 0) + 1
+            path = reference(block["telemetry"], receipts_root)
+            request = request_path(block["telemetry"], receipts_root)
+            require(path not in telemetry_paths and request not in telemetry_paths, "reused telemetry/request path")
+            telemetry_paths.update((path, request))
+            if mode == "measure":
+                require(not path.exists() and not request.exists(), "future telemetry/request path already exists")
         if mode == "measure":
             gate = artifact_receipt(meta["validation_gate"], receipts_root)
             runtime = gate.get("bindings", {}).get("runtime_sha256")
@@ -65,6 +67,8 @@ def preflight_campaign(path, root, source_root, roots, rank, receipts_root, mode
             measurement_gates(fixture, meta, runtime, receipts_root)
         cases.append({"fixture": fixture, "metadata": meta, "fixture_path": fixture_path,
                       "metadata_path": metadata_path, "blocks": case["blocks"]})
+    require(mode != "measure" or all(n >= 5 for n in counts.values()),
+            "campaign measurement needs at least five explicit blocks per cell/start")
     first = cases[0]
     _, _, report = preflight(first["fixture_path"], source_root, first["metadata_path"], roots, rank)
     bank = sorted({row for case in cases for row in graph_rows(case["fixture"])})
@@ -73,13 +77,14 @@ def preflight_campaign(path, root, source_root, roots, rank, receipts_root, mode
     require(sum((n + 2047) // 2048 * 2048 for n in sizes) <= 2 * pool["h"] * 512,
             "campaign maximum all-slot reservations exceed fixed pool")
     report.update({"campaign_sha256": digest(campaign), "cases": len(cases), "blocks": len(block_ids),
-                   "graph_rows": bank, "expected_runtime_sha256": expected_runtime})
+                   "needed_graph_rows": bank, "graph_rows": list(range(1, 33)), "expected_runtime_sha256": expected_runtime})
     return campaign, cases, report
 
 
 def run_campaign(args, campaign, cases, report, roots):
     from .python_provenance import gate_binding, install_import_boundary
-    from .python_receipts import build_record, collect_records, measure_block, retain_anchor, write_exclusive
+    from .python_receipts import block_telemetry, build_record, collect_records, measure_block, retain_anchor, write_exclusive
+    from .python_evidence import validate_receipt
     from .python_runtime import Runtime, exchange
     from .python_validation import validate_device
     from .results import CONFIG_FIELDS, RECORD_FIELDS
@@ -91,27 +96,44 @@ def run_campaign(args, campaign, cases, report, roots):
     first = cases[0]
     install_import_boundary(args.source_root)
     runtime = Runtime(first["fixture"], first["metadata"], roots, args.rank, args.master, args.port, report,
-                      fixtures=[c["fixture"] for c in cases], campaign_identity=report["campaign_sha256"])
+                      fixtures=list({c["fixture"]["fixture_sha256"]: c["fixture"] for c in cases}.values()),
+                      campaign_identity=report["campaign_sha256"])
     if args.mode == "measure":
         require(runtime.runtime_sha256 == report["expected_runtime_sha256"], "campaign actual runtime differs from gates")
-    validations, output = [], None
+    validations, output = {}, None
+    destination = Path(args.output)
+    if args.mode == "validate" and runtime.rank == 0:
+        destination.mkdir()
     try:
         for index, case in enumerate(cases):
             runtime.select_case(case["fixture"], case["metadata"])
             binding = gate_binding(runtime.fixture, runtime.meta, runtime.runtime_sha256)
             if args.mode == "validate":
-                validations.append(validate_device(runtime, binding))
+                sha = runtime.fixture["fixture_sha256"]
+                path = destination / f"validation-{sha}.json"
+                if sha in validations:
+                    validation = validations[sha]
+                    validate_receipt(validation, runtime.fixture, runtime.meta, runtime.runtime_sha256)
+                    if runtime.rank == 0:
+                        require(path.read_bytes() == canonical_bytes(validation) + b"\n",
+                                "previous successful validation receipt changed")
+                else:
+                    validation = validate_device(runtime, binding)
+                    validate_receipt(validation, runtime.fixture, runtime.meta, runtime.runtime_sha256)
+                    if runtime.rank == 0:
+                        write_exclusive(path, [validation])
+                    validations[sha] = validation
+                exchange(runtime.nccl.store, f"campaign-validation/{index}", runtime.rank,
+                         {"fixture_sha256": sha, "validation_sha256": digest(validation)})
                 continue
             checks = measurement_gates(runtime.fixture, runtime.meta, runtime.runtime_sha256, args.receipts_root)
             for block_index, spec in enumerate(case["blocks"]):
                 runtime.meta = copy.deepcopy(case["metadata"])
                 runtime.meta["ids"]["block_id"] = spec["block_id"]
                 result, anchor = measure_block(runtime, checks, args.receipts_root)
-                telemetry = artifact_receipt(spec["telemetry"], args.receipts_root)
-                require(telemetry.get("bindings") == binding and telemetry.get("completed_ranks") == [0, 1]
-                        and telemetry.get("block_id") == spec["block_id"], "campaign telemetry binding mismatch")
-                record = build_record(runtime, result, checks, spec["telemetry"]["sha256"], anchor)
-                records = collect_records(runtime, record)
+                telemetry_sha = block_telemetry(runtime, result, spec["telemetry"], args.receipts_root)
+                record = build_record(runtime, result, checks, telemetry_sha, anchor)
+                records = collect_records(runtime, record, anchor)
                 if runtime.rank == 0:
                     retain_anchor(args.output, anchor)
                     if output is None:
@@ -120,12 +142,6 @@ def run_campaign(args, campaign, cases, report, roots):
                     output.flush()
                 exchange(runtime.nccl.store, f"campaign-block/{index}/{block_index}", runtime.rank,
                          {"written": True, "block_id": spec["block_id"]})
-        if args.mode == "validate" and runtime.rank == 0:
-            destination = Path(args.output)
-            destination.mkdir()
-            for validation in validations:
-                sha = validation["bindings"]["fixture_sha256"]
-                write_exclusive(destination / f"validation-{sha}.json", [validation])
     finally:
         if output is not None:
             output.close()

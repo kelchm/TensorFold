@@ -1,14 +1,17 @@
 """Host negatives for poisoned lookahead, unsynchronized schedules and evidence-bound gates."""
 import copy
-import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from tools.perf.glm_replay.common import ReplayError, digest
-from tools.perf.glm_replay.python_provenance import HASHES, gate_binding
-from tools.perf.glm_replay.python_receipts import measurement_gates, measure_block, server_gate
+from tools.perf.glm_replay.python_provenance import metadata_check
+from tools.perf.glm_replay.python_evidence import validate_receipt
+from tools.perf.glm_replay.tests.python_evidence_doubles import (
+    RUNTIME, fixture_case, metadata, produced_validation, rehash,
+)
+from tools.perf.glm_replay.python_receipts import measurement_gates, measure_block
 from tools.perf.glm_replay.python_validation import capture_forward, validate_device
 
 
@@ -46,28 +49,15 @@ class ValidationTests(unittest.TestCase):
         self.assertTrue(any(not c.get("poison") and c.get("final_capture") for c in calls))
 
     def gate(self):
-        fixture = {**{k: "1" * 64 for k in HASHES.split()}, "forwards": [{}]}
-        meta = {"source": {}, "source_tree_sha256": "2" * 64, "checkpoints": {},
-                "validation_gate": {"path": "validation.json", "sha256": "3" * 64}}
-        runtime = digest(["a" * 64, "b" * 64])
-        binding = gate_binding(fixture, meta, runtime)
-        evidence = {"poisoned_lookahead": True, "unsynchronized_poisoned_and_natural": True,
-                    "expected_kept_outputs": [{"0": [9]}]}
-        ranks = [{"rank": r, "status": "pass", "runtime_rank_sha256": char * 64,
-                  "evidence": copy.deepcopy(evidence), "evidence_sha256": digest(evidence)}
-                 for r, char in enumerate(("a", "b"))]
-        logical = {"bindings": binding, "ranks": ranks}
-        gate = {"schema": "glm-replay-python-validation-v1", "status": "pass", "execution": "device",
-                "bindings": binding, "completed_ranks": [0, 1], "ranks": ranks,
-                "checks": {"correctness": True, "timing_neutral": True, "fresh_prefill": True},
-                "logical_evidence": logical, "logical_evidence_sha256": digest(logical)}
-        return fixture, meta, runtime, gate
+        fixture = fixture_case(partial=True)
+        meta = metadata(fixture)
+        return fixture, meta, RUNTIME, produced_validation(fixture, meta)
 
     def test_correctness_booleans_without_logical_evidence_are_refused(self):
         fixture, meta, runtime, gate = self.gate()
         del gate["logical_evidence"]
         with patch("tools.perf.glm_replay.python_receipts.artifact_receipt", return_value=gate):
-            with self.assertRaisesRegex(ReplayError, "logical evidence"):
+            with self.assertRaisesRegex(ReplayError, "validation receipt"):
                 measurement_gates(fixture, meta, runtime, Path("."))
 
     def test_changed_evidence_cannot_keep_prior_gate_sha(self):
@@ -99,14 +89,41 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual([r["enabled"] for r in runs], [True, False])
         self.assertTrue(all(r["final_capture"] for r in runs))
 
-    def test_server_gate_uses_shared_deferred_validator_without_replay_runtime(self):
-        validate = Mock(return_value={"status": "pass", "execution": "host-double"})
-        module = SimpleNamespace(validate_server_gate=validate)
-        meta = {"server_gate": {"path": "server.json", "sha256": "1" * 64},
-                "source": {"harness_commit": "2" * 40, "fatbin_sha256": "3" * 64}}
-        with patch.dict(sys.modules, {"tools.perf.glm_replay.server_neutrality": module}):
-            server_gate(meta, Path("receipts"))
-        validate.assert_called_once_with(meta["server_gate"], meta["source"], "python", roots=(Path("receipts"),))
+    def test_python_server_gate_is_explicitly_not_applicable(self):
+        fixture = fixture_case()
+        meta = metadata(fixture)
+        metadata_check(meta, fixture)
+        meta["server_gate"] = {"path": "old-server.json", "sha256": "a" * 64}
+        with self.assertRaisesRegex(ReplayError, "server gate must be null"):
+            metadata_check(meta, fixture)
+
+    def test_poison_count_is_actual_and_zero_for_full_keep(self):
+        for partial in (False, True):
+            fixture = fixture_case(partial=partial)
+            meta = metadata(fixture)
+            validation = produced_validation(fixture, meta)
+            self.assertEqual(validation["coverage"]["partial"], partial)
+            for rank in validation["ranks"]:
+                self.assertEqual(rank["evidence"]["poisoned_rows"] > 0, partial)
+            validate_receipt(validation, fixture, meta, RUNTIME)
+
+    def test_rehashed_poison_counts_cannot_invent_partial_coverage(self):
+        fixture, meta, runtime, validation = self.gate()
+        validation["ranks"][0]["evidence"]["poisoned_rows"] = 0
+        with self.assertRaisesRegex(ReplayError, "poisoned discarded-row"):
+            validate_receipt(rehash(validation), fixture, meta, runtime)
+
+    def test_rehashed_opaque_or_incorrect_logical_payload_is_refused(self):
+        for mutate in (
+            lambda e: e["validated_forwards"][0]["states"]["0"].update(position=0),
+            lambda e: e["dispatch"][0].__setitem__(0, 0),
+            lambda e: e["runs"][1].update(snapshots_sha256="0" * 64),
+            lambda e: e["oracle_rows"][0]["kept"]["0"]["selected"].__setitem__(0, 999999),
+        ):
+            fixture, meta, runtime, validation = self.gate()
+            mutate(validation["ranks"][0]["evidence"])
+            with self.assertRaises(ReplayError):
+                validate_receipt(rehash(validation), fixture, meta, runtime)
 
 
 if __name__ == "__main__":

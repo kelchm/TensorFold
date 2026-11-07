@@ -23,6 +23,7 @@ HASHES = "fixture_sha256 config_sha256 schedule_sha256 tokens_sha256"
 
 def relative_file(root, name):
     root = root.resolve()
+    require(isinstance(name, str) and name, "unsafe artifact path")
     path = PurePosixPath(name)
     require(isinstance(name, str) and str(path) == name and not path.is_absolute()
             and ".." not in path.parts and "\\" not in name, "unsafe artifact path")
@@ -81,12 +82,16 @@ def environment(env=None):
 def metadata_check(meta, fixture):
     fields(meta, "schema status arm bindings source source_tree_sha256 artifacts checkpoints "
            "launch ids validation_gate external_gate server_gate telemetry", "Python metadata")
-    require(meta["schema"] == "glm-replay-python-metadata-v1" and meta["status"] == "ready",
+    require(meta["schema"] == "glm-replay-python-metadata-v2" and meta["status"] == "ready",
             "metadata is unrun/template or unsupported")
     require(meta["arm"] == "P", "Python adapter supports contextual arm P only")
     fields(meta["bindings"], HASHES, "fixture bindings")
     for key in HASHES.split():
         require(meta["bindings"][key] == fixture[key], f"metadata {key} mismatch")
+    require(meta["server_gate"] is None, "P server gate must be null: unmodified frozen engine")
+    from .telemetry import reference
+
+    reference(meta["telemetry"], Path.cwd())
     source = meta["source"]
     fields(source, "engine_commit harness_commit binary_sha256 fatbin_sha256 compiler_sha256 "
            "kit_commit image_digest device_image_digest", "source")
@@ -132,7 +137,7 @@ def preflight(fixture_path, source_root, metadata_path=None, roots=None, rank=0,
             "Python aligned all-slot reservations exceed pool")
     report = {"schema": "glm-replay-python-preflight-v1", "status": "host-checked",
               "bindings": {k: fixture[k] for k in HASHES.split()}, "source_tree_sha256": digest(sources),
-              "graph_rows": graph_rows(fixture), "hardware_checks": "unrun",
+              "needed_graph_rows": graph_rows(fixture), "graph_rows": list(range(1, 33)), "hardware_checks": "unrun",
               "qualification": "seven retained installed matches; all other entries local-source-only"}
     if metadata_path is None:
         return fixture, None, report
@@ -169,8 +174,7 @@ def verify_harness(commit):
         return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True).stdout
     require(git("rev-parse", "HEAD").decode().strip() == commit, "harness commit differs from checkout HEAD")
     folder = Path(__file__).parent
-    paths = set(folder.glob("python_*")) | {folder / name for name in
-            ("common.py", "fixture.py", "capacity.py", "results.py", "server_neutrality.py", "__init__.py")}
+    paths = set(folder.rglob("*.py")) | set(folder.glob("python_*.json"))
     for path in sorted(paths):
         if path.is_file():
             require(git("show", f"HEAD:{path.relative_to(repo).as_posix()}") == path.read_bytes(),
