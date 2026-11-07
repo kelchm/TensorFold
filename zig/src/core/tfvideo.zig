@@ -137,10 +137,12 @@ pub const Video = struct {
                 return 0;
             }
         }.take;
+        const count = std.math.cast(c_int, indices.len) orelse return error.Invalid;
+        for (indices) |index| if (index > std.math.maxInt(c_int)) return error.Invalid;
         const idx = try scratch.alloc(c_int, indices.len);
         defer scratch.free(idx);
         for (idx, indices) |*d, s| d.* = @intCast(s);
-        const rc = v.fns.frames(v.handle, idx.ptr, @intCast(idx.len), cb, &ctx);
+        const rc = v.fns.frames(v.handle, idx.ptr, count, cb, &ctx);
         if (ctx.failure) |e| return e;
         if (rc < 0) return err(rc);
         if (rc != indices.len) return error.Short;

@@ -112,9 +112,27 @@ pub fn For(comptime picture: type) type {
             return @round(x);
         }
 
+        /// First frame whose original floating-point timestamp comparison succeeds.
+        /// Searching the monotone predicate preserves rounding at frame boundaries without scanning metadata-sized ranges.
+        fn firstFrame(start: u64, total: u64, per_frame: f64, current: f64) u64 {
+            var low = start;
+            var high = total;
+            while (low < high) {
+                const mid = low + (high - low) / 2;
+                if (@as(f64, @floatFromInt(mid)) * per_frame >= current)
+                    high = mid
+                else
+                    low = mid + 1;
+            }
+            return low;
+        }
+
         /// Glm5NextVideoProcessor.sample_frames on the loader's metadata: distinct indices (the even pad once).
         pub fn sample(a: std.mem.Allocator, s: Source, max_frames: u32) Error![]u32 {
-            if (s.frames == 0 or s.rate_num == 0 or s.rate_den == 0) return error.BadVideo;
+            // The decoder accepts signed C frame indices and rational-rate fields. Validate before integer products/casts.
+            const largest: u64 = std.math.maxInt(c_int);
+            if (s.frames == 0 or s.frames > largest + 1 or s.rate_num == 0 or s.rate_num > largest or
+                s.rate_den == 0 or s.rate_den > largest) return error.BadVideo;
             const total = s.frames;
             const fps = s.fps();
             var duration = s.duration();
@@ -132,12 +150,15 @@ pub fn For(comptime picture: type) type {
                 const per_frame = 1.0 / fps;
                 const inv: f64 = 1.0 / sample_fps;
                 var current: f64 = 0;
-                for (0..total) |i| {
-                    if (@as(f64, @floatFromInt(i)) * per_frame >= current) {
-                        current += inv;
-                        try picked.append(a, @intCast(i));
-                        if (current >= max_seconds) break;
-                    }
+                var cursor: u64 = 0;
+                while (cursor < total) {
+                    const i = firstFrame(cursor, total, per_frame, current);
+                    if (i == total) break;
+                    current += inv;
+                    try picked.append(a, @intCast(i));
+                    // One excess sample already selects the full-range linspace branch below.
+                    if (current >= max_seconds or picked.items.len > extract_t) break;
+                    cursor = i + 1;
                 }
                 if (picked.items.len < extract_t) {
                     const start: f64 = if (picked.items.len == 0) 0 else @floatFromInt(picked.items[0]);
