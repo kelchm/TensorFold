@@ -87,6 +87,7 @@ test {
     _ = train_q4;
     _ = train_attn;
     _ = @import("memory.zig");
+    _ = @import("download_stage_test.zig");
     _ = memory_receipt;
     _ = @import("grouped.zig");
     _ = @import("qlinear.zig");

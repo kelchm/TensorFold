@@ -19,10 +19,22 @@ const Readback = struct {
         copies += 1;
         return cuda.abi.success;
     }
+
+    fn contextDevice(out: *cuda.abi.Device) callconv(.c) cuda.abi.Result {
+        out.* = 0;
+        return cuda.abi.success;
+    }
+
+    fn deviceAttribute(out: *c_int, _: cuda.abi.DeviceAttribute, _: cuda.abi.Device) callconv(.c) cuda.abi.Result {
+        out.* = 0;
+        return cuda.abi.success;
+    }
 };
 
 fn close(comptime T: type, got: []const T, want: []const f64, tol: []const f64) !void {
     var d: cuda.Driver = undefined;
+    d.api.cuCtxGetDevice = Readback.contextDevice;
+    d.api.cuDeviceGetAttribute = Readback.deviceAttribute;
     d.api.cuStreamSynchronize = Readback.sync;
     d.api.cuMemcpyDtoH_v2 = Readback.copy;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
