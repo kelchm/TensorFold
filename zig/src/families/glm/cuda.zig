@@ -27,6 +27,7 @@ pub const config = @import("config.zig");
 pub const quant = @import("cuda_quant.zig");
 pub const q4 = @import("cuda_q4.zig");
 pub const ranks = @import("cuda_ranks.zig");
+pub const startup = @import("cuda_start.zig");
 pub const sampler = @import("cuda_sampler.zig");
 pub const prompt_sink = @import("cuda_prompt_sink.zig");
 pub const prompt_logprobs = @import("cuda_prompt_logprobs.zig");

@@ -158,7 +158,7 @@ def build_fixture(family="prose", tokenizer=None, context_tokens=128, rounds=3, 
                           "active_streams": active, "placement": placement, "pool": {}},
                "streams": streams, "preparation": preparation, "forwards": forwards}
     largest = max(reservations(fixture, 512, 1)["stream_extents"].values())
-    capacity = configured_capacity if configured_capacity is not None else max(131072, largest)
+    capacity = configured_capacity if configured_capacity is not None else ((max(131072, largest) + 511) // 512) * 512
     h = pool_h if pool_h is not None else minimum_h(fixture, 512, capacity)
     fixture["config"]["pool"] = {"h": h, "page_tokens": 512, "configured_capacity": capacity, "prompt_twins": 1}
     return validate_fixture(seal_fixture(fixture), allow_synthetic=True)

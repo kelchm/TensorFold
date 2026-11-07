@@ -125,9 +125,7 @@ pub fn settings() !glm.ranks.Settings {
     for ([_][:0]const u8{ "TF_GLM_PROF", "TF_GLM_DFLASH2_PROF", "TF_GLM_DFLASH2_RING_DIGEST" }) |name| {
         if (glm.ranks.environment(name)) |v| if (!std.mem.eql(u8, v, "0")) return error.ReplayIntrusiveProfiler;
     }
-    if (glm.ranks.environment("TF_KV_PAGES")) |v| {
-        if (!std.mem.eql(u8, v, "on") and !std.mem.eql(u8, v, "auto")) return error.ReplayNeedsPages;
-    }
+    if (!try glm.startup.paging(glm.ranks.environment("TF_KV_PAGES"), 2, true)) return error.ReplayNeedsPages;
     return s;
 }
 

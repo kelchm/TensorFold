@@ -76,10 +76,10 @@ class FixtureTests(unittest.TestCase):
 
     def test_partial_commit_reoffers_discarded_lookahead(self):
         fixture = build_fixture(widths=(8, 4, 2, 1), keeps=(2, 1, 1, 1), permute=True,
-                                preparation_rounds=0, repetitions=2)
+                                preparation_rounds=1, repetitions=2)
         first = fixture["forwards"][0]["parts"][0]
         second = next(p for p in fixture["forwards"][1]["parts"] if p["stream_id"] == 0)
-        self.assertEqual(second["tape_offset"], 2)
+        self.assertEqual(second["tape_offset"], 3)
         self.assertEqual(offered_tokens(fixture, second)[:6], offered_tokens(fixture, first)[2:])
         self.assertEqual(next_anchor(fixture, first), offered_tokens(fixture, second)[0])
         self.assertEqual([p["stream_id"] for p in fixture["forwards"][1]["parts"]], [3, 2, 1, 0])
@@ -108,12 +108,12 @@ class FixtureTests(unittest.TestCase):
         self.assert_rejected(lambda f: f["streams"][0]["prompt_tokens"].__setitem__(0, 0), "prompt prefix")
 
     def test_final_full_keep_requires_next_forced_anchor(self):
-        fixture = build_fixture(active_streams=(0,), rounds=1, preparation_rounds=0, widths=(4, 4, 4, 4), repetitions=2)
+        fixture = build_fixture(active_streams=(0,), rounds=1, preparation_rounds=1, widths=(4, 4, 4, 4), repetitions=2)
         stream = fixture["streams"][0]
-        stream["rendered_tape"] = "abcd"
-        stream["tape_tokens"] = list(b"abcd")
+        stream["rendered_tape"] = "abcde"
+        stream["tape_tokens"] = list(b"abcde")
         from tools.perf.glm_replay.common import text_digest
-        stream["rendered_tape_sha256"] = text_digest("abcd")
+        stream["rendered_tape_sha256"] = text_digest("abcde")
         with self.assertRaisesRegex(ReplayError, "missing next forced anchor"):
             validate_fixture(seal_fixture(fixture), True)
 
@@ -132,12 +132,17 @@ class FixtureTests(unittest.TestCase):
         self.assertGreater(minimum_h(probe, 512, 1 << 20), 512)
 
     def test_page_boundary_reservation_includes_final_anchor(self):
-        before = build_fixture(context_tokens=510, active_streams=(0,), widths=(1, 1, 1, 1),
-                               preparation_rounds=0, rounds=1, repetitions=2)
-        after = build_fixture(context_tokens=511, active_streams=(0,), widths=(1, 1, 1, 1),
-                              preparation_rounds=0, rounds=1, repetitions=2)
-        self.assertEqual(reservations(before, 512, 1)["owner_pages"], [4, 4])
-        self.assertEqual(reservations(after, 512, 1)["owner_pages"], [5, 4])
+        before = build_fixture(context_tokens=494, active_streams=(0,), widths=(1, 1, 1, 1),
+                               preparation_rounds=1, rounds=1, repetitions=2)
+        after = build_fixture(context_tokens=495, active_streams=(0,), widths=(1, 1, 1, 1),
+                              preparation_rounds=1, rounds=1, repetitions=2)
+        self.assertEqual(reservations(before, 512, 1)["owner_pages"], [3, 3])
+        self.assertEqual(reservations(after, 512, 1)["owner_pages"], [4, 3])
+
+    def test_empty_preparation_and_unaligned_capacity_fail_before_engine_load(self):
+        self.assert_rejected(lambda f: f["preparation"].clear(), "empty preparation")
+        self.assert_rejected(lambda f: f["config"]["pool"].update(configured_capacity=131073), "multiple of 64")
+        self.assert_rejected(lambda f: f["config"]["pool"].update(prompt_twins=2), "one transient twin")
 
     def test_encode_each_rendered_stream_once(self):
         codec = SyntheticTokenizer()

@@ -124,7 +124,7 @@ def _schedule(fixture):
         active = {0, 1, 2, 3} if phase == "preparation" else timed_active
         forwards = fixture[phase]
         require(isinstance(forwards, list), f"{phase} must be an array")
-        require(phase == "preparation" or forwards, "empty timed schedule")
+        require(forwards, "empty preparation schedule" if phase == "preparation" else "empty timed schedule")
         for fid, forward in enumerate(forwards):
             fields(forward, "round_id forward_id parts", "forward")
             integer(forward["round_id"], "round_id")

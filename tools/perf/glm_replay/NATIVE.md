@@ -35,6 +35,8 @@ and compares both ranks' logical state, kept logits/taps and live drafter ring. 
 rebuilds state with timing disabled/enabled. Compare checks native off/on equality at actual
 owners. The one-block measure command is useful for a pilot; a campaign must preserve genuine
 process starts and repeated blocks, rather than assigning one start ID to unrelated processes.
+The [campaign entry point](../../../docs/recipes/glm-replay-campaign.md) runs an ordered case list
+within one actual rank session.
 
 ## Metadata and gates
 
@@ -55,7 +57,8 @@ Gate schema `glm-replay-native-gate-v1` requires `schema`, `gate`, `status`, `fi
 `config_sha256`, `binary_sha256`, `completed_ranks`, `comparisons`, `kv_shard`, `runtime_sha256`.
 Only `status=pass`, both completed ranks and positive comparisons admit measurement. Validation
 produces correctness/timing evidence on actual success; compare produces sharding equality.
-Default-server token/performance neutrality requires a separate external device receipt.
+Default-server token/performance neutrality uses the separate server-identity schema and offline
+producer in [SERVER_EVIDENCE.md](SERVER_EVIDENCE.md), rather than the replay gate schema/runtime.
 The host implementation supplies no passing device gates.
 
 ## Measurement boundary

@@ -13,7 +13,7 @@ CONFIG_FIELDS = ("engine speed tp slots dense_bits head_bits kv kv_shard multi_l
                  "query_bytes_per_row output_bytes_per_row graph_rows runtime_sha256")
 RECORD_FIELDS = ("schema fixture_sha256 schedule_sha256 tokens_sha256 config_sha256 run_id pair_id start_id "
                  "start_order block_id cell_id arm rank status exclusion_reason source effective_config "
-                 "effective_config_sha256 preparation_ns wall_ns completed_ranks forwards checks memory telemetry_sha256")
+                 "effective_config_sha256 preparation_ns wall_ns completed_ranks forwards checks memory telemetry_sha256 timing_source")
 FORWARD_FIELDS = ("forward_id round_id parts phases_ns owner graph_replays eager_fallbacks target_commits "
                   "context_commits ingest_calls proposer_calls lost")
 
@@ -152,6 +152,11 @@ def _record(record, fixtures):
             "missing both-rank completion receipt")
     integer(record["preparation_ns"], "preparation_ns")
     integer(record["wall_ns"], "wall_ns", 1)
+    timing = record["timing_source"]
+    fields(timing, "wall phases anchor_sha256", "timing source")
+    require(timing["wall"] == "observer_off", "headline wall must disable the observer")
+    require(timing["phases"] == "separate_observer_on_anchor", "phase intervals need a separate observed anchor")
+    hex_id(timing["anchor_sha256"], "anchor_sha256")
     hex_id(record["telemetry_sha256"], "telemetry_sha256")
     _source(record)
     _config(record, fixture)
@@ -185,7 +190,7 @@ def _rank_agreement(group):
     require(len(group) == 2 and {r["rank"] for r in group} == {0, 1}, "incomplete or duplicate rank block")
     left, right = sorted(group, key=lambda r: r["rank"])
     keys = ("fixture_sha256 schedule_sha256 tokens_sha256 config_sha256 run_id pair_id start_id start_order "
-            "block_id cell_id arm status exclusion_reason source effective_config effective_config_sha256 checks")
+            "block_id cell_id arm status exclusion_reason source effective_config effective_config_sha256 checks timing_source")
     for key in keys.split():
         require(digest(left[key]) == digest(right[key]), f"rank disagreement: {key}")
     require(len(left["forwards"]) == len(right["forwards"]), "rank schedule completion disagreement")

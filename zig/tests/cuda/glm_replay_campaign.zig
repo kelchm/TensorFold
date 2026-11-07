@@ -20,7 +20,8 @@ pub const Campaign = struct {
 };
 
 pub fn checkPages(value: ?[]const u8) !void {
-    if (!eq(value orelse "", "on")) return error.ReplayNeedsPages;
+    for ([_][]const u8{ "on", "1", "all" }) |on| if (eq(value orelse "", on)) return;
+    return error.ReplayNeedsPages;
 }
 
 pub fn parse(a: std.mem.Allocator, raw: []const u8) !Manifest {

@@ -57,9 +57,11 @@ Counter denominator is unique forward count, never stream participation count.
 
 Pool controls: off page argument=2H, on=2H+4, equal logical pages=2H.
 Production per-part minimum=max(131072,configured_capacity//4) tokens, no synthetic bypass.
-Reserve ceil((prompt length+maximum offered/anchor extent)/page_tokens) pages per stream,
-plus prompt_twins times ceil(prompt length/page_tokens), separately per actual owner.
-H must cover both owners' reservations and production minimum. Twins returned before timing.
+Reserve ceil((maximum prompt/offered extent+16)/page_tokens) pages per stream, then the largest
+single opposite-owner prompt twin on each part. prompt_twins is exactly one; the twin is returned
+before another prefill. configured_capacity is a multiple of 64 and covers all reserved extents.
+H must cover both parts' reservations and production minimum. Preparation is nonempty and all
+twins are returned before timing.
 
 ## Results (glm-replay-result-v1 JSONL)
 
@@ -68,7 +70,11 @@ Required keys: schema, fixture_sha256, schedule_sha256, tokens_sha256, config_sh
 run_id, pair_id, start_id, start_order (0|1), block_id, cell_id, arm (A|B|P), rank (0|1),
 status (complete|excluded), exclusion_reason (null|string), source, effective_config,
 effective_config_sha256, preparation_ns, wall_ns, completed_ranks:[0,1], forwards,
-checks, memory, telemetry_sha256.
+checks, memory, telemetry_sha256, timing_source.
+timing_source={wall:"observer_off",phases:"separate_observer_on_anchor",anchor_sha256}.
+The actual combined-rank anchor artifact is retained separately; its hash covers its file bytes.
+Headline wall time has no event observer. Phase intervals describe the separate identical-work
+anchor, and must not be subtracted from or summed into headline wall time.
 source={engine_commit,harness_commit,binary_sha256,fatbin_sha256,compiler_sha256,
 kit_commit,image_digest,device_image_digest}; all commits full 40 hex, all digests full.
 effective_config={engine:"native"|"python",speed:"standard",tp:2,slots:4,

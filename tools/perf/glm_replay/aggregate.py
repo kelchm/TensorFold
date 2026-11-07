@@ -38,6 +38,7 @@ def _start_summary(blocks, tokens):
                         "preparation_ns_by_rank": b["preparation_ns_by_rank"],
                         "phases_ns_by_rank": b["phases_ns_by_rank"],
                         "owner_counters_by_rank": b["owner_counters_by_rank"],
+                        "timing_source": b["timing_source"],
                         "memory_by_rank": b["memory_by_rank"], "telemetry_sha256_by_rank": b["telemetry_sha256_by_rank"]} for b in blocks]}
 
 
@@ -51,6 +52,7 @@ def _block(group):
             "memory_by_rank": [r["memory"] for r in ranks],
             "telemetry_sha256_by_rank": [r["telemetry_sha256"] for r in ranks],
             "phases_ns_by_rank": [[f["phases_ns"] for f in r["forwards"]] for r in ranks],
+            "timing_source": first["timing_source"],
             "owner_counters_by_rank": [[f["owner"] for f in r["forwards"]] for r in ranks]}
 
 

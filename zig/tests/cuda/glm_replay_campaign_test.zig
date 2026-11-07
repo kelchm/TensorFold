@@ -24,8 +24,8 @@ fn control(cell: []const u8, block: []const u8, output: []const u8) campaign.Cas
 }
 
 test "campaign refuses implicit FP8 page mode before opening the driver" {
-    try campaign.checkPages("on");
-    for ([_]?[]const u8{ null, "auto", "off", "", "1" }) |value|
+    for ([_][]const u8{ "on", "1", "all" }) |value| try campaign.checkPages(value);
+    for ([_]?[]const u8{ null, "auto", "off", "", "0", "invalid" }) |value|
         try std.testing.expectError(error.ReplayNeedsPages, campaign.checkPages(value));
 }
 

@@ -70,7 +70,7 @@ pub fn read(a: std.mem.Allocator, io: std.Io, path: []const u8, f: fixture.Fixtu
         try gate(a, io, m.sharding_equality orelse return error.ShardingEqualityUnrun, m, "sharding_equality", sharded, null);
         try gate(a, io, m.correctness orelse return error.CorrectnessUnrun, m, "correctness", sharded, null);
         try gate(a, io, m.timing_neutrality orelse return error.TimingNeutralityUnrun, m, "timing_neutrality", sharded, null);
-        try gate(a, io, m.default_server_neutrality orelse return error.DefaultServerNeutralityUnrun, m, "default_server_neutrality", sharded, null);
+        try @import("glm_replay_server_gate.zig").read(a, io, m.default_server_neutrality orelse return error.DefaultServerNeutralityUnrun, m.source, fileHash);
     }
     return m;
 }
@@ -114,7 +114,6 @@ pub fn checkRuntime(a: std.mem.Allocator, io: std.Io, m: Metadata, sharded: bool
     try gate(a, io, m.sharding_equality.?, m, "sharding_equality", sharded, runtime_hash);
     try gate(a, io, m.correctness.?, m, "correctness", sharded, runtime_hash);
     try gate(a, io, m.timing_neutrality.?, m, "timing_neutrality", sharded, runtime_hash);
-    try gate(a, io, m.default_server_neutrality.?, m, "default_server_neutrality", sharded, runtime_hash);
 }
 
 pub fn checkTelemetry(a: std.mem.Allocator, io: std.Io, m: Metadata) !void {

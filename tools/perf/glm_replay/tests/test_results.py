@@ -101,6 +101,19 @@ class ResultTests(unittest.TestCase):
         with self.assertRaisesRegex(ReplayError, "invalid number"):
             self.validate()
 
+    def test_headline_must_be_observer_off_and_separate_anchor_is_bound(self):
+        self.records[0]["timing_source"]["wall"] = "observer_on"
+        with self.assertRaisesRegex(ReplayError, "disable the observer"):
+            self.validate()
+        self.records[0]["timing_source"]["wall"] = "observer_off"
+        self.records[0]["timing_source"]["phases"] = "headline_block"
+        with self.assertRaisesRegex(ReplayError, "separate observed anchor"):
+            self.validate()
+        self.records[0]["timing_source"]["phases"] = "separate_observer_on_anchor"
+        self.records[0]["timing_source"]["anchor_sha256"] = "c" * 64
+        with self.assertRaisesRegex(ReplayError, "rank disagreement"):
+            self.validate()
+
     def test_hashes_and_effective_configuration_are_bound(self):
         self.records[0]["schedule_sha256"] = "0" * 64
         with self.assertRaisesRegex(ReplayError, "schedule_sha256 mismatch"):

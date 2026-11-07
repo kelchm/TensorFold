@@ -45,6 +45,8 @@ def receipt(fixture, arm="A", pair=0, block=0, rank=0, wall=1_000_000):
             "preparation_ns": 500_000, "wall_ns": wall, "completed_ranks": [0, 1], "forwards": forwards,
             "checks": {"correctness": True, "timing_neutral": True, "default_server_neutral": True,
                        "fresh_prefill": True, "proposer_calls": 0, "lost": 0, "carries": 0, "twins": 0},
+            "timing_source": {"wall": "observer_off", "phases": "separate_observer_on_anchor",
+                              "anchor_sha256": "b" * 64},
             "memory": {"logical_pages": 2 * h, "key_page_bytes": key, "latent_page_bytes": latent,
                        "row_page_bytes": rows, "tables_bytes": 0, "scratch_bytes": 0, "other_bytes": 0,
                        "peak_physical_bytes": rows}, "telemetry_sha256": "7" * 64}
