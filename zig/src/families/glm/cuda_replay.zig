@@ -10,6 +10,7 @@ const pages = @import("cuda_pages.zig");
 const kvs = @import("cuda_kv_shard.zig");
 const dflash = @import("dflash.zig");
 const boundary = @import("cuda_replay_boundary.zig");
+pub const runtime = @import("cuda_replay_runtime.zig");
 pub const timing = @import("cuda_replay_timing.zig");
 pub const capture_mod = @import("cuda_replay_capture.zig");
 pub const Snapshot = capture_mod.Snapshot;
@@ -59,7 +60,8 @@ const Preflight = struct {
             return error.ReplayConfiguration;
         if (!try @import("cuda_start.zig").paging(ranks.environment("TF_KV_PAGES"), 2, true))
             return error.ReplayNeedsPages;
-        for ([_][:0]const u8{ "TF_GLM_PROF", "TF_GLM_DFLASH2_PROF", "TF_GLM_DFLASH2_RING_DIGEST" }) |name| {
+        if (ranks.environment("TF_GLM_DFLASH2_PROF") != null) return error.ReplayIntrusiveProfiler;
+        for ([_][:0]const u8{ "TF_GLM_PROF", "TF_GLM_DFLASH2_RING_DIGEST" }) |name| {
             if (ranks.environment(name)) |v| if (!std.mem.eql(u8, v, "0")) return error.ReplayIntrusiveProfiler;
         }
     }
@@ -70,6 +72,8 @@ pub const Session = struct {
     state: boundary.Boundary,
     trace: ?timing.Trace = null,
     options: Options,
+    runtime_sha256: [32]u8 = undefined,
+    runtime_ranks: [2][32]u8 = undefined,
     prepared: bool = false,
     ended: bool = false,
     failed: bool = false,
@@ -89,10 +93,14 @@ pub const Session = struct {
         errdefer capture_dev.free();
         s.* = .{ .owned = owned, .state = b, .options = r, .capture_dev = capture_dev };
         s.trace = try timing.Trace.init(gpa, ctx.d, r.max_forwards);
+        errdefer if (s.trace) |*t| t.deinit();
         if (s.trace) |*t| {
             s.state.trace_store = t;
             s.state.audit.trace = if (r.observe) t else null;
         }
+        const mine = try runtime.loaded(owned.e);
+        try ranks.gather([32]u8, ctx.d, &owned.group.lib, owned.group.comm, owned.e.stream, owned.group.rank, mine, &s.runtime_ranks);
+        s.runtime_sha256 = runtime.combine(s.runtime_ranks);
         owned.e.replay = &s.state;
         owned.e.replay_capture = .{ .ptr = s, .run = captureRank };
         return s;
@@ -264,4 +272,5 @@ test {
     _ = boundary;
     _ = capture_mod;
     _ = timing;
+    _ = runtime;
 }
