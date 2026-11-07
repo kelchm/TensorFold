@@ -139,7 +139,7 @@ pub const Engine = struct {
     index_splits: u64 = 0, // prompt steps whose indexer rows split (glm-split-check counts them)
     a8_buf: ?cuda.DeviceBuffer = null, // TF_GLM_W8A8=1: a prompt pass's int8 rows and scales (cuda_mm.A8)
     partial: ?PartialFill = null, // TF_GLM_FILL_SLICE_MS: the one prompt chunk between its layers (its slot bound to run it)
-    slice_costs: LayerCosts = .{}, // bounded exact-row timing bands; unknown rows start one layer at a time
+    slice_costs: LayerCosts = .{}, // fixed row buckets; unknown buckets start one layer at a time
     slice_workspace: ?*sliced.Workspace = null, // one startup allocation, shared by sequential chunk leases
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.

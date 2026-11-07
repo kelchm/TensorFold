@@ -88,6 +88,9 @@ pub const Backend = struct {
         prefill: *const fn (ptr: *anyopaque, s: *Stream) anyerror!void,
         /// One chunk of the prompt pass, false while chunks remain; null: the pass runs whole.
         prefill_step: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!bool = null,
+        /// Suspended prompt whose next step owns shared prefill scratch; null: ordinary choice. The host honors
+        /// only a begun, nonterminal job still in its fill queue, without bypassing decode share or row budgets.
+        prefill_owner: ?*const fn (ptr: *anyopaque) ?*const Stream = null,
         /// Keep a cancelled partial prompt before release, between prefill_step calls; no prompt work may run.
         cancel_prefill: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!void = null,
         /// Several prompts in one pass, each as after `prefill`; false or an error leaves none prefilled.

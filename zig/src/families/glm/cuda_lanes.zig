@@ -108,6 +108,7 @@ pub const Lanes = struct {
     const steps_vt: be.Backend.VTable = vt: {
         var v = whole_vt;
         v.prefill_step = prefillStepFn;
+        v.prefill_owner = prefillOwnerFn;
         v.cancel_prefill = cancelPrefillFn;
         v.prefill_many = null;
         v.many_rows = 0;
@@ -315,6 +316,14 @@ pub const Lanes = struct {
         for (ss, firsts) |s, t| self.lanes.getPtr(s).?.first = self.take(t);
     }
 
+    fn prefillOwnerFn(ptr: *anyopaque) ?*const lanes.Stream {
+        const self = of(ptr);
+        const p = self.x.e.partial orelse return null;
+        var it = self.lanes.iterator();
+        while (it.next()) |entry| if (entry.value_ptr.slot == p.slot) return entry.key_ptr.*;
+        return null;
+    }
+
     /// One step of the stream's prompt pass (other rounds run between): a slice of a chunk while
     /// TF_GLM_FILL_SLICE_MS holds one open, else a chunk; true once the first token is drawn.
     fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
@@ -324,8 +333,9 @@ pub const Lanes = struct {
         const mine: ?u32 = if (self.lanes.getPtr(s)) |l| l.slot else null;
         if (mine != null) if (self.lanes.getPtr(s).?.first != null and self.lanes.getPtr(s).?.fill == null) return true; // its prompt ended inside another stream's step
         if (e.partial) |p| if (mine == null or p.slot != mine.?) {
-            // Host charged this choice to s: finish the foreign chunk, then advance s in the same call.
-            try self.drainPartial();
+            // Host must select the suspended owner. Direct callers also cannot spend this stream's turn
+            // on another stream's forward, callbacks or error: the open chunk remains untouched.
+            return error.SliceBusy;
         };
         const going: ?usize = if (self.lanes.getPtr(s)) |l| l.fill else null;
         const from = if (going == null) try self.opening(s) else null;
@@ -381,8 +391,9 @@ pub const Lanes = struct {
         };
         const at = l.fill orelse return;
         if (at <= s.cached or s.reuse.hook == null) return;
-        // A foreign partial must finish with its own marks/logprob owner before this lane announces a whole chunk.
-        try self.drainPartial();
+        // Cancellation must not run another prompt's model work. Skip this waiter's interrupted-prefix
+        // publication while foreign scratch is leased; its earlier published marks remain reusable.
+        if (self.x.e.partial != null) return;
         try self.x.bind(l.slot);
         _ = self.x.chunk(s.prompt(), at, false, null, .{ .ptr = null, .check = cancelNow }, marksOf(s)) catch |err| {
             if (err == error.Cancelled) return;

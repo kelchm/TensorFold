@@ -38,9 +38,18 @@ pub fn resident(e: *const Engine) usize {
     return if (e.slice_workspace) |w| w.resident() else 0;
 }
 
+fn profile(p: *const Partial) engine.LayerCosts.Profile {
+    const last = p.start + p.rows == p.len;
+    return if (p.logprobs != null)
+        (if (last) .logprobs_final else .logprobs_chunk)
+    else
+        (if (last) .final else .chunk);
+}
+
 pub fn hi(e: *Engine, rows: usize, lo: usize, budget: f64) !usize {
     if (lo >= e.w.layers.len or !std.math.isFinite(budget) or budget <= 0) return error.BadSlice;
-    if (e.slice_costs.readyRows(rows)) return @min(e.w.layers.len, e.slice_costs.stop(rows, lo, budget));
+    const tail_profile = if (e.partial) |*p| profile(p) else .final;
+    if (e.slice_costs.readyRows(rows)) return @min(e.w.layers.len, e.slice_costs.stopProfile(rows, lo, budget, tail_profile));
     return lo + 1;
 }
 
@@ -164,8 +173,8 @@ pub fn run(e: *Engine, part: []const u32, start: usize, len: usize, from: ?engin
     if (!p.calibrated) {
         p.costs[end] = tail_ms;
         // Direct callers may choose wider cold ranges; only complete single-layer measurements train a band.
-        if (p.measured == end) e.slice_costs.calibrate(p.rows, p.costs[0 .. end + 1]) catch {};
-    } else e.slice_costs.observeTail(p.rows, tail_ms);
+        if (p.measured == end) e.slice_costs.calibrateProfile(p.rows, p.costs[0 .. end + 1], profile(p)) catch {};
+    } else e.slice_costs.observeTailProfile(p.rows, tail_ms, profile(p));
     if ((e.shared(0) catch |err| undo.fatal(err)) != 0) undo.fatal(error.PeerSliceCommit);
     e.index_splits += @intFromBool(p.split);
     dispose(e, e.slot);
@@ -186,4 +195,8 @@ fn tail(e: *Engine, f: *fw.Forward, p: *const Partial) !?u32 {
     }
     try f.commit(p.rows);
     return first;
+}
+
+comptime {
+    std.debug.assert(engine.prompt_rows == engine.LayerCosts.row_limits[engine.LayerCosts.row_limits.len - 1]);
 }

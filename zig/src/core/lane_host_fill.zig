@@ -4,19 +4,41 @@ const LaneHost = @import("lane_host.zig").LaneHost;
 
 pub const preference_rounds = 8;
 
-/// After eight skipped choices, oldest wait wins; each fill runs within eight plus the admitted lane count.
+/// After eight skipped chunk choices, oldest wait wins; suspended continuations spend no further choices.
 pub fn next(h: *const LaneHost) usize {
     return took(h, pick(h, .all).?);
 }
 
 /// Fill `at` taken: its wait starts over, every other one's grows.
 fn took(h: *const LaneHost, at: usize) usize {
+    // One fair choice per chunk, not per layer range: slicing must not age every waiter into equal sharing.
+    if (owner(h) == at) return at;
     for (h.filling.items, 0..) |j, i| j.fill_wait = if (i == at) 0 else j.fill_wait +| 1;
     return at;
 }
 
+/// A backend can retain shared scratch for a suspended fill, never for a released, unbegun or terminal job.
+fn owner(h: *const LaneHost) ?usize {
+    // No begun fill can own suspended scratch. Keep ordinary admission choices independent of the backend.
+    const begun = for (h.filling.items) |j| {
+        if (j.fill_began and j.prefilled == null and !j.stream.finished) break true;
+    } else false;
+    if (!begun) return null;
+    const backend = h.core.backend;
+    const suspended = backend.vtable.prefill_owner orelse return null;
+    const stream = suspended(backend.ptr) orelse return null;
+    for (h.filling.items, 0..) |j, i| {
+        if (&j.stream == stream and j.fill_began and j.prefilled == null and !j.stream.finished) return i;
+    }
+    return null;
+}
+
 /// The fill `next` takes among `among`, its waits untouched; null when none waits.
 fn pick(h: *const LaneHost, among: enum { all, short, long }) ?usize {
+    if (owner(h)) |at| {
+        // A long owner's debt still gates its next step; a short arrival cannot borrow that step or its scratch.
+        return if (among == .all or short(h.filling.items[at]) == (among == .short)) at else null;
+    }
     var found: ?usize = null;
     for (h.filling.items, 0..) |j, i| {
         if (among != .all and short(j) != (among == .short)) continue;
