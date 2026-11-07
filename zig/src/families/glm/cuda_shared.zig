@@ -10,6 +10,27 @@ const kda_block = @import("cuda_kda_block.zig");
 const dsa_block = @import("cuda_dsa_block.zig");
 const glue = @import("cuda_glue.zig");
 const projection = @import("cuda_proj.zig");
+const sparse = @import("cuda_sparse.zig");
+
+/// Whether a decode shared window's segments take one latent attention launch (dsa_block.segsKind) on this buffer:
+/// it holds every segment's partials apart (part_chunks), each segment fits one dense block, the pages share a stride.
+fn segsKind(r: fw.Rank, a: dsa_block.Layer, di: usize) ?dsa_block.SegsKind {
+    const b = r.b;
+    if (b.prefill or b.part_chunks == 0 or r.segs.len == 0 or r.segs.len > latent.max_segs) return null;
+    if (b.part_chunks < @max(b.nch, latent.chunksFor(sparse.width))) return null;
+    var caches: [latent.max_segs]dsa_block.Caches = undefined;
+    var host_pos: [latent.max_segs]usize = undefined;
+    var rows: [latent.max_segs]usize = undefined;
+    const ps = r.segs[0].st.caches[di].ps;
+    for (r.segs, 0..) |g, i| {
+        if (g.rows > b.part_rows or g.st.caches[di].ps != ps) return null;
+        caches[i] = g.st.caches[di];
+        host_pos[i] = g.st.pos;
+        rows[i] = g.rows;
+    }
+    const n = r.segs.len;
+    return dsa_block.segsKind(a, caches[0..n], host_pos[0..n], rows[0..n]);
+}
 
 /// Checks a shared window's segments (a prompt buffer's: whole prompts) against its `rows` rows; each holds its own.
 pub fn begin(r: fw.Rank, rows: usize, stream: cuda.Stream) !void {
@@ -47,7 +68,11 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             var s = b.kda;
             s.p = b.kproj;
             try kda_block.project(f.set(), f.stream, k, s, b.normed, c.hidden, rows);
-            for (r.segs) |g| {
+            // a decode window on the three-kernel chain: every segment's chain in one launch each (kda.chainSegs),
+            // their q and y scratch rows at the segment's own offset; the same blocks, so the same bits
+            const batched = !b.prefill and f.kda_wide and f.m.shared_segs and r.segs.len <= kda.max_segs;
+            var t: kda.Segs = undefined;
+            for (r.segs, 0..) |g, i| {
                 const st = g.st;
                 const cur = st.cur[li];
                 var v = s;
@@ -70,17 +95,48 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
                 v.saves.v = st.save_v + kv * 2;
                 v.saves.g = st.save_g + kv * 4;
                 v.saves.b = st.save_b + li * fw.window_rows * st.heads * 4;
-                try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), f.kda_wide);
+                if (batched) {
+                    t.s[i] = .{ .p = v.p, .a = v.ka, .g = v.kg, .cs = conv, .state_in = st.recAt(cur, li), .state_out = v.saves.state_out, .q = s.wide.q + g.row0 * n * 4, .k = v.saves.k, .v = v.saves.v, .gs = v.saves.g, .b = v.saves.b, .y = s.wide.y + g.row0 * n * 2, .out = v.saves.out, .rows = @intCast(g.rows) };
+                } else try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), f.kda_wide);
             }
+            if (batched) try kda_block.chainSegs(&f.m.kda, f.stream, k, &t, r.segs.len);
             if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
         },
         .mla => |a| {
             var sparse_any = false;
             for (r.segs) |g| sparse_any = sparse_any or dsa_block.sparseRows(a, g.st.pos, g.rows);
             try dsa_block.prepare(f.set(), f.stream, a, b.dsa, b.normed, c.hidden, rows, sparse_any);
-            for (r.segs) |g| {
+            const kk: dsa_block.Kernels = .{ .set = f.set(), .ops = f.m.ops() };
+            if (if (f.m.shared_segs) segsKind(r, a, di) else null) |kind| { // every segment's latent attention in one launch
+                var t: latent.AttnSegs = undefined;
+                t.n = @intCast(r.segs.len);
+                for (r.segs, 0..) |g, i| {
+                    const cache = g.st.caches[di];
+                    const v = try dsa_block.attendWrite(kk, f.stream, a, cache, b.dsa, g.row0, g.rows, g.st.pos_dev);
+                    const tok = b.dsa.tokens + g.row0 * sparse.width * 4; // each segment's own lists and partials
+                    const cnt = b.dsa.counts + g.row0 * 4;
+                    if (kind == .sparse) try dsa_block.attendSelect(kk, f.stream, a, cache, v, g.rows, g.st.pos_dev, g.st.pos, tok, cnt);
+                    const at = b.part_chunks * g.row0 * a.heads;
+                    t.s[i] = .{
+                        .qa = v.qa,
+                        .lc = cache.lc,
+                        .scales = cache.ls,
+                        .pos = if (kind == .dense) g.st.pos_dev else 0,
+                        .tok = if (kind == .sparse) tok else 0,
+                        .cnt = if (kind == .sparse) cnt else 0,
+                        .po = b.dsa.partials.po + at * a.lw * 4,
+                        .pm = b.dsa.partials.pm + at * 4,
+                        .pl = b.dsa.partials.pl + at * 4,
+                        .pt = cache.pt,
+                        .rows = @intCast(g.rows),
+                        .nch = @intCast(if (kind == .dense) @min(latent.chunksFor(g.st.pos + g.rows), b.nch) else latent.chunksFor(sparse.width)),
+                        .row0 = @intCast(g.row0),
+                    };
+                }
+                try dsa_block.attendSegs(kk, f.stream, a, b.dsa, &t, rows, r.segs[0].st.caches[di].ps, kind);
+            } else for (r.segs) |g| {
                 const nch = @min(latent.chunksFor(g.st.pos + g.rows), b.nch);
-                try dsa_block.attend(.{ .set = f.set(), .ops = f.m.ops() }, f.stream, a, g.st.caches[di], b.dsa, g.row0, g.rows, g.st.pos_dev, g.st.pos, nch, b.part_rows);
+                try dsa_block.attend(kk, f.stream, a, g.st.caches[di], b.dsa, g.row0, g.rows, g.st.pos_dev, g.st.pos, nch, b.part_rows);
             }
             try latent.expandV(f.set(), f.stream, b.dsa.ol, a.wv, b.dsa.vn, rows, a.heads, a.dv, a.lw);
             if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);

@@ -132,6 +132,38 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
     const set = k.set;
     const ix = l.index;
     const kw_rows = ix.d + ix.heads;
+    const v = try attendWrite(k, stream, l, c, s, r0, rows, pos);
+    const t = table(l, c);
+    const scale = attnScale(l);
+    if (host_pos < l.dense_limit) {
+        const stamp = prof.span(k.prof, stream, .mla);
+        try denseAttention(k, stream, l, c, v, pos, rows, nch, part_rows, scale);
+        stamp.end();
+    }
+    if (sparseRows(l, host_pos, rows)) {
+        try sparse.selectTokensProfile(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, t, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts, k.split, k.prof);
+        const stamp = prof.span(k.prof, stream, .mla);
+        defer stamp.end();
+        try latent.sparseAttentionFormat(set, stream, v.qa, c.lc, c.ls, t, v.tokens, v.counts, sparse.width, v.partials, v.ol, rows, l.heads, l.lw, scale);
+    }
+}
+
+/// The latent cache's table: an E4M3 cache's sparse lists stay positions (its chunks take each key through the
+/// table); BF16's are page rows.
+fn table(l: Layer, c: Caches) latent.Table {
+    return .{ .pt = c.pt, .ps = c.ps, .page_rows = c.ps / (l.lw * 2), .logical = c.ls != 0 };
+}
+
+fn attnScale(l: Layer) f32 {
+    return @floatCast(std.math.pow(f64, @floatFromInt(l.qk), -0.5));
+}
+
+/// attend's first part: the scratch from row r0 (its rows' latents, index keys and gates, queries, outputs), and the
+/// rows' latents and index keys written into the sequence's caches at pos.
+pub fn attendWrite(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, r0: usize, rows: usize, pos: u64) !Scratch {
+    const set = k.set;
+    const ix = l.index;
+    const kw_rows = ix.d + ix.heads;
     var v = s; // the scratch from row r0
     v.lat += r0 * l.lw * 2;
     v.ikr += r0 * kw_rows * 2;
@@ -140,26 +172,42 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
     v.ol += r0 * l.heads * l.lw * 2;
     v.qi += r0 * ix.heads * ix.d * 2;
     if (c.ps % (l.lw * 2) != 0) return error.LatentShape; // pages whole latent rows apart (the token lists' unit)
-    // an E4M3 cache's sparse lists stay positions (its chunks take each key through the table); BF16's are page rows
-    const t: latent.Table = .{ .pt = c.pt, .ps = c.ps, .page_rows = c.ps / (l.lw * 2), .logical = c.ls != 0 };
+    const t = table(l, c);
     var stamp = prof.span(k.prof, stream, .cache_write);
     try latent.latentWriteFormat(set, stream, v.lat, l.lw, c.lc, c.ls, t, pos, rows, l.lw);
     stamp.end();
     stamp = prof.span(k.prof, stream, .index_update);
     try sparse.indexUpdate(set, stream, v.ikr, kw_rows, v.igr, ix.ln_w, ix.ln_b, ix.ape, c.ik, c.ig, c.pk, t, pos, rows);
     stamp.end();
-    const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(l.qk), -0.5));
-    if (host_pos < l.dense_limit) {
-        stamp = prof.span(k.prof, stream, .mla);
-        try denseAttention(k, stream, l, c, v, pos, rows, nch, part_rows, scale);
-        stamp.end();
+    return v;
+}
+
+/// A shared window's segments with one latent attention launch for them all, when every segment can: decode rows on
+/// E4M3 pages (16-head blocks), each segment wholly dense or wholly sparse and all of one kind. `kind` reports which.
+pub const SegsKind = enum { dense, sparse };
+pub fn segsKind(l: Layer, caches: []const Caches, host_pos: []const usize, rows: []const usize) ?SegsKind {
+    var kind: ?SegsKind = null;
+    for (caches, host_pos, rows) |c, p, n| {
+        if (c.ls == 0 or c.pt == 0 or n == 0 or n >= 64) return null; // E4M3 on pages, 16-head blocks
+        const k: SegsKind = if (p + n - 1 < l.dense_limit) .dense else if (p >= l.dense_limit) .sparse else return null;
+        if (kind) |was| if (was != k) return null;
+        kind = k;
     }
-    if (sparseRows(l, host_pos, rows)) {
-        try sparse.selectTokensProfile(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, t, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts, k.split, k.prof);
-        stamp = prof.span(k.prof, stream, .mla);
-        defer stamp.end();
-        try latent.sparseAttentionFormat(set, stream, v.qa, c.lc, c.ls, t, v.tokens, v.counts, sparse.width, v.partials, v.ol, rows, l.heads, l.lw, scale);
-    }
+    return kind;
+}
+
+/// A batched segment's sparse selection (attend's): its token lists and counts at `tokens` and `counts`.
+pub fn attendSelect(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, v: Scratch, rows: usize, pos: u64, host_pos: usize, tokens: u64, counts: u64) !void {
+    const ix = l.index;
+    const kw_rows = ix.d + ix.heads;
+    try sparse.selectTokensProfile(k.set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, table(l, c), pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, tokens, counts, k.split, k.prof);
+}
+
+/// The segments' latent attention (latent.attentionSegs) into s.ol, with the layer's scale.
+pub fn attendSegs(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, t: *const latent.AttnSegs, rows: usize, pstep: u64, kind: SegsKind) !void {
+    const stamp = prof.span(k.prof, stream, .mla);
+    defer stamp.end();
+    try latent.attentionSegs(k.set, stream, t, rows, l.heads, l.lw, if (kind == .sparse) sparse.width else 0, attnScale(l), pstep, kind == .sparse, s.ol);
 }
 
 /// forward.dense_attention: latent.attention in `part_rows`-row blocks, each at its first row's position.

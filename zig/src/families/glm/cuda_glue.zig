@@ -77,6 +77,8 @@ pub const Kernels = struct {
     chunks_16_fp8_paged_fused: cuda.Function,
     chunks_32_fp8_paged_fused: cuda.Function,
     merge: cuda.Function,
+    chunks_16_fp8_paged_segs: cuda.Function, // a shared window's segments in one launch (latent.attentionSegs)
+    merge_segs: cuda.Function,
     scores: cuda.Function,
     latent_mma_kn: cuda.Function, // TF_GLM_ABSORB_MMA (glm_glue_num.cuh): absorb_q's head-batched GEMM, B as [K][N]
     latent_mma_nk: cuda.Function, // and expand_v's, B as [N][K]
@@ -91,6 +93,7 @@ pub const Kernels = struct {
         try k.chunks_16_fp8.allowDynamicShared(chunksSmem(16));
         try k.chunks_32_fp8.allowDynamicShared(chunksSmem(32));
         try k.chunks_16_fp8_paged.allowDynamicShared(chunksSmem(16));
+        try k.chunks_16_fp8_paged_segs.allowDynamicShared(chunksSmem(16));
         try k.chunks_32_fp8_paged.allowDynamicShared(chunksSmem(32));
         try k.chunks_16_fused.allowDynamicShared(chunksSmem(16));
         try k.chunks_32_fused.allowDynamicShared(chunksSmem(32));

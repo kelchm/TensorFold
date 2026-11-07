@@ -16,13 +16,61 @@ pub const Kernels = struct {
     prep: cuda.Function,
     step: cuda.Function,
     out: cuda.Function,
+    prep_segs: cuda.Function, // a shared window's segments in one launch each (chainSegs)
+    step_segs: cuda.Function,
+    out_segs: cuda.Function,
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
-        inline for (.{ "chain", "replay", "replay_layers", "prep", "step", "out" }) |name| @field(k, name) = try m.function("tf_glm_kda_" ++ name);
+        inline for (.{ "chain", "replay", "replay_layers", "prep", "step", "out", "prep_segs", "step_segs", "out_segs" }) |name| @field(k, name) = try m.function("tf_glm_kda_" ++ name);
         return k;
     }
 };
+
+/// The most segments one chainSegs launch takes (glm_kda.cu's KDA_SEGS: Engine.max_shared).
+pub const max_segs = 16;
+
+/// One segment of a shared window's KDA layer, as glm_kda.cu's KdaSeg: its rows, the stream's states and saves.
+pub const Seg = extern struct { p: u64, a: u64, g: u64, cs: u64, state_in: u64, state_out: u64, q: u64, k: u64, v: u64, gs: u64, b: u64, y: u64, out: u64, rows: c_int, pad: c_int = 0 };
+pub const Segs = extern struct { s: [max_segs]Seg };
+
+/// A shared window's KDA layer through the three-kernel chain with every segment in one launch each (z: the
+/// segment): each block is the block that segment's own `chain` (wide) launch runs, on its rows, states and saves,
+/// so the same bits; `c` gives the layer's shared fields (strides, conv weights, decay, norm), `t` the segments.
+pub fn chainSegs(ks: *const Kernels, stream: cuda.Stream, c: Chain, t: *const Segs, n: usize) !void {
+    if (n == 0 or n > max_segs) return error.TooManySegments;
+    var most: usize = 0;
+    for (t.s[0..n]) |g| most = @max(most, @as(usize, @intCast(g.rows)));
+    if (most == 0) return;
+    const h: c_int = @intCast(c.heads);
+    const z: u32 = @intCast(n);
+    var a: cuda.Args = .{};
+    a.add(h);
+    a.add(@as(c_int, @intCast(c.p_stride)));
+    a.add(@as(c_int, @intCast(c.b_off)));
+    a.add(@as(c_int, @intCast(c.a_stride)));
+    for ([_]u64{ c.conv_w, c.a_log, c.dt_bias }) |v| a.add(v);
+    a.add(c.lower);
+    a.add(t.*);
+    try cuda.launch.launch(ks.prep_segs, .{ .grid = .{ .x = @intCast(most), .y = @intCast(c.heads), .z = z }, .block = .{ .x = 512 } }, stream, &a);
+    var b: cuda.Args = .{};
+    b.add(h);
+    b.add(t.*);
+    try cuda.launch.launch(ks.step_segs, .{ .grid = .{ .x = @intCast(c.heads), .y = dv / 4 / 8, .z = z }, .block = .{ .x = 8 * 32 } }, stream, &b);
+    var o: cuda.Args = .{};
+    o.add(h);
+    o.add(@as(c_int, @intCast(c.g_stride)));
+    o.add(c.norm_w);
+    o.add(c.eps);
+    o.add(t.*);
+    try cuda.launch.launch(ks.out_segs, .{ .grid = .{ .x = @intCast(most), .y = @intCast(c.heads), .z = z }, .block = .{ .x = dv } }, stream, &o);
+}
+
+test "a shared window's KDA segments fit glm_kda.cu's table and one launch's arguments" {
+    try std.testing.expectEqual(@as(usize, 112), @sizeOf(Seg));
+    try std.testing.expectEqual(@as(usize, 16 * 112), @sizeOf(Segs));
+    try std.testing.expect(48 + @sizeOf(Segs) <= cuda.launch.Args.max_bytes); // prep's arguments, the largest
+}
 
 /// One layer's chain inputs, `heads` heads: p rows [q|k|v|f_a|g_a|...] (beta at `b_off`), decay and gate rows, states.
 pub const Chain = struct {
