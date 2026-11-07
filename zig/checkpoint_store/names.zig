@@ -5,18 +5,22 @@ const f = @import("format.zig");
 
 pub const Input = struct {
     tokens: []const u32,
-    spans: []const [2]u32 = &.{},
-    starts: []const u32 = &.{},
-    planned: bool = false,
+    spans: []const [2]u32,
+    starts: []const u32,
 };
 
-/// Inputs are the paused sequence's canonical tokens and prepared media, never a caller-chosen pathname.
-pub fn build(input: Input, metadata: *const glm.checkpoint_restore.Metadata, out: []f.Name) !void {
+/// GLM prompt kernels depend on planned chunk ends and canonical decode spans (native/glm_host.zig).
+pub fn rules(metadata: *const glm.checkpoint_restore.Metadata) f.chain.Keying {
+    return .{ .identity = 0x303639304d4c47, .block = glm.state.page_rows, .planned = true, .lookahead = @intFromBool(metadata.shape.flags & 2 != 0) };
+}
+
+fn validate(input: Input, metadata: *const glm.checkpoint_restore.Metadata) !void {
     try metadata.validate();
-    if (out.len > f.max_pages or out.len * glm.state.page_rows > metadata.mark or input.tokens.len < metadata.mark) return error.BlockIdentity;
+    const through = metadata.mark + rules(metadata).lookahead;
+    if (input.tokens.len < through or input.tokens.len > f.max_pages * glm.state.page_rows + 1) return error.BlockIdentity;
     var end: u32 = 0;
-    for (input.spans) |span| {
-        if (span[0] < end or span[1] <= span[0] or span[1] > metadata.mark) return error.BlockIdentity;
+    for (input.spans, 0..) |span, i| {
+        if ((i != 0 and span[0] <= end) or span[1] <= span[0] or span[1] > metadata.mark) return error.BlockIdentity;
         end = span[1];
     }
     end = 0;
@@ -24,12 +28,26 @@ pub fn build(input: Input, metadata: *const glm.checkpoint_restore.Metadata, out
         if ((i != 0 and start <= end) or start > metadata.mark) return error.BlockIdentity;
         end = start;
     }
-    f.chain.blocks(.{ .identity = 0x303539304d4c47, .block = glm.state.page_rows, .planned = input.planned }, input.tokens, input.spans, input.starts, @intCast(metadata.mark), 0, @intCast(out.len), out);
+    if (input.starts.len == 0 or input.starts[input.starts.len - 1] != metadata.mark) return error.BlockIdentity;
+}
+
+/// Binds the agreement to precisely the consumed tokens, arithmetic cuts, and head lookahead, never future tokens.
+pub fn prefix(input: Input, metadata: *const glm.checkpoint_restore.Metadata) !f.Name {
+    try validate(input, metadata);
+    const through: usize = @intCast(metadata.mark + rules(metadata).lookahead);
+    return f.chain.state(rules(metadata), input.tokens[0..through], input.spans, input.starts, @intCast(metadata.mark));
+}
+
+/// Inputs must come from the paused sequence owner; explicit empty spans assert that every row used prompt arithmetic.
+pub fn build(input: Input, metadata: *const glm.checkpoint_restore.Metadata, out: []f.Name) !void {
+    try validate(input, metadata);
+    if (out.len > f.max_pages or out.len * glm.state.page_rows > metadata.mark) return error.BlockIdentity;
+    f.chain.blocks(rules(metadata), input.tokens, input.spans, input.starts, @intCast(metadata.mark), 0, @intCast(out.len), out);
     for (out, 0..) |*name, i| {
         var h = f.Sha.init(.{});
-        h.update("GLM rows media prefix 0950 v1");
+        h.update("GLM rows media prefix 0960 v2");
         h.update(name);
-        const through = (i + 1) * glm.state.page_rows;
+        const through = (i + 1) * glm.state.page_rows + rules(metadata).lookahead;
         for (metadata.media.images[0..metadata.media.count]) |im| {
             if (im.at >= through) break;
             h.update(&metadata.media.processor);
@@ -42,7 +60,7 @@ pub fn build(input: Input, metadata: *const glm.checkpoint_restore.Metadata, out
 /// Local geometry and TP identity separate files even when token rows happen to be identical.
 pub fn context(a: f.epoch.Agreement, rank: u32, metadata: *const glm.checkpoint_restore.Metadata, parts: []const f.Part) f.Name {
     var h = f.Sha.init(.{});
-    h.update("GLM local page geometry 0950 v1");
+    h.update("GLM local page geometry 0960 v2");
     inline for (.{ "model", "drafter", "arithmetic", "layout" }) |field| h.update(&@field(a.binding, field));
     h.update(&f.wire.hash(metadata.shape));
     h.update(&f.wire.hash([_]u32{ a.world, rank }));

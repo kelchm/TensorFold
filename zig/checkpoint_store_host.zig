@@ -4,6 +4,8 @@ test {
     _ = @import("checkpoint_store/store_test.zig");
     _ = @import("checkpoint_store/protocol_test.zig");
     _ = @import("checkpoint_store/integrity_test.zig");
+    _ = @import("checkpoint_store/hardening_test.zig");
+    _ = @import("checkpoint_store/retention_test.zig");
 }
 test "block store: reference no-op" {
     try std.testing.expect(!store.serving_enabled);

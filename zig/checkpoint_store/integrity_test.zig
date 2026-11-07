@@ -4,7 +4,7 @@ const x = @import("fixture.zig");
 const Fault = @import("store_test.zig").Fault;
 const t = std.testing;
 
-fn corruptWithRowsHash(path: [:0]const u8) !void {
+pub fn corruptWithRowsHash(path: [:0]const u8) !void {
     const fd = sys.c.open(path, .{ .ACCMODE = .RDWR }, @as(sys.c.mode_t, 0));
     if (fd < 0) return error.TestFile;
     defer _ = sys.c.close(fd);
@@ -52,7 +52,9 @@ test "block store: recomputed row checksums cannot hide changed block content or
         try t.expectEqual(@as(u64, 1), recovered.manifest.agreement.epoch);
         if (!point_file) {
             fixture.agreement.epoch = 3;
-            try t.expectError(error.BlockHash, fixture.save(&files, 0));
+            const repaired = try fixture.save(&files, 0);
+            try t.expectEqual(@as(u64, 1), fixture.stats.repaired_pages);
+            _ = try x.commitOne(&files, repaired, fixture.slab.slice(u8));
         }
     }
 }
@@ -86,9 +88,13 @@ test "block store: no-replace epoch slot preserves the committed mark and collec
     const receipt = try fixture.save(&files, 0);
     const epoch = try x.commitOne(&files, receipt, fixture.slab.slice(u8));
     const used = files.used;
-    try fixture.mark(1025); // same binding and epoch, another mark
-    const conflict = try fixture.save(&files, 0);
-    try t.expectError(error.BlockCollectiveAbort, x.commitOne(&files, conflict, fixture.slab.slice(u8)));
+    // Canonical prefix binding prevents a forged same-slot/different-mark capture before any publication.
+    try fixture.mark(1025);
+    fixture.agreement.binding.prefix = receipt.agreement.binding.prefix;
+    try t.expectError(error.BlockIdentity, fixture.save(&files, 0));
+    var conflicting = epoch.manifest;
+    conflicting.ranks[0].digest[0] ^= 1;
+    try t.expectError(error.BlockHash, x.local.publish(&files, &conflicting, 0, fixture.slab.slice(u8)));
     try x.local.collect(&files, fixture.slab.slice(u8));
     try t.expectEqual(used, files.used);
     try x.local.validateLocal(&files, &epoch.manifest, 0, fixture.slab.slice(u8));
@@ -128,11 +134,11 @@ test "block store: prepared media identities and row boundaries control reuse ac
     var before: [3]x.f.Name = undefined;
     var after: [3]x.f.Name = undefined;
     const names = @import("names.zig");
-    try names.build(.{ .tokens = &fixture.tokens }, &fixture.metadata, &before);
+    try names.build(fixture.input(), &fixture.metadata, &before);
     fixture.metadata.media.images[0].digest[0] ^= 1;
-    try names.build(.{ .tokens = &fixture.tokens }, &fixture.metadata, &after);
+    try names.build(fixture.input(), &fixture.metadata, &after);
     try t.expectEqualDeep(before[0], after[0]);
     try t.expect(!std.mem.eql(u8, &before[1], &after[1]));
     try t.expect(!std.mem.eql(u8, &before[2], &after[2]));
-    try t.expectError(error.BlockIdentity, names.build(.{ .tokens = fixture.tokens[0..1024] }, &fixture.metadata, &after));
+    try t.expectError(error.BlockIdentity, names.build(.{ .tokens = fixture.tokens[0..1024], .spans = &.{}, .starts = fixture.input().starts }, &fixture.metadata, &after));
 }

@@ -43,7 +43,7 @@ pub const Chunks = struct {
 };
 
 pub const Header = struct {
-    magic: u64 = 0x31544e494f504c47,
+    magic: u64 = 0x32544e494f504c47,
     envelope: epoch.Envelope,
     metadata: glm.checkpoint_restore.Metadata,
     count: u32,
@@ -52,7 +52,7 @@ pub const Header = struct {
     capsule: Object,
 
     pub fn validate(h: *const Header) !void {
-        if (h.magic != 0x31544e494f504c47 or h.count == 0 or h.count > max_parts or h.pages > max_pages or h.envelope.agreement.epoch == std.math.maxInt(u64)) return error.BlockFormat;
+        if (h.magic != 0x32544e494f504c47 or h.count == 0 or h.count > max_parts or h.pages > max_pages or h.envelope.agreement.epoch == std.math.maxInt(u64)) return error.BlockFormat;
         if (!std.meta.eql(h.envelope, try h.metadata.envelope(h.envelope.agreement, h.envelope.rank))) return error.BlockIdentity;
         var total: u64 = 0;
         var capsule: u64 = 0;
@@ -84,7 +84,7 @@ pub fn record(sha: *Sha, metadata: []const u8, trailer: *const rows.Trailer) epo
 
 pub fn pageName(context: Name, row: Name) Name {
     var h = Sha.init(.{});
-    h.update("GLM immutable page 0950 v1");
+    h.update("GLM immutable page 0960 v2");
     h.update(&context);
     h.update(&row);
     return h.finalResult();

@@ -18,7 +18,7 @@ const Link = struct {
         while (done < bytes.len) {
             var p: [1]Poll = .{.{ .fd = fd, .events = if (writing) 4 else 1 }};
             if (poll(&p, 1, 5000) <= 0) return error.PeerTimeout;
-            const n = if (writing) sys.c.write(fd, bytes[done..].ptr, @min(4096, bytes.len - done)) else sys.c.read(fd, bytes[done..].ptr, bytes.len - done);
+            const n = if (writing) sys.c.send(fd, bytes[done..].ptr, @min(4096, bytes.len - done), sys.c.MSG.NOSIGNAL) else sys.c.read(fd, bytes[done..].ptr, bytes.len - done);
             if (n < 0 and sys.c.errno(n) == .INTR) continue;
             if (n <= 0) return error.PeerLost;
             done += @intCast(n);
@@ -52,14 +52,18 @@ const Link = struct {
     }
 };
 
-const Job = struct {
+pub const Job = struct {
     dirs: [2][:0]const u8,
     receipts: [2]x.f.Receipt,
     recover: bool = false,
     expected: ?u64 = null,
-    failure: bool = false,
+    expected_name: ?x.f.Name = null,
+    failure: ?[2]anyerror = null,
     crash: bool = false,
     fsync_failure: bool = false,
+    directory_failure: bool = false,
+    cancelled: bool = false,
+    read_failure: bool = false,
     missing_receipt: bool = false,
     tamper: @FieldType(Link, "tamper") = .none,
 };
@@ -71,36 +75,47 @@ const Crash = struct {
     }
 };
 
+fn readFailure(_: ?*anyopaque, _: c_int, _: []u8, _: u64) !usize {
+    return error.BlockReadIO;
+}
+fn expectFailure(rank: u32, wanted: anyerror, actual: anyerror) !void {
+    if (wanted != actual) {
+        std.debug.print("rank {d}: expected {s}, got {s}\n", .{ rank, @errorName(wanted), @errorName(actual) });
+        return error.WrongProtocolFailure;
+    }
+}
 fn rankJob(job: Job, rank: u32, fd: c_int) !void {
     var files = try x.fs.Files.open(job.dirs[rank], 1 << 30, 700 + rank);
     defer files.close();
     var slab: [65537]u8 = undefined;
     var link: Link = .{ .fd = fd, .rank = rank, .tamper = job.tamper };
     var transport = link.adapter();
-    var fault: Fault = .{ .fail_sync = 1 };
+    var fault: Fault = .{ .fail_sync = if (job.fsync_failure) 1 else 0, .fail_dir = if (job.directory_failure) 2 else 0, .cancel = job.cancelled };
     if (rank == 1 and job.crash) files.io.write = Crash.write;
-    if (rank == 1 and job.fsync_failure) fault.attach(&files);
+    if (rank == 1 and (job.fsync_failure or job.directory_failure or job.cancelled)) fault.attach(&files);
+    if (rank == 1 and job.read_failure) files.read_io.call = readFailure;
     if (job.recover) {
         const epoch = x.protocol.recover(&files, x.selection(&job.receipts[rank].agreement.binding), &transport, &slab, 16) catch |err| {
-            if (job.failure) return;
+            if (job.failure) |wanted| return expectFailure(rank, wanted[rank], err);
             return err;
         };
-        if (job.failure) return error.UnexpectedAck;
+        if (job.failure != null) return error.UnexpectedAck;
         try t.expectEqual(job.expected, if (epoch) |e| e.manifest.agreement.epoch else null);
+        if (job.expected_name) |name| try t.expectEqualDeep(name, epoch.?.manifest.agreement.manifestName());
     } else {
         const receipt: anyerror!?x.f.Receipt = if (rank == 1 and job.missing_receipt) error.LocalWorkerFailed else job.receipts[rank];
         _ = x.protocol.commit(&files, job.receipts[rank].agreement, receipt, &transport, &slab) catch |err| {
-            if (job.failure) return;
+            if (job.failure) |wanted| return expectFailure(rank, wanted[rank], err);
             return err;
         };
-        if (job.failure) return error.UnexpectedAck;
+        if (job.failure != null) return error.UnexpectedAck;
     }
     try t.expect(link.largest < 4096);
     try t.expect(link.bytes < 128 << 10);
 }
 
 /// Real processes exchange only wire records; each opens only its own independent NVMe stand-in directory.
-fn pair(job: Job) !void {
+pub fn pair(job: Job) !void {
     var sockets: [2]c_int = undefined;
     if (socketpair(1, 1, 0, &sockets) != 0) return error.SocketPair;
     const child = sys.c.fork();
@@ -123,7 +138,7 @@ fn pair(job: Job) !void {
     try result;
 }
 
-fn prepare(fixture: *x.Fixture, dirs: [2][:0]const u8) ![2]x.f.Receipt {
+pub fn prepare(fixture: *x.Fixture, dirs: [2][:0]const u8) ![2]x.f.Receipt {
     var receipts: [2]x.f.Receipt = undefined;
     for (dirs, 0..) |dir, rank| {
         var files = try x.fs.Files.open(dir, 1 << 30, fixture.agreement.epoch * 100);
@@ -169,6 +184,8 @@ test "block store: separate processes commit and recover common epochs without s
     const next = try prepare(&fixture, dirs);
     // All-local durable files are still not a recovery epoch until every local manifest exists.
     try pair(.{ .dirs = dirs, .receipts = next, .recover = true, .expected = 1 });
+    try pair(.{ .dirs = dirs, .receipts = next, .directory_failure = true, .failure = .{ error.BlockCollectiveIO, error.BlockCollectiveIO } });
+    try pair(.{ .dirs = dirs, .receipts = next, .recover = true, .expected = 1 });
     try pair(.{ .dirs = dirs, .receipts = next });
     try pair(.{ .dirs = dirs, .receipts = next, .recover = true, .expected = 2 });
     try disagree(b.name(), next[1].agreement);
@@ -200,7 +217,7 @@ test "block store: interrupted rank manifest write requires common older epoch a
     try fixture.mark(1025);
     fixture.agreement.epoch = 2;
     const next = try prepare(&fixture, dirs);
-    try pair(.{ .dirs = dirs, .receipts = next, .failure = true, .crash = true });
+    try pair(.{ .dirs = dirs, .receipts = next, .failure = .{ error.PeerLost, error.PeerLost }, .crash = true });
     var files = try x.fs.Files.open(b.name(), 1 << 30, 900);
     var path: [1200]u8 = undefined;
     const stem = std.fmt.bytesToHex(next[1].agreement.manifestName(), .lower);
@@ -225,17 +242,21 @@ test "block store: missing failed duplicate stale or disagreeing ranks cannot ac
     defer b.deinit();
     const dirs = .{ a.name(), b.name() };
     const first = try prepare(&fixture, dirs);
-    try pair(.{ .dirs = dirs, .receipts = first, .failure = true, .missing_receipt = true });
-    try pair(.{ .dirs = dirs, .receipts = first, .failure = true, .fsync_failure = true });
+    try pair(.{ .dirs = dirs, .receipts = first, .failure = .{ error.BlockCollectiveAbort, error.BlockCollectiveAbort }, .missing_receipt = true });
+    try pair(.{ .dirs = dirs, .receipts = first, .failure = .{ error.BlockCollectiveIO, error.BlockCollectiveIO }, .fsync_failure = true });
     for ([_]@FieldType(Link, "tamper"){ .duplicate, .stale, .wrong_scope }) |tamper| {
-        try pair(.{ .dirs = dirs, .receipts = first, .failure = true, .tamper = tamper });
+        try pair(.{ .dirs = dirs, .receipts = first, .failure = .{ error.BlockTransport, error.BlockTransport }, .tamper = tamper });
     }
+    try pair(.{ .dirs = dirs, .receipts = first, .cancelled = true, .failure = .{ error.BlockCollectiveCancelled, error.BlockCollectiveCancelled } });
+    try pair(.{ .dirs = dirs, .receipts = first, .read_failure = true, .failure = .{ error.BlockCollectiveIO, error.BlockCollectiveIO } });
     var wrong = first;
     wrong[1].agreement.mark += 1;
-    try pair(.{ .dirs = dirs, .receipts = wrong, .failure = true });
+    try pair(.{ .dirs = dirs, .receipts = wrong, .failure = .{ error.BlockCollectiveAbort, error.BlockCollectiveAbort } });
     wrong = first;
     wrong[1].agreement.epoch += 1;
-    try pair(.{ .dirs = dirs, .receipts = wrong, .failure = true });
+    try pair(.{ .dirs = dirs, .receipts = wrong, .failure = .{ error.BlockCollectiveAbort, error.BlockCollectiveAbort } });
     try pair(.{ .dirs = dirs, .receipts = first });
     try pair(.{ .dirs = dirs, .receipts = first, .recover = true, .expected = 1 });
+    try pair(.{ .dirs = dirs, .receipts = first, .recover = true, .read_failure = true, .failure = .{ error.BlockCollectiveIO, error.BlockCollectiveIO } });
+    try pair(.{ .dirs = dirs, .receipts = first, .recover = true, .cancelled = true, .failure = .{ error.BlockCollectiveCancelled, error.BlockCollectiveCancelled } });
 }

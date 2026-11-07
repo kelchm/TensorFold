@@ -7,6 +7,7 @@ pub const Reader = @import("reader.zig").Reader;
 pub const collect = @import("collect.zig").collect;
 
 pub const Point = struct {
+    files: *const fs.Files,
     opened: f.rows.Opened,
     header: f.Header,
     record: f.epoch.Record,
@@ -15,13 +16,14 @@ pub const Point = struct {
         var o = try s.opened(name, ".point", .state);
         errdefer o.close();
         var bytes: [f.wire.size(f.Header)]u8 = undefined;
-        const meta = try fs.metadata(&o, &bytes);
+        const meta = try fs.metadata(s, &o, &bytes);
         const h = try f.wire.decode(f.Header, meta);
         try h.validate();
         if (o.trailer.payload != @as(u64, h.pages) * f.wire.size(f.Object) or o.trailer.at != h.envelope.agreement.mark or !std.mem.eql(u8, &name, &h.envelope.agreement.identity(h.envelope.rank).name()) or !std.mem.eql(u8, &name, &h.capsule.name)) return error.BlockIdentity;
-        const record = try fs.verify(&o, meta, slab, s.control);
+        const record = try fs.verify(s, &o, meta, slab);
         if (expected) |want| if (!std.meta.eql(record, want)) return error.BlockHash;
-        return .{ .opened = o, .header = h, .record = record };
+        if (s.metrics) |m| m.points_verified += 1;
+        return .{ .files = s, .opened = o, .header = h, .record = record };
     }
     pub fn open(s: *const fs.Files, a: f.epoch.Agreement, rank: u32, expected: ?f.epoch.Record, slab: []u8) !Point {
         try a.validate();
@@ -37,7 +39,7 @@ pub const Point = struct {
     pub fn page(p: *const Point, index: usize) !f.Object {
         if (index >= p.header.pages) return error.BlockFormat;
         var bytes: [f.wire.size(f.Object)]u8 = undefined;
-        if (!f.rows.readUnaligned(p.opened.fd, &bytes, index * bytes.len)) return error.RowsRead;
+        try fs.disk.readAt(p.files, p.opened.fd, &bytes, index * bytes.len);
         return f.wire.decode(f.Object, &bytes);
     }
     pub fn validateObjects(p: *const Point, s: *const fs.Files, slab: []u8) !void {
@@ -85,8 +87,9 @@ pub fn readManifest(s: *const fs.Files, name: f.Name) !f.epoch.Manifest {
     defer o.close();
     if (o.trailer.payload != f.wire.size(f.epoch.Manifest) or o.trailer.meta != 0 or o.trailer.meta_hash != std.hash.Wyhash.hash(1, "")) return error.BlockFormat;
     var bytes: [f.wire.size(f.epoch.Manifest)]u8 = undefined;
-    if (!f.rows.readUnaligned(o.fd, &bytes, 0)) return error.RowsRead;
+    try fs.disk.readAt(s, o.fd, &bytes, 0);
     if (std.hash.Wyhash.hash(0, &bytes) != o.trailer.payload_hash) return error.RowsHash;
+    if (s.metrics) |metrics| metrics.manifests += 1;
     const m = try f.wire.decode(f.epoch.Manifest, &bytes);
     try validateManifest(&m);
     if (!std.mem.eql(u8, &m.agreement.manifestName(), &name) or o.trailer.at != m.agreement.mark) return error.BlockIdentity;
@@ -101,7 +104,7 @@ pub fn validateLocal(s: *const fs.Files, m: *const f.epoch.Manifest, rank: u32, 
     try p.validateObjects(s, slab);
 }
 
-pub fn publish(s: *fs.Files, m: *const f.epoch.Manifest, rank: u32, slab: []u8) !void {
+pub fn publish(s: *fs.Files, m: *const f.epoch.Manifest, rank: u32, slab: []u8) !bool {
     errdefer s.recount() catch {
         s.used = s.quota;
     };
@@ -119,7 +122,7 @@ pub fn publish(s: *fs.Files, m: *const f.epoch.Manifest, rank: u32, slab: []u8) 
         defer o.close();
         try s.io.sync(s.io.ctx, o.fd);
         try s.publication.sync_dir(s.publication.ctx, s.fd);
-        return;
+        return false;
     }
     var reservation = try s.reserve(f.wire.size(f.epoch.Manifest) + @sizeOf(f.rows.Trailer));
     defer reservation.close();
@@ -128,6 +131,7 @@ pub fn publish(s: *fs.Files, m: *const f.epoch.Manifest, rank: u32, slab: []u8) 
     var bytes: [f.wire.size(f.epoch.Manifest)]u8 = undefined;
     try w.append(try f.wire.encode(m.*, &bytes));
     _ = try s.publish(&reservation, &w, name, .state, @intCast(m.agreement.mark), "");
+    return true;
 }
 
 /// Caller selection must establish request-prefix compatibility; it may be stricter than exact Binding equality.
@@ -136,27 +140,59 @@ pub const Selection = struct {
     accepts: *const fn (*const anyopaque, f.epoch.Agreement) bool,
 };
 
-/// Highest locally valid commit below ceiling. Missing/corrupt newer files never mask a complete older point.
+pub const Key = struct { epoch: u64, name: f.Name };
+pub const Bound = struct { key: Key, inclusive: bool = false };
+pub fn key(m: f.epoch.Manifest) Key {
+    return .{ .epoch = m.agreement.epoch, .name = m.agreement.manifestName() };
+}
+pub fn less(a: Key, b: Key) bool {
+    return a.epoch < b.epoch or (a.epoch == b.epoch and std.mem.order(u8, &a.name, &b.name) == .lt);
+}
+pub fn within(m: f.epoch.Manifest, bound: Bound) bool {
+    return less(key(m), bound.key) or (bound.inclusive and std.meta.eql(key(m), bound.key));
+}
 pub fn latest(s: *const fs.Files, selection: Selection, world: u32, rank: u32, ceiling: u64, slab: []u8) !?f.epoch.Manifest {
-    const dir = sys.c.opendir(s.dir) orelse return error.CheckpointDirectory;
-    defer _ = sys.c.closedir(dir);
-    var best: ?f.epoch.Manifest = null;
-    while (sys.c.readdir(dir)) |ent| {
-        try s.control.check();
-        const text = std.mem.sliceTo(&ent.name, 0);
-        if (text.len != 71 or !std.mem.endsWith(u8, text, ".commit")) continue;
-        const name = decodeName(text[0..64]) catch continue;
-        const m = readManifest(s, name) catch continue;
-        if (m.agreement.world != world or rank >= world or m.agreement.epoch >= ceiling or !selection.accepts(selection.ctx, m.agreement)) continue;
-        if (best) |old| if (old.agreement.epoch >= m.agreement.epoch) continue;
-        validateLocal(s, &m, rank, slab) catch {
+    return latestBefore(s, selection, world, rank, .{ .key = .{ .epoch = ceiling, .name = f.zero } }, slab);
+}
+
+/// Metadata-only selection, then one payload validation of the newest candidate; ties use descending names.
+pub fn latestBefore(s: *const fs.Files, selection: Selection, world: u32, rank: u32, bound: Bound, slab: []u8) !?f.epoch.Manifest {
+    var before: ?f.epoch.Manifest = null;
+    var work: usize = 0;
+    while (work < s.max_work) {
+        const dir = sys.c.opendir(s.dir) orelse return error.CheckpointDirectory;
+        defer _ = sys.c.closedir(dir);
+        var best: ?f.epoch.Manifest = null;
+        while (try fs.disk.next(dir)) |text| {
             try s.control.check();
+            work += 1;
+            if (work >= s.max_work) return error.BlockWorkBudget;
+            if (s.metrics) |m| m.directory_entries += 1;
+            if (text.len != 71 or !std.mem.endsWith(u8, text, ".commit")) continue;
+            const name = decodeName(text[0..64]) catch continue;
+            const m = readManifest(s, name) catch |err| {
+                if (!fs.disk.invalid(err)) return err;
+                continue;
+            };
+            if (m.agreement.world != world or rank >= world or !within(m, bound) or !selection.accepts(selection.ctx, m.agreement)) continue;
+            if (before) |previous| if (!newer(previous, m)) continue;
+            if (best) |old| if (!newer(m, old)) continue;
+            best = m;
+        }
+        const candidate = best orelse return null;
+        validateLocal(s, &candidate, rank, slab) catch |err| {
+            if (!fs.disk.invalid(err)) return err;
+            before = candidate;
             continue;
         };
-        best = m;
+        try s.control.check();
+        return candidate;
     }
-    try s.control.check();
-    return best;
+    return error.BlockWorkBudget;
+}
+
+fn newer(a: f.epoch.Manifest, b: f.epoch.Manifest) bool {
+    return less(key(b), key(a));
 }
 
 pub fn decodeName(text: []const u8) !f.Name {

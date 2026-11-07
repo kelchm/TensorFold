@@ -30,13 +30,17 @@ pub const Media = struct {
     images: [max_images]Image = @splat(.{}),
 
     pub fn validate(m: *const Media, mark: u64) !void {
+        return m.validateRead(mark, false);
+    }
+    /// A head row consumes the next token, including an image beginning or continuing at that boundary.
+    pub fn validateRead(m: *const Media, mark: u64, head: bool) !void {
         if (m.count > max_images) return error.CheckpointMedia;
         if (m.count > 0 and std.mem.allEqual(u8, &m.processor, 0)) return error.CheckpointMedia;
         if (m.count == 0 and !std.mem.allEqual(u8, &m.processor, 0)) return error.CheckpointMedia;
         var end: u64 = 0;
         for (m.images[0..m.count]) |im| {
             const next = @as(u64, im.at) + im.tokens;
-            if (std.mem.allEqual(u8, &im.digest, 0) or im.tokens == 0 or im.at < end or next > mark or im.gh == 0 or im.gw == 0 or im.gh % 2 != 0 or im.gw % 2 != 0 or @as(u64, im.gh) * im.gw != @as(u64, im.tokens) * @import("vision_config.zig").patches_per_token) return error.CheckpointMedia;
+            if (std.mem.allEqual(u8, &im.digest, 0) or im.tokens == 0 or im.at < end or (if (head) im.at > mark else next > mark) or im.gh == 0 or im.gw == 0 or im.gh % 2 != 0 or im.gw % 2 != 0 or @as(u64, im.gh) * im.gw != @as(u64, im.tokens) * @import("vision_config.zig").patches_per_token) return error.CheckpointMedia;
             end = next;
         }
         for (m.images[m.count..]) |im| if (!std.meta.eql(im, Image{})) return error.CheckpointMedia;
@@ -88,8 +92,8 @@ pub const Shape = struct {
 };
 
 pub const Metadata = struct {
-    magic: u64 = 0x32534b4346474c4d,
-    version: u32 = 2,
+    magic: u64 = 0x33534b4346474c4d,
+    version: u32 = 3,
     shape: Shape,
     mark: u64,
     mtp_len: u64,
@@ -112,7 +116,7 @@ pub const Metadata = struct {
         return m;
     }
     pub fn validate(m: *const Metadata) !void {
-        if (m.magic != 0x32534b4346474c4d or m.version != 2 or m.shape.version != 1 or m.shape.flags & ~@as(u32, 3) != 0 or m.cur_count > max_layers or m.cur_count != m.shape.kda_layers or m.mark > std.math.maxInt(i32) or m.mtp_len > std.math.maxInt(i32) or m.mtp_len > m.mark + state.window_rows) return error.CheckpointMetadata;
+        if (m.magic != 0x33534b4346474c4d or m.version != 3 or m.shape.version != 1 or m.shape.flags & ~@as(u32, 3) != 0 or m.cur_count > max_layers or m.cur_count != m.shape.kda_layers or m.mark > std.math.maxInt(i32) or m.mtp_len > std.math.maxInt(i32) or m.mtp_len > m.mark + state.window_rows) return error.CheckpointMetadata;
         const head = m.shape.flags & 2 != 0;
         if (!head and (m.mtp_len != 0 or m.bases[1] != 0)) return error.CheckpointMetadata;
         if (head and m.mark / state.page_rows > m.mtp_len / state.page_rows + 1) return error.UnsupportedHeadLag;
@@ -126,7 +130,7 @@ pub const Metadata = struct {
         }
         const rows = @max(m.mark, m.mtp_len);
         if (m.pages_required < (rows + state.page_rows - 1) / state.page_rows or m.pages_required > (rows + 2 * sparse.pool + state.page_rows - 1) / state.page_rows) return error.CheckpointMetadata;
-        try m.media.validate(m.mark);
+        try m.media.validateRead(m.mark, head);
     }
     pub fn bind(m: *const Metadata, identity: epoch.Binding) epoch.Binding {
         var b = identity;

@@ -55,7 +55,9 @@ pub const Fixture = struct {
     budget: core.checkpoint_capture.Budget,
     metadata: glm.checkpoint_restore.Metadata,
     agreement: f.epoch.Agreement,
-    tokens: [2048]u32,
+    tokens: [2049]u32,
+    starts: [8]u32 = undefined,
+    starts_len: usize = 0,
     slab: cuda.HostBuffer,
     transfer: capture.Device,
     stats: capture.Stats = .{},
@@ -111,7 +113,16 @@ pub const Fixture = struct {
         var freezer: glm.checkpoint_freeze.Device = .{ .gpa = t.allocator, .d = &x.d, .stream = x.stream() };
         x.saved = try glm.checkpoint.Capture.create(&x.budget, &x.live, &x.st, &x.w.config, if (x.draft) |d| .{ .dflash2 = .{ .live = d.ptr, .from = @intCast(at - 512), .through = at } } else .none, freezer.adapter());
         x.metadata = try glm.checkpoint_restore.Metadata.fromCapture(&x.saved.?, &x.st, &x.w.config, .{});
+        x.starts_len = 0;
+        var start: u32 = 0;
+        while (start < at) : (start += 512) {
+            x.starts[x.starts_len] = start;
+            x.starts_len += 1;
+        }
+        x.starts[x.starts_len] = @intCast(at);
+        x.starts_len += 1;
         x.agreement.mark = at;
+        x.agreement.binding.prefix = try @import("names.zig").prefix(x.input(), &x.metadata);
         x.agreement.binding = x.metadata.bind(x.agreement.binding);
         x.stats = .{};
     }
@@ -126,10 +137,13 @@ pub const Fixture = struct {
     }
     fn admit(ptr: *anyopaque, demand: capture.Demand) !void {
         const x: *Fixture = @ptrCast(@alignCast(ptr));
-        if (x.admission_fail or demand.pages > 4 or demand.slab_bytes > 65537) return error.AdmissionRefused;
+        if (x.admission_fail or demand.pages > 4 or demand.slab_bytes > 65537 or demand.maintenance_bytes > 8 << 20) return error.AdmissionRefused;
+    }
+    pub fn input(x: *Fixture) @import("names.zig").Input {
+        return .{ .tokens = &x.tokens, .spans = &.{}, .starts = x.starts[0..x.starts_len] };
     }
     pub fn request(x: *Fixture, rank: u32) capture.Request {
-        return .{ .gpa = t.allocator, .saved = &x.saved.?, .metadata = &x.metadata, .agreement = x.agreement, .rank = rank, .input = .{ .tokens = &x.tokens }, .slab = x.slab.slice(u8), .transfer = x.transfer.adapter(), .admission = .{ .ctx = x, .admit = admit }, .stats = &x.stats };
+        return .{ .gpa = t.allocator, .saved = &x.saved.?, .metadata = &x.metadata, .agreement = x.agreement, .rank = rank, .input = x.input(), .slab = x.slab.slice(u8), .transfer = x.transfer.adapter(), .admission = .{ .ctx = x, .admit = admit }, .stats = &x.stats };
     }
     pub fn save(x: *Fixture, s: *fs.Files, rank: u32) !f.Receipt {
         return (try capture.save(.experimental, s, x.request(rank))).?;
@@ -191,7 +205,10 @@ pub fn commitOne(s: *fs.Files, receipt: f.Receipt, slab: []u8) !protocol.Epoch {
 }
 pub fn accepts(ptr: *const anyopaque, a: f.epoch.Agreement) bool {
     const b: *const f.epoch.Binding = @ptrCast(@alignCast(ptr));
-    return std.meta.eql(b.*, a.binding);
+    // Synthetic histories in these tests share tokens through earlier marks; live selection must prove that itself.
+    var want = b.*;
+    want.prefix = a.binding.prefix;
+    return std.meta.eql(want, a.binding);
 }
 pub fn selection(binding: *const f.epoch.Binding) local.Selection {
     return .{ .ctx = binding, .accepts = accepts };

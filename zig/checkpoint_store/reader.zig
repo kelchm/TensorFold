@@ -67,7 +67,7 @@ pub const Reader = struct {
             r.object = object;
         }
         const n: usize = @intCast(@min(into.len, r.segment_left));
-        if (!f.rows.readUnaligned(r.object.?.opened.fd, into[0..n], r.segment_offset)) return error.RowsRead;
+        try fs.disk.readAt(r.files, r.object.?.opened.fd, into[0..n], r.segment_offset);
         r.sha.update(into[0..n]);
         r.segment_offset += n;
         r.segment_left -= n;
@@ -86,7 +86,7 @@ pub const Reader = struct {
         // References are read on demand. Recheck their original digest before Ready, closing a file-mutation race.
         var scratch: [f.wire.size(f.Object)]u8 = undefined;
         var meta: [f.wire.size(f.Header)]u8 = undefined;
-        const record = try fs.verify(&r.point.opened, try f.wire.encode(r.point.header, &meta), &scratch, r.files.control);
+        const record = try fs.verify(r.files, &r.point.opened, try f.wire.encode(r.point.header, &meta), &scratch);
         if (!std.meta.eql(record, r.point.record)) return error.BlockHash;
         r.finished = true;
         return r.point.record;

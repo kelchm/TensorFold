@@ -53,7 +53,6 @@ test "block store: actual GLM growing marks and a token fork reuse shared pages 
         x.fill(x.rec.bytes(fixture.device.ptr + @as(u64, fixture.live.ids.items[1]) * fixture.pool.page_bytes, fixture.pool.page_bytes), 97);
         try fixture.mark(1537);
         fixture.agreement.epoch = 3;
-        fixture.agreement.binding.prefix[0] ^= 1;
         const fork_bytes = try fixture.oracle();
         defer t.allocator.free(fork_bytes);
         const third = try fixture.save(&files, 0);
@@ -97,6 +96,7 @@ pub const Fault = struct {
     fail_dir: usize = 0,
     fail_link: bool = false,
     cancel: bool = false,
+    cancel_after_point_link: bool = false,
     checks: usize = 0,
     cancel_at: usize = 0,
     pub fn write(ptr: ?*anyopaque, fd: c_int, bytes: []const u8) !usize {
@@ -115,6 +115,7 @@ pub const Fault = struct {
         const fault: *Fault = @ptrCast(@alignCast(ptr.?));
         if (fault.fail_link) return error.InjectedLink;
         try (x.core.checkpoint_file.Publication{}).link(null, from, to);
+        if (fault.cancel_after_point_link and std.mem.endsWith(u8, to, ".point")) fault.cancel = true;
     }
     pub fn syncDir(ptr: ?*anyopaque, fd: c_int) !void {
         const fault: *Fault = @ptrCast(@alignCast(ptr.?));
@@ -162,7 +163,14 @@ test "block store: ENOSPC and each file/publication barrier preserve an older co
             else => unreachable,
         };
         fault.attach(&files);
-        if (fixture.save(&files, 0)) |_| return error.ExpectedFailure else |_| {}
+        const expected: anyerror = switch (i) {
+            0 => error.NoSpaceLeft,
+            1, 2, 3 => error.InjectedFsync,
+            4 => error.InjectedLink,
+            5, 6, 7 => error.InjectedDirectoryFsync,
+            else => unreachable,
+        };
+        try t.expectError(expected, fixture.save(&files, 0));
         files.io = .{};
         files.publication = .{};
         files.control = .{};
@@ -204,7 +212,7 @@ test "block store: quota and admission reject before writes; allocation DMA canc
     files.io = .{};
     files.publication = .{};
     x.rec.fail_copy = x.rec.copies + 2;
-    if (fixture.save(&files, 0)) |_| return error.ExpectedFailure else |_| {}
+    try t.expectError(error.NotReady, fixture.save(&files, 0));
     x.rec.fail_copy = null;
     try t.expectEqual(@as(usize, 0), fixture.saved.?.pages.readers);
     try t.expectEqual(@as(usize, 1), fixture.budget.active);

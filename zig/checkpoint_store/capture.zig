@@ -7,12 +7,13 @@ const f = @import("format.zig");
 const fs = @import("files.zig");
 const names = @import("names.zig");
 const local = @import("local.zig");
+const retained = @import("retained.zig");
 const cp = glm.checkpoint;
 const cap = core.checkpoint_capture;
 const stream = core.checkpoint_stream;
 
 pub const Mode = enum { reference, experimental };
-pub const Demand = struct { pages: usize, names_bytes: usize, slab_bytes: usize, disk_bytes: u64 };
+pub const Demand = struct { pages: usize, names_bytes: usize, maintenance_bytes: usize, slab_bytes: usize, disk_bytes: u64 };
 pub const Admission = struct {
     ctx: *anyopaque,
     // Validates caller-owned admission; this callback must not acquire resources or mutate reservations.
@@ -48,6 +49,7 @@ pub const Device = struct {
 
 pub const Stats = struct {
     new_pages: u64 = 0,
+    repaired_pages: u64 = 0,
     reused_pages: u64 = 0,
     immutable_written: u64 = 0,
     mutable_written: u64 = 0,
@@ -72,57 +74,105 @@ pub fn save(mode: Mode, files: ?*fs.Files, request: ?Request) !?f.Receipt {
     if (mode == .reference) return null;
     const s = files orelse return error.BlockAdmission;
     const r = request orelse return error.BlockAdmission;
+    try s.begin(null);
+    defer s.transaction = false;
     errdefer s.recount() catch {
         s.used = s.quota;
     };
     if (r.slab.len < 4 or r.slab.len > f.epoch.max_chunk or r.saved.pages.closed) return error.BlockAdmission;
+    if (!std.mem.eql(u8, &r.agreement.binding.prefix, &try names.prefix(r.input, r.metadata))) return error.BlockIdentity;
     var header = try headerOf(r);
     const pages = header.pages;
     const context = names.context(r.agreement, r.rank, r.metadata, header.parts[0..header.count]);
-    try r.admission.admit(r.admission.ctx, .{ .pages = pages, .names_bytes = pages * @sizeOf(f.Name), .slab_bytes = r.slab.len, .disk_bytes = 0 });
+    try r.admission.admit(r.admission.ctx, .{ .pages = pages, .names_bytes = pages * (@sizeOf(f.Name) + @sizeOf(Page)), .maintenance_bytes = s.maintenance_bytes, .slab_bytes = r.slab.len, .disk_bytes = 0 });
     const row_names = try r.gpa.alloc(f.Name, pages);
     defer r.gpa.free(row_names);
     try names.build(r.input, r.metadata, row_names);
     for (row_names) |*name| name.* = f.pageName(context, name.*);
+    var index = try retained.Index.init(s);
+    defer index.close();
+    try index.load(s, r.slab);
+    const existing = try r.gpa.alloc(Page, pages);
+    defer r.gpa.free(existing);
+    const point_name = r.agreement.identity(r.rank).name();
+    if (try s.rawExists(r.agreement.manifestName(), ".commit")) return error.BlockAlreadyExists;
+    if (try s.rawExists(point_name, ".point") or try s.rawExists(point_name, ".cap")) {
+        if (s.readers != 0) return error.BlockBusy;
+        try s.remove(point_name, ".point");
+        try s.remove(point_name, ".cap");
+        try s.publication.sync_dir(s.publication.ctx, s.fd);
+        try s.recount();
+    }
     var page_bytes: u64 = 0;
     for (header.parts[0..header.count]) |p| page_bytes += p.span;
     var required: u64 = r.saved.frozen.len + f.wire.size(f.Chunks) + @sizeOf(f.rows.Trailer);
     required += @as(u64, pages) * f.wire.size(f.Object) + f.wire.size(f.Header) + @sizeOf(f.rows.Trailer);
     required += f.wire.size(f.epoch.Manifest) + @sizeOf(f.rows.Trailer);
-    for (row_names) |name| if (!try s.exists(name, ".blk")) {
-        required = try std.math.add(u64, required, page_bytes + f.wire.size(f.Chunks) + @sizeOf(f.rows.Trailer));
-    };
-    try r.admission.admit(r.admission.ctx, .{ .pages = pages, .names_bytes = pages * @sizeOf(f.Name), .slab_bytes = r.slab.len, .disk_bytes = required });
+    for (row_names, existing) |name, *page| {
+        page.* = .{ .want = index.get(name, .block) };
+        if (try s.exists(name, ".blk")) {
+            if (page.want) |want| {
+                const actual = fs.inspectObject(s, name, ".blk", r.slab) catch |err| failed: {
+                    if (!fs.disk.invalid(err)) return err;
+                    break :failed null;
+                };
+                page.reuse = if (actual) |a| std.meta.eql(a, want) else false;
+                if (!page.reuse and try s.rawExists(name, ".heal")) return error.BlockRepairExhausted;
+            } else {
+                if (s.readers != 0) return error.BlockBusy;
+                try s.remove(name, ".blk");
+                try s.remove(name, ".heal");
+            }
+        }
+        if (!page.reuse) {
+            if (page.want != null and s.readers != 0) return error.BlockRepairBusy;
+            required = try std.math.add(u64, required, page_bytes + f.wire.size(f.Chunks) + @sizeOf(f.rows.Trailer));
+        }
+    }
+    try s.recount();
+    try r.admission.admit(r.admission.ctx, .{ .pages = pages, .names_bytes = pages * (@sizeOf(f.Name) + @sizeOf(Page)), .maintenance_bytes = s.maintenance_bytes, .slab_bytes = r.slab.len, .disk_bytes = required });
     var reservation = try s.reserve(required);
     defer reservation.close();
-    const point_name = r.agreement.identity(r.rank).name();
-    if (try s.exists(point_name, ".point") or try s.exists(point_name, ".cap") or try s.exists(point_name, ".commit")) return error.BlockAlreadyExists;
+    var capsule_published = false;
+    errdefer if (capsule_published) {
+        s.remove(point_name, ".cap") catch {};
+        _ = @import("sys").c.fsync(s.fd);
+    };
     var point = try s.writer(point_name, ".point");
     defer point.abort();
-    for (row_names, 0..) |name, page| {
-        const object = if (try s.exists(name, ".blk")) reuse: {
-            const existing = try fs.inspectObject(s, name, ".blk", r.slab);
+    for (row_names, existing, 0..) |name, state, page| {
+        const object = if (state.reuse) reuse: {
             r.stats.reused_pages += 1;
-            break :reuse existing;
+            break :reuse state.want.?;
         } else new: {
-            const object = try writeObject(s, &reservation, r, &header, name, page);
-            r.stats.new_pages += 1;
+            const object = try writeObject(s, &reservation, r, &header, name, page, state.want);
+            if (state.want != null) r.stats.repaired_pages += 1 else r.stats.new_pages += 1;
             r.stats.immutable_written += page_bytes;
             break :new object;
         };
         var bytes: [f.wire.size(f.Object)]u8 = undefined;
         try point.append(try f.wire.encode(object, &bytes));
     }
-    header.capsule = try writeObject(s, &reservation, r, &header, point_name, null);
+    header.capsule = try writeObject(s, &reservation, r, &header, point_name, null, null);
+    capsule_published = true;
     r.stats.mutable_written += r.saved.frozen.len;
     try header.validate();
     var meta: [f.wire.size(f.Header)]u8 = undefined;
-    _ = try s.publish(&reservation, &point, point_name, .state, @intCast(r.agreement.mark), try f.wire.encode(header, &meta));
-    var opened = try local.Point.open(s, r.agreement, r.rank, null, r.slab);
+    const metadata = try f.wire.encode(header, &meta);
+    const bytes = try s.seal(&point, point_name, .state, @intCast(r.agreement.mark), metadata);
+    var opened = try fs.disk.open(s, point.tmp[0..point.tmp_len :0], .state, point_name);
     defer opened.close();
-    try opened.validateObjects(s, r.slab);
-    return .{ .agreement = r.agreement, .rank = r.rank, .point = opened.record };
+    var read_meta: [f.wire.size(f.Header)]u8 = undefined;
+    const actual_meta = try fs.metadata(s, &opened, &read_meta);
+    if (!std.mem.eql(u8, metadata, actual_meta)) return error.BlockHash;
+    const record = try fs.verify(s, &opened, actual_meta, r.slab);
+    _ = try s.publishSealed(&reservation, &point, bytes);
+    const receipt: f.Receipt = .{ .agreement = r.agreement, .rank = r.rank, .point = record };
+    s.pending = receipt;
+    return receipt;
 }
+
+const Page = struct { want: ?f.Object = null, reuse: bool = false };
 
 fn headerOf(r: Request) !f.Header {
     const saved = r.saved;
@@ -140,8 +190,8 @@ fn headerOf(r: Request) !f.Header {
     return h;
 }
 
-fn writeObject(s: *fs.Files, reservation: *fs.Reservation, r: Request, header: *const f.Header, name: f.Name, page: ?usize) !f.Object {
-    const ext = if (page == null) ".cap" else ".blk";
+fn writeObject(s: *fs.Files, reservation: *fs.Reservation, r: Request, header: *const f.Header, name: f.Name, page: ?usize, repair: ?f.Object) !f.Object {
+    const ext = if (repair != null) ".heal" else if (page == null) ".cap" else ".blk";
     var w = try s.writer(name, ext);
     defer w.abort();
     var chunks: f.Chunks = .{ .count = header.count };
@@ -153,8 +203,14 @@ fn writeObject(s: *fs.Files, reservation: *fs.Reservation, r: Request, header: *
         chunks.hashes[i] = try pump(s, r, &range, &w);
     }
     var meta: [f.wire.size(f.Chunks)]u8 = undefined;
-    _ = try s.publish(reservation, &w, name, .block, 0, try f.wire.encode(chunks, &meta));
-    return fs.inspectObject(s, name, ext, r.slab);
+    const bytes = try s.seal(&w, name, .block, 0, try f.wire.encode(chunks, &meta));
+    var opened = try fs.disk.open(s, w.tmp[0..w.tmp_len :0], .block, name);
+    defer opened.close();
+    const object = try fs.inspectOpened(s, &opened, name, r.slab);
+    if (!std.mem.eql(u8, &object.metadata, &f.wire.hash(chunks))) return error.BlockHash;
+    if (repair) |want| if (!std.meta.eql(object, want)) return error.BlockRepairMismatch;
+    _ = try s.publishSealed(reservation, &w, bytes);
+    return object;
 }
 
 const Range = struct {
