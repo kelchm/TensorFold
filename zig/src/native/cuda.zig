@@ -75,6 +75,7 @@ pub const Host = struct {
     startup: []u8 = &.{},
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
     store: ?*api.prompt_cache.Store = null, // kept Nemotron states; null when the budget is 0
+    warm_quiet: u64 = 0, // ns a warm pass waits for other work before its first chunk: the family's `warm_quiet`
     learn: ?api.Learner = null, // the family's Sliding Weights learner (--slide), called with the context current
     slide: ?*anyopaque = null, // that learner's adapter, freed by slide_free before the family
     slide_free: ?*const fn (Allocator, *anyopaque) void = null,
@@ -130,7 +131,7 @@ pub const Host = struct {
         h.host.explain = explain;
         h.host.health = @import("cuda_readiness.zig").source(h);
         h.host.cache = h.store;
-        h.host.warm_quiet = if (info.warm_turns) nemotron.native.warm_quiet else 0;
+        h.host.warm_quiet = if (info.warm_turns) h.warm_quiet else 0;
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true, .logprobs = h.inner.vtable.first_row != null, .structures = h.inner.vtable.first_masked != null, .min_budget = nemotron.native.lone_min_budget, .resumes = true };
         if (h.learn != null) h.host.learner = h.learner();
         try h.host.start();
@@ -435,6 +436,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         }
         try kv_pages.store(F, store, loaded.target, kept); // its snapshot slots, before a disk probe takes one
         h.store = store;
+        if (@hasDecl(F, "warm_quiet")) h.warm_quiet = F.warm_quiet;
         if (o.learn_conversations) if (o.learn) |root| {
             if (F == nemotron.native) try cuda_disk.attach(a, io, &g.ctx, o, root, kernels, loaded, store);
             if (comptime cuda_disk.keptDisk(F)) |K| try cuda_disk.attachKept(K, F.model_type, a, io, &g.ctx, o, root, kernels, loaded, store);

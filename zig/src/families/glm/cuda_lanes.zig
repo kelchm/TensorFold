@@ -210,8 +210,11 @@ pub const Lanes = struct {
         return false;
     }
 
+    /// Read at every chunk gate (on every rank, rank 0's word): the stream was cancelled, or it is a background
+    /// prompt pass (a warm turn, server/warm.zig) and real work waits; the states kept so far stay kept either way.
     fn cancelled(ptr: ?*anyopaque) bool {
-        return @as(*lanes.Stream, @ptrCast(@alignCast(ptr.?))).isCancelled();
+        const s: *lanes.Stream = @ptrCast(@alignCast(ptr.?));
+        return s.isCancelled() or s.yields();
     }
 
     // -- the vtable ---------------------------------------------------------------------------------------------

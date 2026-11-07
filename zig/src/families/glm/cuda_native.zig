@@ -24,6 +24,11 @@ pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = fw.prefill_rows;
 /// Prompt kernels change arithmetic with a chunk's rows: states keep and resume only on chunk starts.
 pub const snap_grid: u32 = prompt_rows;
+/// Warm turns (server/warm.zig): after a reply, the next turn's prompt is prefilled in the background, so a user
+/// message after an agent loop resumes past the loop's turns, which GLM's template renders without their reasoning
+/// once that message comes. The pass waits this long for other work before its first chunk, and steps aside at any
+/// chunk gate once real work waits (cuda_lanes.zig `cancelled`), keeping the states it reached.
+pub const warm_quiet: u64 = 150 * std.time.ns_per_ms;
 /// `explain` words this family's open refusals too (where to set the rank and the id).
 pub const explains_open = true;
 
