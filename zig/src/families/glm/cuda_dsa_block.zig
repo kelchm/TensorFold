@@ -68,6 +68,7 @@ pub const Scratch = struct {
     counts: u64, // i32 [rows]
     mm_part: u64, // fp32 split-K partials
     at: u64, // an i32: a prompt block's first position (pos + its first row)
+    mm_part_bytes: usize = 0, // mm_part's size: a decode window's two-problem launches need both problems' slices
 };
 
 /// The kernels: the captured Triton set and glm_ops (the token lists and position offsets).
@@ -107,18 +108,23 @@ pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
 pub fn prepareProfile(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, qi: bool, profile: ?*prof.Prof) !void {
     var stamp = prof.span(profile, stream, .replicated_qakva);
     const width = l.q_lora + l.lw;
-    try projection.matmul(set, stream, l.proj, x, x_stride, s.dp, s.mm_part, rows, width, l.dims, false);
+    const ix = l.index;
+    const kw_n = ix.d + ix.heads;
+    // a decode window's [q_a | kv_a] and the indexer's kw read the same rows: one launch, each its own K slices
+    const two_kw = try projection.matmulTwo(set, stream, .{ l.proj, ix.kw }, .{ x, x }, .{ x_stride, x_stride }, .{ s.dp, s.ikr }, .{ width, kw_n }, .{ l.dims, l.dims }, s.mm_part, s.mm_part_bytes, rows);
+    if (!two_kw) try projection.matmul(set, stream, l.proj, x, x_stride, s.dp, s.mm_part, rows, width, l.dims, false);
     try glue.rmsnorm(set, stream, s.dp, width, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
     try glue.rmsnorm(set, stream, s.dp + l.q_lora * 2, width, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
     stamp.end();
     stamp = prof.span(profile, stream, .projections);
     defer stamp.end();
-    try projection.matmul(set, stream, l.q_b, s.qr, l.q_lora, s.q, s.mm_part, rows, l.heads * l.qk, l.q_lora, false);
-    const ix = l.index;
-    try projection.matmul(set, stream, ix.kw, x, x_stride, s.ikr, s.mm_part, rows, ix.d + ix.heads, l.dims, false);
+    // and q_b with the indexer's qb (sparse rows only) on the q rows, likewise
+    const two_qb = if (qi) try projection.matmulTwo(set, stream, .{ l.q_b, ix.qb }, .{ s.qr, s.qr }, .{ l.q_lora, l.q_lora }, .{ s.q, s.qi }, .{ l.heads * l.qk, ix.heads * ix.d }, .{ l.q_lora, l.q_lora }, s.mm_part, s.mm_part_bytes, rows) else false;
+    if (!two_qb) try projection.matmul(set, stream, l.q_b, s.qr, l.q_lora, s.q, s.mm_part, rows, l.heads * l.qk, l.q_lora, false);
+    if (!two_kw) try projection.matmul(set, stream, ix.kw, x, x_stride, s.ikr, s.mm_part, rows, kw_n, l.dims, false);
     try glue.router(set, stream, x, x_stride, ix.gate, s.igr, s.router_part, rows, l.dims, ix.d);
     try latent.absorbQ(set, stream, s.q, l.wk, s.qa, rows, l.heads, l.qk, l.lw);
-    if (qi) try projection.matmul(set, stream, ix.qb, s.qr, l.q_lora, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
+    if (qi and !two_qb) try projection.matmul(set, stream, ix.qb, s.qr, l.q_lora, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
 }
 
 /// One sequence's rows r0..r0 + rows at pos: latent and index keys written, dense then sparse attention into s.ol.

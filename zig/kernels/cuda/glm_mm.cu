@@ -88,13 +88,15 @@ struct Tile {
 template <int BITS, int BM, int WM, int STAGES, bool ROWS_FIRST = false>
 __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, long long ldx,
         const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part,
-        int f32, int M, int N, int K, int SK, int zslice = -1) {
+        int f32, int M, int N, int K, int SK, int zslice = -1, int xtile = -1) {
     using T = Tile<BITS, BM, WM, STAGES>;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp / T::WN, wn = warp % T::WN;
     const int KG = K >> 6, per = KG / SK, N8 = N >> 3;
-    const int n0 = (ROWS_FIRST ? blockIdx.y : blockIdx.x) * T::BN, m0 = (ROWS_FIRST ? blockIdx.x : blockIdx.y) * BM;
+    // a two-problem launch passes the block's column tile (xtile) and slice (zslice) of its problem
+    const int n0 = (xtile >= 0 ? (unsigned)xtile : (ROWS_FIRST ? blockIdx.y : blockIdx.x)) * T::BN,
+              m0 = (ROWS_FIRST ? blockIdx.x : blockIdx.y) * BM;
     const int slice = zslice >= 0 ? zslice : (int)blockIdx.z, g0 = slice * per;  // a pair launch's z is its problem
     const int t0 = n0 >> 3;                                   // the block's first column tile
     auto stage = [&](int st) { return buf + st * T::STAGE; };
@@ -282,6 +284,58 @@ GLM_MM_PAIR(4)
 GLM_MM_PAIR(6)
 GLM_MM_PAIR(8)
 GLM_MM_PAIR(16)
+
+// Two decode problems of one width in one launch, each with its own shape and its own K slices: x runs problem 0's
+// column tiles times its slices, then problem 1's, and each block is the block a lone glm_mm{B}_{BM} launch runs for
+// that (column tile, slice), so partials and outputs are two launches' bit for bit (GLM's DSA [q_a | kv_a] with the
+// indexer's kw on the layer's rows, and q_b with the indexer's qb on the q rows).
+struct MmTwo {
+    const __nv_bfloat16* x[2];
+    long long ldx[2];
+    const uint32_t* w[2];
+    const __half* s[2];
+    void* out[2];
+    float* part[2];
+    int N[2], K[2], SK[2], cols[2];
+    int blocks0, f32, M;
+};
+template <int B, int BM, int WM>
+__device__ __forceinline__ void mm_two(const MmTwo& p) {
+    const int b = (int)blockIdx.x, z = b >= p.blocks0 ? 1 : 0, l = b - (z ? p.blocks0 : 0), c = p.cols[z];
+    mm_kernel<B, BM, WM, 3>(p.x[z], p.ldx[z], p.w[z], p.s[z], p.out[z], p.part[z], p.f32, p.M, p.N[z], p.K[z], p.SK[z],
+                            l / c, l % c);
+}
+#define GLM_MM_TWO(B)                                                                                                   \
+    extern "C" __global__ void __launch_bounds__(128) glm_mm##B##_16t(const MmTwo p) { mm_two<B, 16, 1>(p); }          \
+    extern "C" __global__ void __launch_bounds__(128) glm_mm##B##_32t(const MmTwo p) { mm_two<B, 32, 1>(p); }          \
+    extern "C" __global__ void __launch_bounds__(256) glm_mm##B##_64t(const MmTwo p) { mm_two<B, 64, 2>(p); }
+GLM_MM_TWO(4)
+GLM_MM_TWO(6)
+GLM_MM_TWO(8)
+GLM_MM_TWO(16)
+
+// Both problems' K slices added in slice order, then rounded once: glm_mm_reduce's sums for each (x: problem 0's
+// blocks, then problem 1's; a problem of one slice has none).
+struct MmReduceTwo {
+    const float* part[2];
+    void* out[2];
+    long long total[2];
+    int SK[2];
+    int blocks0, f32;
+};
+extern "C" __global__ void glm_mm_reduce_two(const MmReduceTwo r) {
+    qmm_frag::grid_launch();
+    const int z = (int)blockIdx.x >= r.blocks0 ? 1 : 0;
+    const long long i = (long long)((int)blockIdx.x - (z ? r.blocks0 : 0)) * blockDim.x + threadIdx.x;
+    const long long total = r.total[z];
+    if (i >= total) return;
+    const float* part = r.part[z];
+    const int SK = r.SK[z];
+    float acc = part[i];
+    for (int sl = 1; sl < SK; ++sl) acc = acc + part[sl * total + i];
+    if (r.f32) reinterpret_cast<float*>(r.out[z])[i] = acc;
+    else reinterpret_cast<__nv_bfloat16*>(r.out[z])[i] = __float2bfloat16_rn(acc);
+}
 
 // -- tiling at load: ops.cu's packed rows and fp16 scales [N][K / 64] -> the tiled chunks and scales ---------------
 template <int BITS>
