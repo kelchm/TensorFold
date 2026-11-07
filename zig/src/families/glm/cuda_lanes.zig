@@ -53,6 +53,7 @@ pub const Lanes = struct {
     x: follow.Leader,
     whole: bool = false, // prompt passes run whole (TF_GLM_PROMPT_STEPS=0): no other stream's round between chunks
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
+    fill_slice_ms: f64 = 0, // TF_GLM_FILL_SLICE_MS: a prompt chunk's layers run a slice about this cheap at a time (0: whole chunks)
     mtp_confidence: ?f64 = null, // --mtp-confidence: the MTP head's chains stop where their chance falls under it
     shared: u64 = 0, // forwards that held several streams' windows (checks read it)
     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
@@ -221,6 +222,7 @@ pub const Lanes = struct {
 
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
         const self = of(ptr);
+        try self.drainPartial(); // a suspended chunk would run under the whole pass's own (a warm turn finds one)
         const from = try self.opening(s);
         try self.images(s, from);
         var sink: Sink = .{ .gpa = self.x.e.gpa, .s = s };
@@ -231,8 +233,46 @@ pub const Lanes = struct {
         self.lanes.getPtr(s).?.first = self.take(first);
     }
 
+    /// Rebuild the callback on this call's stack from the owning Stream, never from a saved Sink pointer.
+    fn advancePartial(self: *Lanes, budget: f64) !void {
+        const e = self.x.e;
+        const p = e.partial orelse return;
+        var it = self.lanes.iterator();
+        while (it.next()) |entry| if (entry.value_ptr.slot == p.slot) {
+            const owner = @constCast(entry.key_ptr.*);
+            const l = entry.value_ptr;
+            try self.x.bind(p.slot);
+            var sink: Sink = .{ .gpa = e.gpa, .s = owner };
+            sink.prepare() catch |err| {
+                try self.x.cancelSlice(p.start, marksOf(owner));
+                l.fill = null;
+                return err;
+            };
+            e.prompt_logprobs = sink.want();
+            defer e.prompt_logprobs = null;
+            const step = self.x.chunkSliced(&.{}, p.start, false, null, budget, .{ .ptr = owner, .check = cancelled }, marksOf(owner)) catch |err| {
+                l.fill = null;
+                if (err == error.Cancelled) return;
+                return err;
+            };
+            if (step.first) |first| {
+                l.first = self.take(first);
+                l.fill = null;
+            } else l.fill = if (e.partial != null) p.start else p.start + p.rows;
+            return;
+        };
+        try self.x.bind(p.slot);
+        try self.x.cancelSlice(p.start, null);
+        return error.SliceOwnerMissing;
+    }
+
+    pub fn drainPartial(self: *Lanes) !void {
+        while (self.x.e.partial != null) try self.advancePartial(std.math.floatMax(f64));
+    }
+
     fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
         const self = of(ptr);
+        if (self.fill_slice_ms > 0 or self.x.e.partial != null) return false;
         if (!self.x.e.m.tiled or ss.len > engine.max_together) return false;
         for (ss) |s| if (!canBatch(s)) return false;
         var opened: usize = 0;
@@ -261,37 +301,72 @@ pub const Lanes = struct {
         for (ss, firsts) |s, t| self.lanes.getPtr(s).?.first = self.take(t);
     }
 
-    /// One chunk of the stream's prompt pass (other rounds run between); true once the first token is drawn.
+    /// One step of the stream's prompt pass (other rounds run between): a slice of a chunk while
+    /// TF_GLM_FILL_SLICE_MS holds one open, else a chunk; true once the first token is drawn.
     fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
         const self = of(ptr);
+        const e = self.x.e;
+        const mine: ?u32 = if (self.lanes.getPtr(s)) |l| l.slot else null;
+        if (mine != null) if (self.lanes.getPtr(s).?.first != null and self.lanes.getPtr(s).?.fill == null) return true; // its prompt ended inside another stream's step
+        if (e.partial) |p| if (mine == null or p.slot != mine.?) {
+            try self.advancePartial(self.fill_slice_ms);
+            return false;
+        };
         const going: ?usize = if (self.lanes.getPtr(s)) |l| l.fill else null;
         const from = if (going == null) try self.opening(s) else null;
         if (going == null) try self.images(s, from);
         const l = self.lanes.getPtr(s).?;
-        if (going != null) try self.x.bind(l.slot);
+        errdefer {
+            // Capacity/callback setup can fail before chunkSliced gets control of a resumed partial.
+            // Restore that owner even when no forward ran in this call, before forgetting its fill cursor.
+            if (e.partial) |p| if (p.slot == l.slot) {
+                const undo = @import("cuda_slice_undo.zig");
+                self.x.bind(p.slot) catch |why| undo.fatal(why);
+                self.x.cancelSlice(p.start, marksOf(s)) catch |why| undo.fatal(why);
+            };
+            l.fill = null;
+        }
+        if (going != null) self.x.bind(l.slot) catch |err| {
+            @import("cuda_slice_undo.zig").admissionError(err);
+            return err;
+        };
         const at = going orelse if (from) |r| r.at else 0;
-        errdefer l.fill = null;
         var sink: Sink = .{ .gpa = self.x.e.gpa, .s = s };
         try sink.prepare();
         self.x.e.prompt_logprobs = sink.want();
         defer self.x.e.prompt_logprobs = null;
-        const step = try self.x.chunk(s.prompt(), at, !self.othersDecode(s), from, .{ .ptr = s, .check = cancelled }, marksOf(s));
+        const step = if (self.fill_slice_ms > 0)
+            try self.x.chunkSliced(s.prompt(), at, !self.othersDecode(s), from, self.fill_slice_ms, .{ .ptr = s, .check = cancelled }, marksOf(s))
+        else
+            try self.x.chunk(s.prompt(), at, !self.othersDecode(s), from, .{ .ptr = s, .check = cancelled }, marksOf(s));
         if (step.first) |first| {
             l.first = self.take(first);
             l.fill = null;
             return true;
         }
-        l.fill = at + step.rows;
-        if (s.settle_step) try self.x.e.stream.synchronize(); // its tail would land in the next decode round's time
+        // a suspended chunk's rows stand at its start until its last slice commits them
+        l.fill = if (e.partial) |p| p.start else at + step.rows;
+        if (s.settle_step) self.x.e.stream.synchronize() catch |err| {
+            if (self.fill_slice_ms > 0) @import("cuda_slice_undo.zig").fatal(err);
+            return err;
+        };
         return false;
     }
 
     fn cancelPrefillFn(ptr: *anyopaque, s: *lanes.Stream) !void {
         const self = of(ptr);
         const l = self.lanes.getPtr(s) orelse return;
+        // a chunk suspended between its layers drops without its commit: no rerun to cancel at a gate (its layers
+        // already ran), the states kept so far standing as at one -- one step, every rank the same
+        if (self.x.e.partial) |p| if (p.slot == l.slot) {
+            try self.x.bind(l.slot);
+            try self.x.cancelSlice(p.start, marksOf(s));
+            l.fill = null;
+            return;
+        };
         const at = l.fill orelse return;
-        if (at <= s.cached or s.reuse.hook == null) return;
         try self.x.bind(l.slot);
+        if (at <= s.cached or s.reuse.hook == null) return;
         _ = self.x.chunk(s.prompt(), at, false, null, .{ .ptr = null, .check = cancelNow }, marksOf(s)) catch |err| {
             if (err == error.Cancelled) return;
             return err;

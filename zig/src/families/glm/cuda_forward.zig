@@ -421,13 +421,19 @@ pub const Forward = struct {
     const tapPieces = @import("cuda_forward_pieces.zig").tapPieces;
     const shareTaps = @import("cuda_forward_pieces.zig").shareTaps;
 
-    /// forward.pieced_layers: a prompt chunk's layers with exchanges in row pieces; same kernels and bits as unpieced.
-    fn pieced(f: *const Forward, p: *const Pieces, R: usize, cut: []const [2]usize) !void {
+    /// forward.pieced_layers: a prompt chunk's layers [j0, j1) with exchanges in row pieces; same kernels and bits
+    /// as unpieced. A resumed range (j0 > 0) starts where the last slice's glue left the rows; the layer-0 pre and
+    /// the taps' sharing belong to the whole range's ends alone.
+    fn piecedRange(f: *const Forward, p: *const Pieces, R: usize, cut: []const [2]usize, j0: usize, j1: usize) !void {
         const layers = f.ranks[0].w.layers;
-        for (f.ranks) |r| try f.pre(r, r.w.layers[0].attn_hc, r.w.layers[0].in_norm, R);
         var li: usize = 0;
         var di: usize = 0;
-        for (layers, 0..) |_, j| {
+        for (layers[0..j0]) |l| switch (l.mixer) { // a resumed range's counts start where its layers do
+            .kda => li += 1,
+            .mla => di += 1,
+        };
+        if (j0 == 0) for (f.ranks) |r| try f.pre(r, r.w.layers[0].attn_hc, r.w.layers[0].in_norm, R);
+        for (layers[j0..j1], j0..) |_, j| {
             prof_mod.context(f.prof, j, null, .mixer);
             for (f.ranks) |r| if (r.segs.len > 0) try shared.mixer(f, r, r.w.layers[j], li, di, R, null) else try f.mixer(r, r.w.layers[j], li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), null);
             try f.exchangePieces(p, j, .mixer, cut);
@@ -442,43 +448,62 @@ pub const Forward = struct {
                 .mla => di += 1,
             }
         }
-        if (f.taps) |t| try f.shareTaps(t, cut);
+        if (j1 == layers.len) if (f.taps) |t| try f.shareTaps(t, cut);
     }
 
     pub const pairBody = @import("cuda_forward_pair.zig").pairBody;
 
     /// forward.forward of `ids`: logits in b.logits; a prompt chunk's KDA layers committed, a window's at `commit`.
     pub fn run(f: *const Forward, ids: []const i32) !void {
+        return f.runRange(ids, 0, f.ranks[0].w.layers.len);
+    }
+
+    /// `run` over the layers [j0, j1) of `ids` (a sliced prompt chunk, TF_GLM_FILL_SLICE_MS, resumes at j0 > 0 on the
+    /// rows the last slice left in the buffers): the prolog and the finish belong to the whole range's ends alone, so
+    /// a slice moves only where the host returns between layers -- the kernels, their arguments and their order are
+    /// `run`'s, and the commit stays where it was.
+    pub fn runRange(f: *const Forward, ids: []const i32, j0: usize, j1: usize) !void {
         const R = ids.len;
-        for (f.ranks) |r| {
-            if (R == 0 or R > r.b.rows) return error.BadWindow;
-            if (r.segs.len == 0) {
-                try r.st.ready(f.stream, R);
-                r.st.pending = R;
-                r.st.prompt = r.b.prefill;
-            } else try shared.begin(r, R, f.stream);
-            try cuda.copy_source.enqueue(f.d, r.b.ids, std.mem.sliceAsBytes(ids), f.stream);
+        const layers = f.ranks[0].w.layers;
+        if (j0 >= j1 or j1 > layers.len) return error.BadRange;
+        if (j0 == 0) {
+            for (f.ranks) |r| {
+                if (R == 0 or R > r.b.rows) return error.BadWindow;
+                if (r.segs.len == 0) {
+                    try r.st.ready(f.stream, R);
+                    r.st.pending = R;
+                    r.st.prompt = r.b.prefill;
+                } else try shared.begin(r, R, f.stream);
+                try cuda.copy_source.enqueue(f.d, r.b.ids, std.mem.sliceAsBytes(ids), f.stream);
+            }
+            const c = &f.ranks[0].w.config;
+            const embed_stamp = prof_mod.span(f.prof, f.stream, .embed);
+            for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
+            if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, r.b.x, c.hc);
+            embed_stamp.end();
+            if (f.prof) |p| p.mark(f.stream, .embed);
         }
-        const c = &f.ranks[0].w.config;
-        const embed_stamp = prof_mod.span(f.prof, f.stream, .embed);
-        for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
-        if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, r.b.x, c.hc);
-        embed_stamp.end();
-        if (f.prof) |p| p.mark(f.stream, .embed);
         var cut: [max_pieces][2]usize = undefined;
         const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill) ranges(R, p.count, &cut) else 0) else 0;
         // overlap.Overlap.begin: pieced with two pieces or more, and split takes a chunk of one piece too
-        if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
-        try f.finish(R);
-        if (f.prof) |p| p.mark(f.stream, .head);
+        if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.piecedRange(f.pieces.?, R, cut[0..pieces], j0, j1) else try f.wholeRange(R, j0, j1);
+        if (j1 == layers.len) {
+            try f.finish(R);
+            if (f.prof) |p| p.mark(f.stream, .head);
+        }
     }
 
-    /// The unpieced loop over the layers (and the stream mean): each site's partials whole, then the glue.
-    fn whole(f: *const Forward, R: usize) !void {
+    /// The unpieced loop over the layers [j0, j1) (and the stream mean): each site's partials whole, then the glue.
+    fn wholeRange(f: *const Forward, R: usize, j0: usize, j1: usize) !void {
         const c = &f.ranks[0].w.config;
+        const layers = f.ranks[0].w.layers;
         var li: usize = 0;
         var di: usize = 0;
-        for (f.ranks[0].w.layers, 0..) |_, j| {
+        for (layers[0..j0]) |l| switch (l.mixer) { // a resumed range's counts start where its layers do
+            .kda => li += 1,
+            .mla => di += 1,
+        };
+        for (layers[j0..j1], j0..) |_, j| {
             prof_mod.context(f.prof, j, null, .mixer);
             for (f.ranks) |r| {
                 const l = r.w.layers[j];
@@ -505,7 +530,7 @@ pub const Forward = struct {
                 .mla => di += 1,
             }
         }
-        for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, r.b.x, r.b.hidden, R, c.hidden, c.hc);
+        if (j1 == layers.len) for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, r.b.x, r.b.hidden, R, c.hidden, c.hc);
     }
 
     /// The final norm and this rank's rows of the head (a prompt buffer's last row only).

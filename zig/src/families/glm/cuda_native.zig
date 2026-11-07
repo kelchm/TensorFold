@@ -171,6 +171,20 @@ pub fn roceBytes(text: ?[]const u8) !usize {
 const startup = @import("cuda_start.zig");
 const paging = startup.paging;
 
+/// TF_GLM_FILL_SLICE_MS in milliseconds, read once as the lanes are made (0, unset or ill-formed: off): a prompt
+/// chunk's layers then run a slice about this cheap at a time, the decode rounds between the slices -- rank 0 alone
+/// reads it, its steps carrying each slice's end layer to the other ranks.
+fn fillSlice() f64 {
+    const v = std.c.getenv("TF_GLM_FILL_SLICE_MS") orelse return 0;
+    const ms = std.fmt.parseFloat(f64, std.mem.span(v)) catch {
+        std.log.warn("TF_GLM_FILL_SLICE_MS={s}: not a number; prompt chunks run whole", .{std.mem.span(v)});
+        return 0;
+    };
+    if (ms > 0 and std.math.isFinite(ms)) return ms;
+    if (ms != 0) std.log.warn("TF_GLM_FILL_SLICE_MS={s}: finite milliseconds over 0; prompt chunks run whole", .{std.mem.span(v)});
+    return 0;
+}
+
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
     _ = kernels; // our own kernels: a captured set is not used
     const p = try place();
@@ -324,7 +338,7 @@ fn finishRank(a: OpenArgs) !Loaded {
         }
     }.get;
     own.link.asleep = cuda.tp_watch.open(); // the other ranks begin asleep (follow): the first step wakes them
-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .mtp_confidence = o.mtp_confidence };
+    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .fill_slice_ms = fillSlice(), .mtp_confidence = o.mtp_confidence };
     const extra: u64 = (if (o.drafter != null) dflash.ring_bytes else 0) + if (own.e.images) |v| v.streamBytes() else @as(usize, 0);
     own.layout = if (set.pages) try pages_mod.layout(gpa, own.e, extra) else null;
     return .{

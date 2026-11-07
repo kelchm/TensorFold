@@ -19,6 +19,7 @@ const dflash = @import("dflash.zig");
 const prof_mod = @import("cuda_prof.zig");
 const pages_mod = @import("cuda_pages.zig");
 const prompt_pair = @import("cuda_prompt_pair.zig");
+const taps_mod = @import("cuda_taps.zig");
 pub const Options = @import("cuda_engine_types.zig").Options;
 
 /// Rank 0's own word on its request (cancelled or not); the other ranks have none and hear rank 0's.
@@ -72,6 +73,12 @@ test "GLM heads: no MTP layer and no drafter loads no head and decodes plain; DF
         try std.testing.expect(!heads(false, dr, n).drafts);
     };
 }
+
+pub const LayerCosts = @import("cuda_slice_costs.zig").LayerCosts;
+pub const SliceUndo = @import("cuda_slice_undo.zig").Undo;
+const sliced = @import("cuda_sliced.zig");
+
+pub const PartialFill = sliced.Partial;
 
 pub const Engine = struct {
     gpa: std.mem.Allocator,
@@ -130,6 +137,8 @@ pub const Engine = struct {
     index_split: bool = false, // the next prompt step's indexer rows split across the ranks: rank 0's choice, the chunk's flag 2
     index_splits: u64 = 0, // prompt steps whose indexer rows split (glm-split-check counts them)
     a8_buf: ?cuda.DeviceBuffer = null, // TF_GLM_W8A8=1: a prompt pass's int8 rows and scales (cuda_mm.A8)
+    partial: ?PartialFill = null, // TF_GLM_FILL_SLICE_MS: the one prompt chunk between its layers (its slot bound to run it)
+    slice_costs: LayerCosts = .{}, // its per-layer costs: the first chunk calibrates by events, later ones the EWMA scale
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
@@ -183,7 +192,7 @@ pub const Engine = struct {
         for (layers, 0..) |*l, i| l.* = @intCast(i);
         const sel = heads(o.drafts, o.drafter, c.mtp); // every rank alike: the same config and options (cuda_ranks)
         if (o.drafts and !sel.drafts and rank == 0) std.log.warn("glm: the checkpoint has no MTP layer (num_nextn_predict_layers 0) and no --drafter is given: decoding without drafts", .{});
-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .moe_fuse = envOn("TF_GLM_MOE_FUSE"), .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .drafts = sel.drafts, .mtp = false };
+        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .moe_fuse = envOn("TF_GLM_MOE_FUSE"), .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .drafts = sel.drafts, .mtp = false, .slice_costs = .{ .gpa = gpa } };
         const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
         if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
         const Tile = struct {
@@ -260,6 +269,9 @@ pub const Engine = struct {
     pub fn deinit(e: *Engine) void {
         e.stream.synchronize() catch {};
         if (e.side) |x| x.s.synchronize() catch {}; // shared-expert work still in flight reads buffers and weights freed below
+        if (e.partial) |p| _ = e.dropPartialOf(p.slot);
+        e.slice_costs.deinit();
+
         e.gpa.free(e.packs.ptrs);
         e.gpa.free(e.packs.bits);
         if (e.drafter) |dr| dr.deinit();
@@ -384,6 +396,7 @@ pub const Engine = struct {
 
     /// Frees slot `slot`'s sequence (slot 0 stays, and a paged one gives its pages back) and binds slot 0.
     pub fn release(e: *Engine, slot: u32) void {
+        _ = e.dropPartialOf(slot); // restore before returning the slot's live page owner
         if (e.images) |v| v.release(slot);
         const paged = if (e.pages) |p| p.paged(slot) else false;
         if (paged) e.pages.?.close(slot) else if (slot != 0) e.free(slot);
@@ -417,6 +430,7 @@ pub const Engine = struct {
 
     /// A fresh sequence with `sampling` (null or temperature 0: greedy).
     pub fn begin(e: *Engine, sampling: ?sampler.Sampling) !void {
+        _ = e.dropPartialOf(e.slot);
         e.cur.sampling = sampler.check(sampling);
         e.cur.in_head = 0;
         try e.cur.st.reset(e.stream);
@@ -425,6 +439,7 @@ pub const Engine = struct {
 
     /// decode.prefill: `ids` in 2,048-row chunks, then the first token from the last row; `from` restores a kept state.
     pub fn prefill(e: *Engine, ids: []const u32, from: ?Resume, cancel: ?Cancel, marks: ?Marks) !u32 {
+        if (e.partial != null) return error.SliceBusy;
         var start = try e.prefillStart(ids.len, from);
         while (true) : (start += fw.prefill_rows) {
             if (try e.prefillChunk(ids[start..@min(ids.len, start + fw.prefill_rows + 1)], start, ids.len, null, cancel, marks)) |first| return first;
@@ -437,7 +452,7 @@ pub const Engine = struct {
     }
 
     /// Where a prompt pass of `len` ids starts: 0, or `from`'s position with its kept state restored.
-    fn prefillStart(e: *Engine, len: usize, from: ?Resume) !usize {
+    pub fn prefillStart(e: *Engine, len: usize, from: ?Resume) !usize {
         if (!promptFits(len, e.cur.st.capacity)) return error.PromptTooLong;
         const r = from orelse return 0;
         if (r.at == 0 or r.at >= len or r.at % fw.prefill_rows != 0) return error.BadResume;
@@ -445,8 +460,15 @@ pub const Engine = struct {
         return r.at;
     }
 
+    /// A prompt chunk's prof by its rows (TF_GLM_PROF=1: one a row class, its label with it).
+    fn promptProfAt(rows: usize) usize {
+        return if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3;
+    }
+    const prompt_prof_labels = [_][]const u8{ "prompt chunk to 64 rows", "prompt chunk to 256 rows", "prompt chunk to 1024 rows", "prompt chunk to 2048 rows" };
+
     /// One chunk of a `len`-id prompt pass: `part` from `start` plus the next id; first token at the end, else null.
     pub fn prefillChunk(e: *Engine, part: []const u32, start: usize, len: usize, from: ?Resume, cancel: ?Cancel, marks: ?Marks) !?u32 {
+        if (e.partial != null) return error.SliceBusy;
         const split = e.index_split; // this step's alone
         e.index_split = false;
         if ((from != null or start == 0) and try e.prefillStart(len, from) != start) return error.BadChunk;
@@ -460,9 +482,8 @@ pub const Engine = struct {
         if (start + rows <= len -| @as(usize, @intCast(dflash.WIN))) f.taps = null; // none read (dflash.promptRun)
         const as_i32: []const i32 = @ptrCast(part);
         if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
-        f.prof = e.prompt_profs[if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3];
-        const labels = [_][]const u8{ "prompt chunk to 64 rows", "prompt chunk to 256 rows", "prompt chunk to 1024 rows", "prompt chunk to 2048 rows" };
-        if (f.prof) |p| try p.beginPrompt(e.stream, labels[if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3], .{ .rank = e.share.rank, .slot = e.slot, .start = start, .rows = rows }, e.c.run, e.pieces.count);
+        f.prof = e.prompt_profs[promptProfAt(rows)];
+        if (f.prof) |p| try p.beginPrompt(e.stream, prompt_prof_labels[promptProfAt(rows)], .{ .rank = e.share.rank, .slot = e.slot, .start = start, .rows = rows }, e.c.run, e.pieces.count);
         if (f.prof) |p| e.profiling_prompt = p;
         defer if (f.prof != null) {
             e.profiling_prompt = null;
@@ -520,6 +541,13 @@ pub const Engine = struct {
         if (f.prof) |p| p.mark(e.stream, .commit);
         return first;
     }
+
+    pub const sliceHi = sliced.hi;
+    pub const prepareSlice = sliced.prepare;
+    pub const agreeSlice = sliced.admit;
+    pub const prefillChunkSlice = sliced.run;
+    pub const dropPartialOf = sliced.rollback;
+    pub const sliceResidentBytes = sliced.resident;
 
     /// The chunk gate on every rank: a kept state at the mark, the heat wait, rank 0's cancel; the id exchanged first.
     pub fn gate(e: *Engine, cancel: ?Cancel) !void {
@@ -590,6 +618,7 @@ pub const Engine = struct {
 
     /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.
     pub fn verify(e: *Engine, ids: []const u32, out: []u32, bits: u64) !void {
+        if (e.partial) |p| if (p.slot == e.slot) return error.SliceBusy;
         if (ids.len == 0 or ids.len > fw.window_rows) return error.WindowTooWide;
         var one: [1]fw.Rank = undefined;
         var f = e.view(&e.bd, &one);
@@ -608,6 +637,9 @@ pub const Engine = struct {
 
     /// Several streams' windows in one forward: shared row ops, per-part attention and KDA.
     pub fn verifyShared(e: *Engine, parts: []const Part) !void {
+        if (e.partial) |p| for (parts) |part| {
+            if (part.slot == p.slot) return error.SliceBusy;
+        };
         const b = if (e.bs) |*x| x else return error.NoSharedWindows;
         if (parts.len == 0 or parts.len > max_shared) return error.WindowTooWide;
         var segs: [max_shared]fw.Seg = undefined;

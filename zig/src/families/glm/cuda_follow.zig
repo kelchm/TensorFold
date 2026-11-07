@@ -12,20 +12,20 @@ const pages_mod = @import("cuda_pages.zig");
 const sparse = @import("cuda_sparse.zig");
 const Engine = engine.Engine;
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, slice_prepare, chunkpart };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
     kind: u32,
     n: u32 = 0, // ids that follow
-    depth: u32 = 0, // draft: drafts to chain; chunk: where it starts; shared: its parts
-    flags: u32 = 0, // begin: sampled; draft: from the prompt (1), chances (2); prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2); verify, shared: whole rows
-    a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length
-    seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position; snapshots: the host tier asked
+    depth: u32 = 0, // draft: drafts to chain; chunk, chunkpart: where the chunk starts; shared: its parts
+    flags: u32 = 0, // begin: sampled; draft: from the prompt (1), chances (2); prefill, chunk, chunkpart: prompt_logprobs (1); chunk, chunkpart: indexer rows split (2); verify, shared: whole rows
+    a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length; chunkpart: the slice's end layer (0: the chunk is cancelled)
+    seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position; chunkpart: the kept state's id (its position is the chunk's start, 0: none); snapshots: the host tier asked
     temperature: f64 = 0,
     top_p: f64 = 0,
     min_p: f64 = 0,
-    top_k: u32 = 0, // begin: top_k; chunk: the prompt's length
+    top_k: u32 = 0, // begin: top_k; chunk, chunkpart: the prompt's length
     slot: u32 = 0, // the stream's sequence the step runs on (Engine.bind)
 
     comptime {
@@ -176,6 +176,10 @@ pub const Leader = struct {
 
     /// Frees a stream's sequence on every rank.
     pub fn release(x: Leader, slot: u32) !void {
+        if (x.e.partial) |p| if (p.slot == slot) {
+            x.bind(slot) catch |err| @import("cuda_slice_undo.zig").fatal(err);
+            try x.cancelSlice(p.start, null);
+        };
         try x.flush();
         try x.e.bind(slot);
         try x.send(.{ .kind = @backingInt(Kind.release) }, &.{});
@@ -200,6 +204,8 @@ pub const Leader = struct {
     /// Rank 0's own begin failing after the step went out sends a release step: the other ranks began the slot (and
     /// mapped its pages), so they free it as the caller frees it here, and its next begin maps there again.
     pub fn beginOn(x: Leader, s: ?sampler.Sampling, pages: []const u32) !void {
+        // Cancel before followers can remap the slot's retained page owner in their begin handler.
+        if (x.e.partial) |p| if (p.slot == x.e.slot) try x.cancelSlice(p.start, null);
         try x.flush();
         const c = sampler.check(s);
         var h: Header = .{ .kind = @backingInt(Kind.begin) };
@@ -269,6 +275,52 @@ pub const Leader = struct {
         x.e.index_split = split;
         const first = try x.e.prefillChunk(part, start, ids.len, from, if (cancelled_media) .{ .ptr = null, .check = cancelMedia } else cancel, marks);
         return .{ .first = first, .rows = @min(ids.len - start, n * engine.prompt_rows) };
+    }
+
+    /// Media retains the complete 070 window protocol; text always slices, even if pairing could run whole.
+    pub fn chunkSliced(x: Leader, ids: []const u32, start: usize, pair: bool, from: ?engine.Resume, budget: f64, cancel: ?engine.Cancel, marks: ?engine.Marks) !Chunk {
+        const fatal = @import("cuda_slice_undo.zig").fatal;
+        if (x.e.partial == null) {
+            if (x.e.images) |v| if (v.source.images.len != 0) return x.chunk(ids, start, pair, from, cancel, marks);
+            if (start >= ids.len) return error.BadChunk;
+            // Validate the setting before allocating or announcing anything.
+            _ = try x.e.sliceHi(@min(ids.len - start, engine.prompt_rows), 0, budget);
+            const part = ids[start..@min(ids.len, start + engine.prompt_rows + 1)];
+            try x.flush();
+            const split = sparse.splitAt(start, x.e.settings.index_split, x.e.share.world);
+            x.e.index_split = split;
+            x.e.prepareSlice(part, start, ids.len, from) catch |err| {
+                @import("cuda_slice_undo.zig").admissionError(err);
+                return err;
+            };
+            x.send(.{ .kind = @backingInt(Kind.slice_prepare), .flags = x.rows() | @as(u32, @intFromBool(split)) << 1, .seed = if (from) |r| r.id else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part) catch |err| fatal(err);
+            try x.e.agreeSlice(null);
+        }
+        const p = &x.e.partial.?;
+        if (p.slot != x.e.slot) return error.SliceBusy;
+        if (p.start != start) {
+            try x.cancelSlice(p.start, marks);
+            return error.BadChunk;
+        }
+        const stop = x.e.sliceHi(p.rows, p.j, budget) catch |err| {
+            try x.cancelSlice(start, marks);
+            return err;
+        };
+        const chunk_rows = p.rows;
+        x.send(.{ .kind = @backingInt(Kind.chunkpart), .flags = x.rows() | @as(u32, @intFromBool(p.split)) << 1, .a = stop, .depth = @intCast(start), .top_k = @intCast(p.len) }, &.{}) catch |err| fatal(err);
+        const first = try x.e.prefillChunkSlice(p.part, start, p.len, null, cancel, marks, stop);
+        return .{ .first = first, .rows = chunk_rows };
+    }
+
+    /// Restore on every rank before publishing the interrupted prefix, including an empty prefix.
+    pub fn cancelSlice(x: Leader, start: usize, marks: ?engine.Marks) !void {
+        const p = x.e.partial orelse return;
+        if (p.slot != x.e.slot or p.start != start) return error.BadChunk;
+        const fatal = @import("cuda_slice_undo.zig").fatal;
+        x.flush() catch |err| fatal(err);
+        x.send(.{ .kind = @backingInt(Kind.chunkpart), .a = 0, .depth = @intCast(start) }, &.{}) catch |err| fatal(err);
+        _ = x.e.dropPartialOf(x.e.slot);
+        @import("cuda_snapshots.zig").interrupted(x.e, marks, @intCast(start)) catch |err| fatal(err);
     }
 
     fn cancelMedia(_: ?*anyopaque) bool {
@@ -374,6 +426,10 @@ pub const Leader = struct {
 
     /// The other ranks leave their loops.
     pub fn end(x: Leader) !void {
+        if (x.e.partial) |p| {
+            try x.bind(p.slot);
+            try x.cancelSlice(p.start, null);
+        }
         try x.send(.{ .kind = @backingInt(Kind.end) }, &.{});
     }
 };
@@ -381,13 +437,13 @@ pub const Leader = struct {
 /// A prompt step whose rows go through the head (Leader.rows): this rank's columns join each pass's broadcasts.
 fn promptRows(h: Header) bool {
     const kind: Kind = @fromBackingInt(@intCast(h.kind));
-    return (kind == .prefill or kind == .chunk) and h.flags & 1 != 0;
+    return (kind == .prefill or kind == .chunk or kind == .chunkpart or kind == .slice_prepare) and h.flags & 1 != 0;
 }
 
 /// A prompt chunk whose indexer rows split across the ranks (Leader.chunk): this rank picks for its block of rows.
 fn indexSplit(h: Header) bool {
     const kind: Kind = @fromBackingInt(@intCast(h.kind));
-    return kind == .chunk and h.flags & 2 != 0;
+    return (kind == .chunk or kind == .chunkpart or kind == .slice_prepare) and h.flags & 2 != 0;
 }
 
 /// A verify step under a grammar (Engine.structured): this rank's columns join the gather of each draw's whole rows.
@@ -453,6 +509,30 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
                 error.Cancelled => {},
                 else => return err,
             };
+        },
+        .slice_prepare => {
+            const from: ?engine.Resume = if (h.seed != 0) .{ .id = h.seed, .at = h.depth } else null;
+            e.index_split = indexSplit(h);
+            var failed: ?anyerror = null;
+            e.prepareSlice(ids_in, h.depth, h.top_k, from) catch |err| {
+                failed = err;
+            };
+            // A preparation rejection is acknowledged, then this rank waits for the next command.
+            e.agreeSlice(failed) catch return true;
+        },
+        .chunkpart => {
+            const fatal = @import("cuda_slice_undo.zig").fatal;
+            const p = e.partial orelse fatal(error.SliceNotAdmitted);
+            if (p.slot != h.slot or p.start != h.depth) fatal(error.SliceProtocol);
+            if (h.a == 0) {
+                _ = e.dropPartialOf(h.slot);
+                @import("cuda_snapshots.zig").interrupted(e, null, h.depth) catch |err| fatal(err);
+            } else {
+                _ = e.prefillChunkSlice(p.part, h.depth, h.top_k, null, null, null, @intCast(h.a)) catch |err| switch (err) {
+                    error.Cancelled, error.BadSlice => {},
+                    else => return err,
+                };
+            }
         },
         .verify => { // rank 0 alone reads the draws: this rank joins their gathers and leaves the tokens on the device
             e.discard_draws = true;
@@ -579,10 +659,12 @@ test "a link whose host allocation fails frees its device buffer" {
     try std.testing.expectEqual(@as(usize, 1), Mock.frees);
     try std.testing.expectEqual(before, cuda.usage(false).device);
 }
-test "flag 1 asks for prompt rows on prefill and chunk steps only (begin's is sampling, draft's from the prompt)" {
+test "flag 1 asks for prompt rows on prefill, chunk and chunkpart steps only (begin's is sampling, draft's from the prompt)" {
     try std.testing.expect(promptRows(.{ .kind = @backingInt(Kind.chunk), .flags = 1, .depth = 2048, .top_k = 4000 }));
     try std.testing.expect(promptRows(.{ .kind = @backingInt(Kind.prefill), .flags = 1 }));
+    try std.testing.expect(promptRows(.{ .kind = @backingInt(Kind.chunkpart), .flags = 1, .a = 12, .depth = 2048, .top_k = 4000 }));
     try std.testing.expect(!promptRows(.{ .kind = @backingInt(Kind.chunk), .depth = 2048, .top_k = 4000 }));
+    try std.testing.expect(!promptRows(.{ .kind = @backingInt(Kind.chunkpart), .a = 12, .depth = 2048, .top_k = 4000 }));
     try std.testing.expect(!promptRows(.{ .kind = @backingInt(Kind.begin), .flags = 1, .seed = 7 }));
     try std.testing.expect(!promptRows(.{ .kind = @backingInt(Kind.draft), .flags = 1, .depth = 3 }));
 }
@@ -595,10 +677,12 @@ test "flag 1 on verify and shared steps draws from whole rows; a prompt step's f
     try std.testing.expect(!structuredStep(.{ .kind = @backingInt(Kind.begin), .flags = 1 }));
 }
 
-test "flag 2 on a chunk splits its indexer rows across the ranks, beside flag 1's prompt rows; elsewhere it does not" {
+test "flag 2 on a chunk or a chunkpart splits its indexer rows across the ranks, beside flag 1's prompt rows; elsewhere it does not" {
     try std.testing.expect(indexSplit(.{ .kind = @backingInt(Kind.chunk), .flags = 2, .depth = 65536, .top_k = 70000 }));
+    try std.testing.expect(indexSplit(.{ .kind = @backingInt(Kind.chunkpart), .flags = 2, .a = 12, .depth = 65536, .top_k = 70000 }));
     try std.testing.expect(indexSplit(.{ .kind = @backingInt(Kind.chunk), .flags = 3, .depth = 65536, .top_k = 70000 }));
     try std.testing.expect(promptRows(.{ .kind = @backingInt(Kind.chunk), .flags = 3, .depth = 65536, .top_k = 70000 }));
     try std.testing.expect(!indexSplit(.{ .kind = @backingInt(Kind.chunk), .flags = 1, .depth = 65536, .top_k = 70000 }));
+    try std.testing.expect(!indexSplit(.{ .kind = @backingInt(Kind.chunkpart), .flags = 1, .a = 12, .depth = 65536, .top_k = 70000 }));
     try std.testing.expect(!indexSplit(.{ .kind = @backingInt(Kind.prefill), .flags = 2 }));
 }

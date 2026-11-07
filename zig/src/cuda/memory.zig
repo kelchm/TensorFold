@@ -172,6 +172,22 @@ pub const DeviceBuffer = struct {
         self.* = undefined;
     }
 
+    /// Transaction owners must stop on an unknown driver release failure, retaining their charge until success.
+    pub fn freeChecked(self: *DeviceBuffer) Error!void {
+        if (!self.borrowed) {
+            if (self.ptr != 0) {
+                if (self.owner) |h| {
+                    if (!h.free(h.ctx, self.ptr)) return error.CudaFailed;
+                } else {
+                    try self.d.check(self.d.api.cuMemFree_v2(self.ptr), "cuMemFree checked");
+                    _ = driver_allocs.fetchSub(1, .monotonic);
+                }
+            }
+            freed(&device_bytes, self.len);
+        }
+        self.* = undefined;
+    }
+
     /// The device address `offset` bytes in; out of range is refused.
     pub fn at(self: DeviceBuffer, offset: usize) Error!abi.DevicePtr {
         if (offset > self.len) return error.Invalid;
