@@ -53,6 +53,17 @@ extern "C" __global__ void tf_exl3_grouped_1_k8r16s(tf_exl3::GroupedArgs a) {
     tf_exl3::grouped_body_v2<1, 4, 4, GROUPED_SHFL, 8, 16>(a, blockIdx.x, blockIdx.y, blockIdx.z);
 }
 
+// The same as dependent launches (cuda/exl3_experts.zig core's decode chain): plan, trellis pointers and first tile before
+// griddepcontrol.wait, the rows' inputs and the partials after it; launched without the attribute they are k8r8s/k8r16s.
+// Every SM builds the waits (a kernel without them must never launch as a dependent; below sm_90 they compile out).
+constexpr int GROUPED_SHFL_PDL = tf_exl3::SHFL_PDL;
+extern "C" __global__ void tf_exl3_grouped_1_k8r8p(tf_exl3::GroupedArgs a) {
+    tf_exl3::grouped_body_v2<1, 4, 4, GROUPED_SHFL_PDL, 8, 8>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+extern "C" __global__ void tf_exl3_grouped_1_k8r16p(tf_exl3::GroupedArgs a) {
+    tf_exl3::grouped_body_v2<1, 4, 4, GROUPED_SHFL_PDL, 8, 16>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
 extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1, any width (RED-SNOW's experts)
     tf_exl3::grouped_body<2, 8, 4, GROUPED_LOAD>(a, blockIdx.x, blockIdx.y, blockIdx.z);
 }
@@ -89,6 +100,8 @@ struct RotInArgs {
 };
 
 extern "C" __global__ void tf_exl3_experts_rot_in(const RotInArgs a) {
+    pdl_wait();  // a dependent launch on the decode chain: the picks are the grid before's; no-op otherwise
+    pdl_trigger();
     const int p = blockIdx.x, blk = blockIdx.y, mat = blockIdx.z;
     const int e = a.pick[p];
     if (e < 0 || e >= a.experts) return;
@@ -131,6 +144,8 @@ struct GateUpArgs {
 };
 
 extern "C" __global__ void tf_exl3_gateup_epilogue(const GateUpArgs a) {
+    pdl_wait();  // a dependent launch on the decode chain: z is the grid before's; no-op otherwise
+    pdl_trigger();
     const int p = blockIdx.x, blk = blockIdx.y;
     const int e = a.pick[p];
     if (e < 0 || e >= a.experts) return;
