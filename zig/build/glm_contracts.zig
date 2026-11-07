@@ -2,6 +2,13 @@
 const std = @import("std");
 pub fn tests(b: *std.Build, glm: *std.Build.Module, lanes: *std.Build.Module, cuda: *std.Build.Module, core: *std.Build.Module) void {
     const host = b.graph.host;
+    const checkpoint = b.step("test-checkpoint-bounded-host", "Bounded native checkpoint ownership, GLM geometry and streaming credits");
+    checkpoint.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = core, .filters = &.{"checkpoint bounded:"} })).step);
+    checkpoint.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/core/kv_pool.zig"), .target = host, .optimize = .debug, .link_libc = true }) })).step);
+    checkpoint.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/core/checkpoint_file_test.zig"), .target = host, .optimize = .debug, .link_libc = true }), .filters = &.{"checkpoint bounded:"} })).step);
+    const checkpoint_host = b.createModule(.{ .root_source_file = b.path("zig/glm_checkpoint_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm", .module = glm }, .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core } } });
+    checkpoint.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = checkpoint_host })).step);
+
     const prompt_arena = b.createModule(.{ .root_source_file = b.path("zig/glm_prompt_arena_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm", .module = glm }, .{ .name = "cuda", .module = cuda } } });
     b.step("test-glm-prompt-arena-host", "Actual sequence arenas retain and account prompt rows").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = prompt_arena })).step);
     const prompt_owner = b.createModule(.{ .root_source_file = b.path("zig/glm_prompt_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "glm", .module = glm }} });

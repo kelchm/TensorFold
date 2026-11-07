@@ -142,6 +142,8 @@ pub const Pool = struct {
     gpa: Allocator,
     refs: []u32, // holders a page: each lease that maps it once, the store once
     leased: []u32, // of those, the leases'
+    pins: []u32, // checkpoint readers: never evictable, even after their live lease ends
+    npinned: usize = 0, // unique physical pages, not the number of checkpoint readers
     free: []u32, // a stack of free ids, `nfree` deep
     nfree: usize,
     promised: usize = 0,
@@ -156,16 +158,21 @@ pub const Pool = struct {
         errdefer gpa.free(refs);
         const leased = try gpa.alloc(u32, count);
         errdefer gpa.free(leased);
+        const pins = try gpa.alloc(u32, count);
+        errdefer gpa.free(pins);
         const free = try gpa.alloc(u32, count);
         @memset(refs, 0);
         @memset(leased, 0);
+        @memset(pins, 0);
         for (free, 0..) |*f, i| f.* = @intCast(count - 1 - i); // page 0 taken first
-        return .{ .gpa = gpa, .refs = refs, .leased = leased, .free = free, .nfree = count, .page_bytes = page_bytes };
+        return .{ .gpa = gpa, .refs = refs, .leased = leased, .pins = pins, .free = free, .nfree = count, .page_bytes = page_bytes };
     }
 
     pub fn deinit(p: *Pool) void {
+        std.debug.assert(p.npinned == 0);
         p.gpa.free(p.refs);
         p.gpa.free(p.leased);
+        p.gpa.free(p.pins);
         p.gpa.free(p.free);
         p.* = undefined;
     }
@@ -195,10 +202,12 @@ pub const Pool = struct {
     }
 
     /// Ownership changes update page classes once; holders and leases remain the authoritative per-page state.
-    fn ownership(p: *Pool, id: usize, refs: u32, leased: u32) void {
+    fn ownership(p: *Pool, id: usize, refs: u32, leased: u32, pins: u32) void {
         const r = p.refs[id];
         const l = p.leased[id];
-        p.nreclaimable = p.nreclaimable - @intFromBool(r == 1 and l == 0) + @intFromBool(refs == 1 and leased == 0);
+        p.nreclaimable = p.nreclaimable - @intFromBool(r == 1 and l == 0 and p.pins[id] == 0) + @intFromBool(refs == 1 and leased == 0 and pins == 0);
+        p.npinned = p.npinned - @intFromBool(p.pins[id] > 0) + @intFromBool(pins > 0);
+        p.pins[id] = pins;
         p.nkept = p.nkept - @intFromBool(r > l) + @intFromBool(refs > leased);
         p.nleased = p.nleased - @intFromBool(l > 0) + @intFromBool(leased > 0);
         p.refs[id] = refs;
@@ -208,7 +217,7 @@ pub const Pool = struct {
     /// A lease gives back its reference; its last reference returns the page to the same free stack.
     fn unlease(p: *Pool, id: u32) void {
         if (p.leased[id] == 0 or p.refs[id] < p.leased[id]) std.debug.panic("kv pool: page {d} released with no holder", .{id});
-        p.ownership(id, p.refs[id] - 1, p.leased[id] - 1);
+        p.ownership(id, p.refs[id] - 1, p.leased[id] - 1, p.pins[id]);
         if (p.refs[id] > 0) return;
         p.free[p.nfree] = id;
         p.nfree += 1;
@@ -216,7 +225,7 @@ pub const Pool = struct {
 
     pub fn idle(p: *const Pool) bool {
         const c = p.census();
-        return c.promised == 0 and c.leased == 0 and c.free + c.kept == c.total;
+        return c.promised == 0 and c.leased == 0 and p.npinned == 0 and c.free + c.kept == c.total;
     }
 
     /// How many hold the page: each lease that maps it, and the store.
@@ -227,7 +236,7 @@ pub const Pool = struct {
     /// One more holder of a held page; a free page is never retained, only taken.
     pub fn retain(p: *Pool, id: u32) void {
         if (p.refs[id] == 0) std.debug.panic("kv pool: page {d} retained while free", .{id});
-        p.ownership(id, p.refs[id] + 1, p.leased[id]);
+        p.ownership(id, p.refs[id] + 1, p.leased[id], p.pins[id]);
     }
 
     /// One holder fewer; the last one's release frees the page. Releasing a page nobody holds panics.
@@ -237,9 +246,24 @@ pub const Pool = struct {
 
     /// `release`, as an error when no holder but the leases' holds the page (the store's release of a page it lacks).
     pub fn drop(p: *Pool, id: u32) error{NotHeld}!void {
-        if (p.refs[id] <= p.leased[id]) return error.NotHeld; // no holder past the leases' (callers drop theirs first)
-        p.ownership(id, p.refs[id] - 1, p.leased[id]);
+        if (p.refs[id] <= p.leased[id] + p.pins[id]) return error.NotHeld; // no holder past the leases' (callers drop theirs first)
+        p.ownership(id, p.refs[id] - 1, p.leased[id], p.pins[id]);
         if (p.refs[id] > 0) return;
+        p.free[p.nfree] = id;
+        p.nfree += 1;
+    }
+
+    /// A checkpoint reader of a completed, immutable page; admission validates the owning lease first.
+    pub fn pinCheckpoint(p: *Pool, id: u32) void {
+        std.debug.assert(p.leased[id] > 0 and p.refs[id] < std.math.maxInt(u32));
+        p.ownership(id, p.refs[id] + 1, p.leased[id], p.pins[id] + 1);
+    }
+
+    /// A drained checkpoint releases its own reader, never a cache or live-lease reference.
+    pub fn unpinCheckpoint(p: *Pool, id: u32) void {
+        std.debug.assert(p.pins[id] > 0);
+        p.ownership(id, p.refs[id] - 1, p.leased[id], p.pins[id] - 1);
+        if (p.refs[id] != 0) return;
         p.free[p.nfree] = id;
         p.nfree += 1;
     }
@@ -266,7 +290,7 @@ pub const Pool = struct {
         try l.ids.ensureUnusedCapacity(p.gpa, 1);
         p.nfree -= 1;
         const id = p.free[p.nfree];
-        p.ownership(id, 1, 1);
+        p.ownership(id, 1, 1, 0);
         l.promised -= 1;
         p.promised -= 1;
         l.ids.appendAssumeCapacity(id);
@@ -279,7 +303,7 @@ pub const Pool = struct {
             for (ids) |id| p.release(id);
             return e;
         };
-        for (ids) |id| p.ownership(id, p.refs[id], p.leased[id] + 1);
+        for (ids) |id| p.ownership(id, p.refs[id], p.leased[id] + 1, p.pins[id]);
     }
 
     /// The stream's page `i` swapped for the store's copy `id` of the same tokens (a keep's Kept.shared).
@@ -287,7 +311,7 @@ pub const Pool = struct {
         const old = l.ids.items[i];
         if (old == id) return;
         p.retain(id);
-        p.ownership(id, p.refs[id], p.leased[id] + 1);
+        p.ownership(id, p.refs[id], p.leased[id] + 1, p.pins[id]);
         l.ids.items[i] = id;
         p.unlease(old);
     }
@@ -373,7 +397,7 @@ pub const Pool = struct {
     pub fn releaseRun(p: *Pool, start: u32, k: usize) void {
         for (start..start + k) |id| {
             if (p.refs[id] != 1 or p.leased[id] != 1) std.debug.panic("kv pool: run page {d} released while not a run's", .{id});
-            p.ownership(id, 0, 0);
+            p.ownership(id, 0, 0, 0);
             p.free[p.nfree] = @intCast(id);
             p.nfree += 1;
         }

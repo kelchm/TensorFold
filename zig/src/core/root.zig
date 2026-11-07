@@ -56,6 +56,9 @@ pub const dense_ref = @import("dense_ref.zig");
 
 pub const checkpoint_weights = @import("checkpoint_weights.zig");
 pub const kv_pool = @import("kv_pool.zig");
+pub const checkpoint_capture = @import("checkpoint_capture.zig");
+pub const checkpoint_stream = @import("checkpoint_stream.zig");
+pub const checkpoint_file = @import("checkpoint_file.zig");
 
 test {
     _ = checkpoint_weights;
@@ -108,6 +111,9 @@ test {
     _ = @import("nvfp4_fixture_test.zig");
     _ = @import("drafter_release_test.zig");
     _ = kv_pool;
+    _ = checkpoint_capture;
+    _ = checkpoint_stream;
+    _ = checkpoint_file;
 }
 
 pub const frame_rounds = @import("frame_rounds.zig");
