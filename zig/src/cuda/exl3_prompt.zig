@@ -61,8 +61,18 @@ pub const Kernels = struct {
     gateup: Function,
     down: Function,
     down_slots: ?Function = null,
+    gateup_glm: ?Function = null,
+    down_glm: ?Function = null,
     pub fn resolve(mod: Module) !Kernels {
-        return .{ .rotate = try mod.function("tf_exl3_prompt_rotate"), .gateup = try mod.function("tf_exl3_prompt_gu"), .down = try mod.function("tf_exl3_prompt_down"), .down_slots = try mod.function("tf_exl3_prompt_down_slots") };
+        return .{ .rotate = try mod.function("tf_exl3_prompt_rotate"), .gateup = try mod.function("tf_exl3_prompt_gu"), .down = try mod.function("tf_exl3_prompt_down"), .down_slots = try mod.function("tf_exl3_prompt_down_slots"), .gateup_glm = try mod.function("tf_exl3_prompt_gu_glm"), .down_glm = try mod.function("tf_exl3_prompt_down_glm") };
+    }
+    /// GLM opts into patch 0078; other families retain the common prompt kernels.
+    pub fn runGlm(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan) !void {
+        if (sc.y % 16 != 0 or sc.xd % 8 != 0 or sc.yrow == 0) return error.Exl3Shape;
+        var tuned = k;
+        tuned.gateup = k.gateup_glm orelse return error.Exl3Shape;
+        tuned.down_slots = k.down_glm orelse return error.Exl3Shape;
+        try tuned.run(e, router, s, l, x, stride, picks, rows, sc, p);
     }
     pub fn run(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan) !void {
         if (!eligible(l) or rows == 0 or rows > sc.rows or stride < l.dims or stride > std.math.maxInt(i32)) return error.Exl3Shape;
