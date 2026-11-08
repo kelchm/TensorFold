@@ -97,7 +97,7 @@ const Result = struct {
     wall_ns: u64,
     layout_checks: u64,
     timing_source: TimingSource,
-    completed_ranks: [2]u8 = .{ 0, 1 },
+    completed_ranks: [2]u32 = .{ 0, 1 },
     forwards: []const Forward,
     checks: Checks = .{},
     memory: Memory,
@@ -159,7 +159,7 @@ pub fn anchor(a: std.mem.Allocator, io: std.Io, output: []const u8, f: fixture.F
         .ids = .{ .run_id = m.run_id, .pair_id = m.pair_id, .start_id = m.start_id, .start_order = m.start_order, .block_id = m.block_id, .cell_id = m.cell_id },
         .kv_shard = sharded,
         .timing_source = "separate_observer_on_anchor",
-        .completed_ranks = [2]u8{ 0, 1 },
+        .completed_ranks = [2]u32{ 0, 1 },
         .completion = profile,
         .headline_completion = headline,
     }, .{});

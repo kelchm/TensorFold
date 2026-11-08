@@ -12,7 +12,7 @@ pub const Gate = struct {
     fatbin_sha256: []const u8,
     original_server_sha256: []const u8,
     instrumented_server_sha256: []const u8,
-    completed_ranks: [2]u8,
+    completed_ranks: [2]u32,
     token_evidence: Artifact,
     performance_evidence: Artifact,
     contract_sha256: []const u8,
@@ -44,7 +44,7 @@ pub const Tokens = struct {
     fatbin_sha256: []const u8,
     original_server_sha256: []const u8,
     instrumented_server_sha256: []const u8,
-    completed_ranks: [2]u8,
+    completed_ranks: [2]u32,
     started_unix_ns: u64,
     ended_unix_ns: u64,
     cases: []const TokenCase,
@@ -72,7 +72,7 @@ pub const Performance = struct {
     fatbin_sha256: []const u8,
     original_server_sha256: []const u8,
     instrumented_server_sha256: []const u8,
-    completed_ranks: [2]u8,
+    completed_ranks: [2]u32,
     started_unix_ns: u64,
     ended_unix_ns: u64,
     policy: Policy,
@@ -101,7 +101,7 @@ pub fn read(a: std.mem.Allocator, io: std.Io, ref: anytype, contract: anytype, s
 
 fn identity(value: anytype, source: anytype, c: Contract) !void {
     if (!eq(value.engine, "native") or !eq(value.execution, "device") or
-        !std.mem.eql(u8, &value.completed_ranks, &.{ 0, 1 })) return error.ServerDeviceUnrun;
+        !std.mem.eql(u32, &value.completed_ranks, &.{ 0, 1 })) return error.ServerDeviceUnrun;
     try fixture.hex(value.harness_commit, 40);
     inline for (.{ "fatbin_sha256", "original_server_sha256", "instrumented_server_sha256" }) |key|
         try fixture.hex(@field(value, key), 64);

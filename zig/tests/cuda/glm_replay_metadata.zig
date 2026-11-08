@@ -45,7 +45,7 @@ pub const Gate = struct {
     fixture_sha256: []const u8,
     config_sha256: []const u8,
     binary_sha256: []const u8,
-    completed_ranks: [2]u8,
+    completed_ranks: [2]u32,
     comparisons: u64,
     kv_shard: bool,
     runtime_sha256: []const u8,
@@ -142,7 +142,7 @@ fn gate(a: std.mem.Allocator, io: std.Io, v: Artifact, m: Metadata, name: []cons
 pub fn checkGate(g: Gate, m: Metadata, name: []const u8, sharded: bool, runtime_hash: ?[]const u8) !void {
     try g.checkpoints.check();
     if (m.expected_checkpoints) |pins| try pins.require(g.checkpoints);
-    if (!eq(g.schema, "glm-replay-native-gate-v1") or !eq(g.gate, name) or !eq(g.status, "pass") or g.comparisons == 0 or g.kv_shard != sharded or (runtime_hash != null and !eq(g.runtime_sha256, runtime_hash.?)) or !std.mem.eql(u8, &g.completed_ranks, &.{ 0, 1 })) return error.GateUnproven;
+    if (!eq(g.schema, "glm-replay-native-gate-v1") or !eq(g.gate, name) or !eq(g.status, "pass") or g.comparisons == 0 or g.kv_shard != sharded or (runtime_hash != null and !eq(g.runtime_sha256, runtime_hash.?)) or !std.mem.eql(u32, &g.completed_ranks, &.{ 0, 1 })) return error.GateUnproven;
     if (!eq(g.fixture_sha256, m.fixture_sha256) or !eq(g.config_sha256, m.config_sha256) or !eq(g.binary_sha256, m.source.binary_sha256)) return error.GateIdentity;
     const proof = m.logical_evidence orelse return error.LogicalEvidenceUnrun;
     if (!eq(g.coverage orelse "", coverage) or !eq(g.evidence_sha256 orelse "", proof.sha256)) return error.GateEvidence;

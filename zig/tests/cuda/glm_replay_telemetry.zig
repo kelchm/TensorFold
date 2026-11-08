@@ -21,7 +21,7 @@ pub const Window = struct {
     schema: []const u8 = "glm-replay-block-window-v1",
     bindings: Bindings,
     ids: Ids,
-    completed_ranks: [2]u8 = .{ 0, 1 },
+    completed_ranks: [2]u32 = .{ 0, 1 },
     ranks: [2]RankWindow,
     session_nonce: []const u8,
     campaign_sha256: []const u8,
@@ -49,7 +49,7 @@ pub const Telemetry = struct {
     window_sha256: []const u8,
     bindings: Bindings,
     ids: Ids,
-    completed_ranks: [2]u8,
+    completed_ranks: [2]u32,
     ranks: [2]Rank,
     session_nonce: []const u8,
     campaign_sha256: []const u8,
@@ -98,7 +98,7 @@ pub fn preflight(a: std.mem.Allocator, io: std.Io, ref: Ref) !void {
 }
 
 pub fn checkWindow(w: Window) !void {
-    if (!eq(w.schema, "glm-replay-block-window-v1") or !std.mem.eql(u8, &w.completed_ranks, &.{ 0, 1 })) return error.TelemetryWindow;
+    if (!eq(w.schema, "glm-replay-block-window-v1") or !std.mem.eql(u32, &w.completed_ranks, &.{ 0, 1 })) return error.TelemetryWindow;
     try fixture.hex(w.session_nonce, 64);
     try fixture.hex(w.campaign_sha256, 64);
     inline for (@typeInfo(Bindings).@"struct".field_names) |key| {
@@ -120,7 +120,7 @@ pub fn checkWindow(w: Window) !void {
 pub fn check(a: std.mem.Allocator, t: Telemetry, w: Window, devices: [2][]const u8) !void {
     try checkWindow(w);
     if (!eq(t.schema, "glm-replay-telemetry-v1") or !eq(t.status, "measured") or
-        !std.mem.eql(u8, &t.completed_ranks, &w.completed_ranks)) return error.TelemetryUnmeasured;
+        !std.mem.eql(u32, &t.completed_ranks, &w.completed_ranks)) return error.TelemetryUnmeasured;
     try hash.matches(t.window_sha256, try digest(a, w));
     inline for (.{ "bindings", "ids", "checkpoints" }) |key| {
         if (!std.mem.eql(u8, &try digest(a, @field(t, key)), &try digest(a, @field(w, key)))) return error.TelemetryBinding;

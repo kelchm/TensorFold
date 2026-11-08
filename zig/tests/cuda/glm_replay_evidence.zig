@@ -20,7 +20,7 @@ pub const Logical = struct {
     checkpoints: @import("glm_replay_provenance.zig").Checkpoints,
     kv_shard: bool,
     forwards: []const fixture.Round,
-    owners: [4]u8,
+    owners: [4]u32,
     observations: []const Observed,
 };
 

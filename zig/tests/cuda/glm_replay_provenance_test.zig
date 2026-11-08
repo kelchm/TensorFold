@@ -117,6 +117,10 @@ test "replay native writer emits rank-local elapsed and headline layout deltas w
     var lines = std.mem.tokenizeScalar(u8, raw, '\n');
     for (0..2) |rank| {
         const v = try std.json.parseFromSliceLeaky(std.json.Value, a, lines.next().?, .{});
+        const completed_ranks = v.object.get("completed_ranks").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), completed_ranks.len);
+        try std.testing.expectEqual(@as(i64, 0), completed_ranks[0].integer);
+        try std.testing.expectEqual(@as(i64, 1), completed_ranks[1].integer);
         try std.testing.expectEqual(@as(i64, @intCast(headline.ranks[rank].elapsed_ns)), v.object.get("wall_ns").?.integer);
         try std.testing.expectEqual(@as(i64, @intCast(headline.ranks[rank].checks)), v.object.get("layout_checks").?.integer);
         try std.testing.expectEqualStrings(identity.session_nonce, v.object.get("session_nonce").?.string);
@@ -129,6 +133,9 @@ test "replay native writer emits rank-local elapsed and headline layout deltas w
     const anchor_raw = try std.Io.Dir.cwd().readFileAlloc(io, anchor_path, a, .limited(1 << 20));
     const anchor = try std.json.parseFromSliceLeaky(std.json.Value, a, anchor_raw, .{});
     try std.testing.expectEqualStrings(identity.session_nonce, anchor.object.get("session_nonce").?.string);
+    const completed_ranks = anchor.object.get("completed_ranks").?.array.items;
+    try std.testing.expectEqual(@as(i64, 0), completed_ranks[0].integer);
+    try std.testing.expectEqual(@as(i64, 1), completed_ranks[1].integer);
     const ranks = anchor.object.get("headline_completion").?.object.get("ranks").?.array.items;
     try std.testing.expectEqual(@as(i64, 173), ranks[1].object.get("elapsed_ns").?.integer);
     try std.testing.expectEqual(@as(i64, 5), ranks[1].object.get("checks").?.integer);
