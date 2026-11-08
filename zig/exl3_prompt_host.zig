@@ -55,7 +55,7 @@ fn run(rows: usize, prompt: bool, shared: bool) !void {
     d.api.cuMemcpy2DAsync_v2 = Capture.copy;
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     var k: ex.Experts = .{ .mod = undefined, .group = function(&d, 1), .rot_in = function(&d, 2), .grouped = @splat(function(&d, 3)), .gateup = function(&d, 4), .down_combine = function(&d, 5) };
-    if (comptime @hasField(ex.Experts, "prompt")) k.prompt = .{ .rotate = function(&d, 11), .gateup = function(&d, 12), .down = function(&d, 13), .down_slots = function(&d, 13) };
+    if (comptime @hasField(ex.Experts, "prompt")) k.prompt = .{ .rotate = function(&d, 11), .gateup = function(&d, 12), .down = function(&d, 13), .down_slots = function(&d, 13), .gateup_glm = function(&d, 12), .down_glm = function(&d, 13) };
     const ek: glm.experts.Kernels = .{ .nvfp4 = undefined, .b32 = null, .router = .{ .plan_small = function(&d, 20), .plan_rank = function(&d, 21), .plan_offsets = function(&d, 22), .plan_scatter = function(&d, 23), .plan_rows = function(&d, 24), .plan_rank_rows = function(&d, 25), .plan_scatter_rows = function(&d, 26) } };
     const w: glm.exl3.Experts = .{ .gt = 100, .ut = 200, .dt = 300, .k2 = 400, .suh_g = 500, .suh_u = 600, .svh_g = 700, .svh_u = 800, .suh_d = 900, .svh_d = 1000, .shx = shared };
     const sc: glm.exl3.Scratch = .{ .picks = 0x100000000, .xg = 0, .xu = 0, .z = 0 };
@@ -190,6 +190,20 @@ test "exl3 prompt: the common entry takes as many experts as the grouped router 
         try std.testing.expectError(error.Exl3Shape, P.bytes(l, rows, 8));
         try std.testing.expectError(error.Exl3Shape, P.scratch(4096, l, rows, 8));
     }
+}
+
+test "exl3 prompt: GLM refuses unaligned vector outputs before any driver call" {
+    Capture.reset();
+    const k: ex.prompt.Kernels = .{ .rotate = undefined, .gateup = undefined, .down = undefined };
+    var sc: ex.prompt.Scratch = .{ .xg = 0, .xu = 0, .xd = 8, .y = 18, .rows = 1, .slots = 8, .yrow = 9 };
+    try std.testing.expectError(error.Exl3Shape, k.runGlm(undefined, undefined, undefined, undefined, 0, 0, 0, 0, sc, undefined));
+    sc.y = 16;
+    sc.xd = 9;
+    try std.testing.expectError(error.Exl3Shape, k.runGlm(undefined, undefined, undefined, undefined, 0, 0, 0, 0, sc, undefined));
+    sc.xd = 8;
+    sc.yrow = 0;
+    try std.testing.expectError(error.Exl3Shape, k.runGlm(undefined, undefined, undefined, undefined, 0, 0, 0, 0, sc, undefined));
+    try std.testing.expectEqual(@as(usize, 0), Capture.count);
 }
 
 fn reply(drafts: bool, neighbors: usize, seed: ?u64) ![32]u32 {

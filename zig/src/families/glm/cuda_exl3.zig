@@ -168,7 +168,7 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
             var scratch = try common.prompt.scratchFor(arena, l, cap, top_k, false);
             scratch.y = ey + at * slots * dims * 4;
             scratch.yrow = slots;
-            try k.prompt.run(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, sc.picks, n, scratch, plan_buf);
+            try k.prompt.runGlm(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, sc.picks, n, scratch, plan_buf);
             continue;
         }
         const scratch = try common.scratch(arena, l, cap, top_k);

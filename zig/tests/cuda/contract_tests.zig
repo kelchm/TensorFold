@@ -347,6 +347,8 @@ fn registered(gpu: check.Gpu, only: []const []const u8, t0: *i96) !g.Tally {
     for (&e3_splits) |*x| try kernels.append(a, x.kernel());
     const exl3_finish = try @import("contract_exl3_finish.zig").Group.create(a, gpu, s, mods[5], &kernels);
     defer exl3_finish.destroy();
+    const exl3_prompt = try @import("contract_exl3_prompt.zig").Group.create(a, gpu, s, &kernels);
+    defer exl3_prompt.destroy();
     const exl3_grouped = try @import("contract_exl3_grouped.zig").Group.create(a, gpu, s, mods[5], &kernels);
     defer exl3_grouped.destroy();
     const nvfp4_facts = try @import("contract_nvfp4_tile.zig").Group.create(a, gpu, s, sms, try cuda.grouped.Router.resolve(mods[6]), &kernels);
