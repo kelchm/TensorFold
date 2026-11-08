@@ -251,6 +251,14 @@ GLM_MM_ALL(4)
 GLM_MM_ALL(6)
 GLM_MM_ALL(8)
 GLM_MM_ALL(16)
+// Packed prompts: two stages, with the three-stage kernel's K-group order and sums.
+#define GLM_MM_PROMPT2(B)                                                                                              \
+    extern "C" __global__ void __launch_bounds__(256, 2) glm_mm##B##_128s2(const __nv_bfloat16* __restrict__ x,       \
+        long long ldx, const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out,          \
+        float* __restrict__ part, int f32, int M, int N, int K, int SK) { mm_kernel<B, 128, 2, 2>(x, ldx, w, s, out, part, f32, M, N, K, SK); }
+GLM_MM_PROMPT2(4)
+GLM_MM_PROMPT2(6)
+GLM_MM_PROMPT2(8)
 
 // -- tiling at load: ops.cu's packed rows and fp16 scales [N][K / 64] -> the tiled chunks and scales ---------------
 template <int BITS>

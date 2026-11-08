@@ -429,6 +429,12 @@ squares in bf16.
 
 ## CUDA records per nvcc release
 
+GLM's packed prompt projections register `glm_mm4_128s2`, `glm_mm6_128s2` and `glm_mm8_128s2`, with BF16 and
+FP32 output, as byte replacements of their three-stage `glm_mm{4,6,8}_128` parents. The CUDA runner includes the
+TP=2 projection shapes, strided inputs, partial row/column tiles, nonfinite classes and FP32 accumulator stress.
+Each output kind and bit width has a dropped-last-row control. `glm_prompt_records.zig` records the two-stage
+launch geometry; compiled resources and device gates remain pending on every served SM.
+
 nvcc allocates registers differently from one release to the next, so the CUDA records are kept per release.
 `registry.cuda` holds what nvcc 13.0 compiles, the compiler of the release fatbins. `registry.cuda_sets` lists what
 each later release compiles differently from the release before it: nvcc 13.2's set holds `tf_rms_rows`, `lane_gemv`

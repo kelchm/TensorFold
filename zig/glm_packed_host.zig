@@ -31,3 +31,15 @@ test "glm packed: every loaded matmul bucket and tiler has a measured resource r
     _ = try record("glm_mm16_rows");
     _ = try record("glm_mm_reduce");
 }
+
+test "glm packed: two-stage prompt geometry is registered without claiming unmeasured resources" {
+    inline for (.{ 4, 6, 8 }) |bits| {
+        const r = try record(std.fmt.comptimePrint("glm_mm{d}_128s2", .{bits}));
+        try t.expectEqualStrings("glm_mm", r.launch.image);
+        try t.expectEqual(@as(u32, 256), r.launch.threads);
+        try t.expectEqual(glm.mm.sharedBytesStages(bits, 128, 2), r.launch.dynamic);
+        try t.expect(r.launch.opt_in and !r.geometry_pending);
+        try t.expectEqual(@as(usize, 5), try registry.checkCuda(t.allocator, &.{r}, true));
+        try t.expectEqual(registry.none, registry.usageFor(r, .{ .major = 13, .minor = 3 }));
+    }
+}

@@ -505,6 +505,9 @@ fn registered(gpu: check.Gpu, only: []const []const u8, t0: *i96) !g.Tally {
     for (&wrows) |*x| try kernels.append(a, x.kernel());
     var glm_glue = try cuda.Module.load(gpu.d, kk.glm_glue);
     defer glm_glue.unload();
+    var glm_prompts = try @import("contract_glm_mm.zig").Prompts.init(gpu);
+    defer glm_prompts.deinit();
+    try glm_prompts.append(gpu, s, &kernels);
     var f32ws: [6]f32w_k.F32w = undefined;
     for (std.enums.values(f32w_k.Which), &f32ws) |w, *x| x.* = .init(.{ .gpu = gpu, .s = s }, w, try glm_glue.function(switch (w) {
         .norm_y, .norm_sums => "tf_glm_rmsnorm_4096_f32w",
