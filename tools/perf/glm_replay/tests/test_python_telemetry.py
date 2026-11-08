@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from tools.perf.glm_replay.common import ReplayError, digest, file_digest, write_json
-from tools.perf.glm_replay.python_provenance import gate_binding
+from tools.perf.glm_replay.python_provenance import gate_binding, metadata_check
 from tools.perf.glm_replay.telemetry import (
     TELEMETRY_SCHEMA, block_window, reference, validate_telemetry, wait_telemetry, write_request,
 )
@@ -84,6 +84,16 @@ class TelemetryTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ReplayError):
                 validate_telemetry(telemetry, window)
 
+    def test_shared_parser_uses_common_native_checkpoint_scheme_for_a_and_b(self):
+        for arm in ("A", "B"):
+            window, telemetry = window_and_samples()
+            window["bindings"]["arm"] = arm
+            window["checkpoints"]["scheme"] = "tensorfold-full-identity-v1"
+            telemetry["bindings"] = copy.deepcopy(window["bindings"])
+            telemetry["checkpoints"] = copy.deepcopy(window["checkpoints"])
+            telemetry["window_sha256"] = digest(window)
+            validate_telemetry(telemetry, window)
+
     def test_unsafe_and_symlink_paths_are_refused(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -91,6 +101,14 @@ class TelemetryTests(unittest.TestCase):
             for path in ("../escape", "/absolute", "a\\b", ".", "a//b", "alias/data.json"):
                 with self.subTest(path=path), self.assertRaises(ReplayError):
                     reference({"path": path}, root)
+
+    def test_metadata_path_validation_does_not_resolve_receipts_against_cwd(self):
+        fixture = fixture_case()
+        meta = metadata(fixture)
+        meta["telemetry"] = {"path": "future/receipt.json"}
+        metadata_check(meta, fixture)
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(reference(meta["telemetry"], directory), Path(directory).resolve() / "future/receipt.json")
 
 
 if __name__ == "__main__":

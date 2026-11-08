@@ -89,9 +89,9 @@ def metadata_check(meta, fixture):
     for key in HASHES.split():
         require(meta["bindings"][key] == fixture[key], f"metadata {key} mismatch")
     require(meta["server_gate"] is None, "P server gate must be null: unmodified frozen engine")
-    from .telemetry import reference
+    from .telemetry import reference_name
 
-    reference(meta["telemetry"], Path.cwd())
+    reference_name(meta["telemetry"])
     source = meta["source"]
     fields(source, "engine_commit harness_commit binary_sha256 fatbin_sha256 compiler_sha256 "
            "kit_commit image_digest device_image_digest", "source")

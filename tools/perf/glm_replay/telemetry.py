@@ -13,10 +13,7 @@ BINDINGS = ("fixture_sha256 config_sha256 schedule_sha256 tokens_sha256 arm sour
 
 
 def relative_path(root, name):
-    require(isinstance(name, str) and name, "unsafe telemetry path")
-    path = PurePosixPath(name)
-    require(str(path) == name and not path.is_absolute() and ".." not in path.parts
-            and "\\" not in name and name != ".", "unsafe telemetry path")
+    name = path_name(name)
     root = Path(root).resolve()
     result = root / name
     require(not any(p.is_symlink() for p in (result, *result.parents)), "symlink telemetry path")
@@ -24,9 +21,21 @@ def relative_path(root, name):
     return result
 
 
-def reference(spec, root):
+def path_name(name):
+    require(isinstance(name, str) and name, "unsafe telemetry path")
+    path = PurePosixPath(name)
+    require(str(path) == name and not path.is_absolute() and ".." not in path.parts
+            and "\\" not in name and name != ".", "unsafe telemetry path")
+    return name
+
+
+def reference_name(spec):
     fields(spec, "path", "future telemetry reference")
-    return relative_path(root, spec["path"])
+    return path_name(spec["path"])
+
+
+def reference(spec, root):
+    return relative_path(root, reference_name(spec))
 
 
 def validate_window(window):
@@ -35,14 +44,15 @@ def validate_window(window):
     require(all(type(r) is int for r in window["completed_ranks"]), "invalid window rank types")
     hex_id(window["session_nonce"], "session nonce")
     hex_id(window["campaign_sha256"], "campaign digest")
+    fields(window["bindings"], BINDINGS, "window bindings")
     fields(window["checkpoints"], "scheme target drafter", "window checkpoints")
-    require(window["checkpoints"]["scheme"] == "file-manifest-v1", "unsupported checkpoint identity scheme")
+    scheme = "file-manifest-v1" if window["bindings"]["arm"] == "P" else "tensorfold-full-identity-v1"
+    require(window["checkpoints"]["scheme"] == scheme, "unsupported checkpoint identity scheme")
     for role in ("target", "drafter"):
         hashes = window["checkpoints"][role]
         require(isinstance(hashes, list) and len(hashes) == 2, "window checkpoints need both ranks")
         for sha in hashes:
             hex_id(sha, "checkpoint digest")
-    fields(window["bindings"], BINDINGS, "window bindings")
     for key, value in window["bindings"].items():
         if key == "arm":
             require(value in ("A", "B", "P"), "invalid window arm")
@@ -85,6 +95,8 @@ def validate_telemetry(value, window):
         require(integer(row["rank"], "rank", 0, 1) == rank, "telemetry rank mismatch")
         string(row["device_uuid"], "device UUID")
         expected = window["ranks"][rank]
+        integer(row["realtime_start_ns"], "telemetry start", 1)
+        integer(row["realtime_end_ns"], "telemetry end", 1)
         require(row["realtime_start_ns"] == expected["realtime_start_ns"]
                 and row["realtime_end_ns"] == expected["realtime_end_ns"], "telemetry rank window mismatch")
         gap = integer(row["max_sample_gap_ns"], "maximum sample gap", 1, 5_000_000_000)

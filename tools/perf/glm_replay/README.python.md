@@ -207,6 +207,8 @@ campaign_sha256,checkpoints`. Bindings are the exact `gate_binding` object: fixt
 tokens SHA256, arm, source SHA256, source-tree SHA256, runtime SHA256 and checkpoints SHA256.
 IDs are run/pair/start/order/cell/block. Ranks are ordered `[0,1]`, each exactly
 `{rank,realtime_start_ns,realtime_end_ns}` with positive ordered integer nanoseconds.
+Checkpoint schemes match the common result contract: `file-manifest-v1` for P and
+`tensorfold-full-identity-v1` for native A/B. Both carry rank-ordered target and drafter SHA256 arrays.
 
 `glm-replay-telemetry-v1` has exactly `schema,status,window_sha256,bindings,ids,completed_ranks,
 ranks,session_nonce,campaign_sha256,checkpoints`. Status is `measured`; `window_sha256` is the

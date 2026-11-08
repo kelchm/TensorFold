@@ -136,6 +136,16 @@ class QualificationTests(unittest.TestCase):
         with self.assertRaisesRegex(ReplayError, "artifact identity"):
             self.build()
 
+    def test_suite_cannot_change_common_source_tree_checkpoints_or_runtime(self):
+        original = artifact_receipt(self.entries[1]["validation"], self.root)
+        for key in ("source_sha256", "source_tree_sha256", "checkpoints_sha256", "runtime_sha256"):
+            changed = copy.deepcopy(original)
+            changed["bindings"][key] = "0" * 64
+            changed["logical_evidence"]["bindings"] = changed["bindings"]
+            self.entries[1]["validation"] = self.save("wrong-binding.json", rehash(changed))
+            with self.subTest(key=key), self.assertRaisesRegex(ReplayError, "gate binding mismatch"):
+                self.build()
+
     def test_synthetic_host_suite_is_refused_by_default_device_validator(self):
         gate = self.build()
         with self.assertRaisesRegex(ReplayError, "synthetic fixture refused"):

@@ -7,6 +7,32 @@ from tools.perf.glm_replay.python_runtime import Runtime
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_realtime_end_is_read_after_wall_stop_and_before_completion_readback(self):
+        calls = []
+        runtime = Runtime.__new__(Runtime)
+        runtime.rank, runtime.guard = 0, SimpleNamespace(calls=0)
+        runtime.torch = SimpleNamespace(cuda=SimpleNamespace(synchronize=lambda: calls.append("sync")))
+        runtime.finish_host = SimpleNamespace(numpy=lambda: [0] * 5)
+        runtime.finish_send = SimpleNamespace(copy_=lambda *a, **k: None)
+        def readback():
+            self.assertEqual(runtime.last_realtime_end_ns, 1234)
+            calls.append("readback")
+            return SimpleNamespace(view=lambda *a: SimpleNamespace(tolist=lambda: [[r, 1, 1, 0, 0] for r in (0, 1)]))
+        runtime.finish_recv = SimpleNamespace(cpu=readback)
+        runtime.nccl = SimpleNamespace(all_gather=lambda *a: None)
+        runtime.comm = SimpleNamespace()
+        frame = SimpleNamespace(target_commits=1, context_commits=1, lost=0)
+        def stop():
+            calls.append("wall_stop")
+            return 100
+        def realtime():
+            calls.append("realtime_end")
+            return 1234
+        with patch("tools.perf.glm_replay.python_runtime.time.perf_counter_ns", side_effect=stop), \
+             patch("tools.perf.glm_replay.python_runtime.time.time_ns", side_effect=realtime):
+            self.assertEqual(runtime.finish([frame], 10), 90)
+        self.assertEqual(calls[-3:], ["wall_stop", "realtime_end", "readback"])
+
     def test_fresh_prefill_clears_every_cache_and_all_four_contexts(self):
         calls = []
         def tensor(name):

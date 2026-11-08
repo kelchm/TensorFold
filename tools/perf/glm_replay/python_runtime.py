@@ -294,6 +294,7 @@ class Runtime:
         self.nccl.all_gather(self.finish_send, self.finish_recv)
         torch.cuda.synchronize()
         wall = time.perf_counter_ns() - start_ns
+        self.last_realtime_end_ns = time.time_ns()
         completed(self.finish_recv.cpu().view(2, 5).tolist(), expected)
         if hasattr(self.comm, "check"):
             self.comm.check()
@@ -355,7 +356,7 @@ class Runtime:
                 frame.verified = None
         if not capture:
             wall = self.finish(plan, begin)
-        realtime_end = time.time_ns()
+        realtime_end = self.last_realtime_end_ns
         final = capture_forward(self, plan[-1], range(4)) if final_capture else None
         plan[-1].verified = None
         phases = trace.resolve() if trace is not None and enabled else None
