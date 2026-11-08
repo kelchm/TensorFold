@@ -1,5 +1,4 @@
 // The kernel contract's planted controls on CUDA: each breaks one gate on purpose, and that gate must go red.
-
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <math.h>
@@ -272,6 +271,7 @@ extern "C" __global__ void tf_ctl_q35_dense_half(const __nv_bfloat16 *X, const _
 }
 // The pre-template GLM BF16 operators, kept apart from the candidate math for byte equality.
 #include "contract_glm_bf16_baseline.cuh"
+#include "contract_glm_attn_baseline.cuh"
 // Gate 4: flashnext_hc's fn_hc_dense_mix8 with each 32-column group summed in bf16, while its spec declares fp32 sums.
 #include "common/glue_math.cuh"
 
