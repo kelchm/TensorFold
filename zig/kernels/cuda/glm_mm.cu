@@ -55,6 +55,18 @@ __device__ __forceinline__ int frag_k(int lane, int v) {
     return kt * 16 + 2 * t + (j & 1) + (j >> 1) * 8;
 }
 
+// LOP3 keeps each packed byte's low seven bits or flips its high bit against a register constant.
+__device__ __forceinline__ uint32_t low7_or(uint32_t t, uint32_t c) {
+    uint32_t y;
+    asm("lop3.b32 %0, %1, 0x007F007F, %2, 0xea;\n" : "=r"(y) : "r"(t), "r"(c));
+    return y;
+}
+__device__ __forceinline__ uint32_t top_xor(uint32_t t, uint32_t c) {
+    uint32_t y;
+    asm("lop3.b32 %0, %1, 0x00800080, %2, 0x6a;\n" : "=r"(y) : "r"(t), "r"(c));
+    return y;
+}
+
 // the B-fragment bf16 pairs of a chunk: pairs 2 kt and 2 kt + 1 are step kt's b0 and b1
 template <int BITS>
 __device__ __forceinline__ void bpairs(const uint32_t* __restrict__ p, uint32_t (&b)[8]) {
@@ -72,6 +84,18 @@ __device__ __forceinline__ void bpairs(const uint32_t* __restrict__ p, uint32_t 
     }
 }
 
+// Codes u become 128 + (u & 127) minus (u < 128 ? 256 : 128), exactly u - 128 in BF16, including +0.
+__device__ __forceinline__ void bpairs8_fast(const uint32_t* __restrict__ p, uint32_t (&b)[8]) {
+    const uint32_t k43 = 0x43004300u, k438 = 0x43804380u;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t t = __byte_perm(p[i >> 1], 0u, (i & 1) ? 0x4342 : 0x4140);
+        const uint32_t a = low7_or(t, k43), c = top_xor(t, k438);
+        const __nv_bfloat162 d = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&a), *reinterpret_cast<const __nv_bfloat162*>(&c));
+        b[i] = *reinterpret_cast<const uint32_t*>(&d);
+    }
+}
+
 template <int BITS, int BM, int WM, int STAGES>
 struct Tile {
     static constexpr int WN = 4, BN = 64, NT = 2, MT = BM / WM / 16, THREADS = WM * WN * 32;
@@ -85,7 +109,7 @@ struct Tile {
 };
 
 // ROWS_FIRST: row blocks fastest, so the blocks reading one weight tile run together and share it in L2 (prompts)
-template <int BITS, int BM, int WM, int STAGES, bool ROWS_FIRST = false>
+template <int BITS, int BM, int WM, int STAGES, bool ROWS_FIRST = false, bool P2 = false>
 __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, long long ldx,
         const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part,
         int f32, int M, int N, int K, int SK) {
@@ -123,6 +147,53 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
             }
         }
     };
+    // P2: the same pieces as loadX / loadW, sources at group g0, a stage adds (g - g0) groups
+    constexpr int XPT = (BM * T::CHUNKS + T::THREADS - 1) / T::THREADS;
+    constexpr int PER_TILE_ = 32 * T::WPC * 4 / 16, WPT = (8 * PER_TILE_ + T::THREADS - 1) / T::THREADS;
+    const unsigned char* xsrc[P2 ? XPT : 1];
+    uint32_t xdst[P2 ? XPT : 1];
+    bool xin[P2 ? XPT : 1], xok[P2 ? XPT : 1];
+    const unsigned char* wsrc[P2 ? WPT : 1];
+    bool wok[P2 ? WPT : 1];
+    const unsigned char* ssrc = nullptr;
+    bool sok = false;
+    if constexpr (P2) {
+#pragma unroll
+        for (int j = 0; j < XPT; ++j) {
+            const int c = tid + j * T::THREADS, r = c / T::CHUNKS, ch = c % T::CHUNKS;
+            xin[j] = c < BM * T::CHUNKS;
+            const int row = min(m0 + r, M - 1);
+            xsrc[j] = reinterpret_cast<const unsigned char*>(x + (long long)row * ldx + (long long)g0 * 64 + ch * 8);
+            xdst[j] = (uint32_t)(r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
+            xok[j] = m0 + r < M;
+        }
+#pragma unroll
+        for (int j = 0; j < WPT; ++j) {
+            const int c = tid + j * T::THREADS, tt = c / PER_TILE_, off = c % PER_TILE_;
+            wok[j] = c < 8 * PER_TILE_ && t0 + tt < N8;
+            wsrc[j] = reinterpret_cast<const unsigned char*>(w) + (wok[j] ? ((long long)(t0 + tt) * KG + g0) * 32 * T::WPC * 4 + off * 16 : 0);
+        }
+        if constexpr (BITS != 16) {
+            sok = tid < 8 && t0 + tid < N8;
+            ssrc = reinterpret_cast<const unsigned char*>(s + (sok ? ((long long)(t0 + tid) * KG + g0) * 8 : 0));
+        }
+    }
+    auto loadPX = [&](int st, int g) {   // P2: loadX of group g into stage st
+        unsigned char* p = stage(st);
+        const long long dg = g - g0;
+#pragma unroll
+        for (int j = 0; j < XPT; ++j)
+            if (xin[j]) cp16z(p + xdst[j], xsrc[j] + dg * 128, xok[j]);
+    };
+    auto loadPW = [&](int st, int g) {   // P2: loadW of group g into stage st
+        unsigned char* pw = stage(st) + T::X;
+        const long long dg = g - g0;
+#pragma unroll
+        for (int j = 0; j < WPT; ++j)
+            if (wok[j]) cp16(pw + (tid + j * T::THREADS) * 16, wsrc[j] + dg * (32 * T::WPC * 4));
+        if constexpr (BITS != 16)
+            if (sok) cp16(pw + T::W + tid * 16, ssrc + dg * 16);
+    };
     float acc[T::MT][T::NT][4];
 #pragma unroll
     for (int i = 0; i < T::MT; ++i)
@@ -134,11 +205,17 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
     grid_launch();
 #pragma unroll
     for (int st = 0; st < STAGES - 1; ++st)
-        if (st < per) loadW(st, g0 + st);
+        if (st < per) {
+            if constexpr (P2) loadPW(st, g0 + st);
+            else loadW(st, g0 + st);
+        }
     grid_wait();
 #pragma unroll
     for (int st = 0; st < STAGES - 1; ++st) {
-        if (st < per) loadX(st, g0 + st);
+        if (st < per) {
+            if constexpr (P2) loadPX(st, g0 + st);
+            else loadX(st, g0 + st);
+        }
         commit();
     }
     for (int it = 0; it < per; ++it) {
@@ -146,8 +223,13 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
         __syncthreads();
         const int next = it + STAGES - 1;
         if (next < per) {
-            loadX(next % STAGES, g0 + next);
-            loadW(next % STAGES, g0 + next);
+            if constexpr (P2) {
+                loadPX(next % STAGES, g0 + next);
+                loadPW(next % STAGES, g0 + next);
+            } else {
+                loadX(next % STAGES, g0 + next);
+                loadW(next % STAGES, g0 + next);
+            }
         }
         commit();
         const unsigned char* p = stage(it % STAGES);
@@ -155,7 +237,10 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
         const __half* ps = reinterpret_cast<const __half*>(p + T::X + T::W);
         uint32_t b[T::NT][8];
 #pragma unroll
-        for (int j = 0; j < T::NT; ++j) bpairs<BITS>(pw + ((wn * T::NT + j) * 32 + lane) * T::WPC, b[j]);
+        for (int j = 0; j < T::NT; ++j) {
+            if constexpr (P2 && BITS == 8) bpairs8_fast(pw + ((wn * T::NT + j) * 32 + lane) * T::WPC, b[j]);
+            else bpairs<BITS>(pw + ((wn * T::NT + j) * 32 + lane) * T::WPC, b[j]);
+        }
         float d[T::MT][T::NT][4];
 #pragma unroll
         for (int kt = 0; kt < 4; ++kt) {
@@ -255,7 +340,7 @@ GLM_MM_ALL(16)
 #define GLM_MM_PROMPT2(B)                                                                                              \
     extern "C" __global__ void __launch_bounds__(256, 2) glm_mm##B##_128s2(const __nv_bfloat16* __restrict__ x,       \
         long long ldx, const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out,          \
-        float* __restrict__ part, int f32, int M, int N, int K, int SK) { mm_kernel<B, 128, 2, 2>(x, ldx, w, s, out, part, f32, M, N, K, SK); }
+        float* __restrict__ part, int f32, int M, int N, int K, int SK) { mm_kernel<B, 128, 2, 2, false, true>(x, ldx, w, s, out, part, f32, M, N, K, SK); }
 GLM_MM_PROMPT2(4)
 GLM_MM_PROMPT2(6)
 GLM_MM_PROMPT2(8)

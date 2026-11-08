@@ -8,15 +8,18 @@ const g = contract.gates;
 const Dense = contract.dense.Dense;
 const Rig = @import("contract_rig.zig").Rig;
 const check = @import("check.zig");
+pub const Gpu = check.Gpu;
 
 const served = [_]c.Shape{
     .{ .rows = 37, .n = 72, .k = 8192 },
     .{ .rows = 768, .n = 6416, .k = 4096 },
+    .{ .rows = 768, .n = 12576, .k = 4096 },
     .{ .rows = 129, .n = 4096, .k = 2048 },
     .{ .rows = 128, .n = 2048, .k = 4096 },
     .{ .rows = 127, .n = 4096, .k = 1024 },
     .{ .rows = 2048, .n = 12288, .k = 4096 },
     .{ .rows = 768, .n = 4096, .k = 6144 },
+    .{ .rows = 129, .n = 4096, .k = 8192 },
     .{ .rows = 1, .n = 2560, .k = 4096 },
     .{ .rows = 33, .n = 4096, .k = 4096 },
     .{ .rows = 1000, .n = 1000, .k = 1024 },
@@ -221,6 +224,27 @@ test "GLM prompt contract: stress distinguishes FP16 and BF16 sums in every orde
                 for (got, want) |v, w| worst = @max(worst, if (v == w) 0 else if (!std.math.isFinite(v)) std.math.inf(f64) else @abs(v - w) / c.boundExact(spec, w));
                 try std.testing.expect(worst >= 100);
             }
+        }
+    }
+}
+
+fn lop3(a: u32, b: u32, third: u32, lut: u8) u32 {
+    var out: u32 = 0;
+    for (0..8) |i| if ((lut >> @as(u3, @intCast(i))) & 1 != 0) {
+        out |= (if (i & 4 != 0) a else ~a) & (if (i & 2 != 0) b else ~b) & (if (i & 1 != 0) third else ~third);
+    };
+    return out;
+}
+
+test "GLM prompt contract: fast eight-bit pair decode preserves every pair including positive zero" {
+    for (0..65536) |pair| {
+        const t: u32 = @intCast((pair & 255) | ((pair >> 8) << 16));
+        const a = lop3(t, 0x007f007f, 0x43004300, 0xea);
+        const b = lop3(t, 0x00800080, 0x43804380, 0x6a);
+        for ([_]u5{ 0, 16 }) |shift| {
+            const got = c.toBf16(c.fromBf16(@truncate(a >> shift)) - c.fromBf16(@truncate(b >> shift)));
+            const signed: i32 = @as(i32, @intCast((t >> shift) & 255)) - 128;
+            try std.testing.expectEqual(c.toBf16(@floatFromInt(signed)), got);
         }
     }
 }
