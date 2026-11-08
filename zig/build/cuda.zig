@@ -90,6 +90,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const dump_options = b.addOptions();
     dump_options.addOption(bool, "enabled", opts.test_dump);
     runner.addOptions("cuda_dump_options", dump_options);
+    @import("cuda_roofline.zig").images(b, runner, fatbin_step, prebuilt, nvcc, version, sms);
     runner.addImport("cuda", cuda);
     runner.addImport("gpu_memory", @import("gpu_memory.zig").module(b, target));
     runner.addImport("core", mods.core);
