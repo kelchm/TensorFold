@@ -166,6 +166,7 @@ const usage =
     \\  ptx                       hand-written PTX through the driver JIT, and a refused broken image
     \\  symbols                   every gdn fatbin instantiation resolves by its listed symbol
     \\  cublaslt                  bf16 GEMM through cuBLASLt against an fp64 reference
+    \\  roofline [seconds-per-test]  device 0: memory, register MMA/FMA and cuBLASLt ceilings (default 1 s/test)
     \\  nccl                      one-rank NCCL all-reduce and all-gather
     \\  rank-scatter <rank> <n> [id]  rank-order reduce-scatter (NCCL_COMM_ID or an id file) against an all-gather
     \\  roce-gather <rank>        two ranks (NCCL_COMM_ID): the RoCE all-gather against NCCL's, graph replays, time a call
@@ -412,6 +413,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "ptx")) return runtime_tests.ptx(gpu);
     if (std.mem.eql(u8, cmd, "symbols")) return runtime_tests.symbols(gpu);
     if (std.mem.eql(u8, cmd, "cublaslt")) return libs_tests.cublaslt(gpu);
+    if (std.mem.eql(u8, cmd, "roofline")) return @import("roofline.zig").run(gpu, rest);
     if (std.mem.eql(u8, cmd, "nccl")) return libs_tests.nccl(gpu);
     if (std.mem.eql(u8, cmd, "rank-scatter")) {
         const rank = try std.fmt.parseInt(usize, try arg(rest, 0), 10);
