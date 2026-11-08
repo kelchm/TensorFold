@@ -105,7 +105,7 @@ pub const Case = struct {
         inline for (.{ self.ins[0], self.ins[1], self.ins[2], self.pos, self.ins[3], self.ins[4], parts[0], parts[1], parts[2], @as(i64, @intCast(s.rows)), @as(i64, heads), @as(i64, @intCast(s.k)), @as(f32, 0.0625), @as(c_int, @intFromBool(self.sparse)) }) |v| a.add(v);
         const shared = if (self.hb == 32) glm.glue.chunksSmem(32) else glm.glue.chunksSmem(16);
         try f.allowDynamicShared(shared);
-        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(s.rows), .y = heads / self.hb, .z = @intCast(self.nch) }, .block = .{ .x = 256 }, .shared = shared }, self.rig.s, &a);
+        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(s.rows), .y = heads / self.hb, .z = @intCast(self.nch) }, .block = .{ .x = glm.latent.chunk_threads }, .shared = shared }, self.rig.s, &a);
         var m: cuda.Args = .{};
         inline for (.{ parts[0], parts[1], parts[2], out, self.ins[4], @as(i64, @intCast(s.rows)), @as(i64, heads), @as(c_int, @intCast(self.nch)), @as(c_int, @intFromBool(self.sparse)) }) |v| m.add(v);
         try cuda.launch.launch(self.merge, .{ .grid = .{ .x = @intCast(s.rows), .y = heads }, .block = .{ .x = 128 } }, self.rig.s, &m);
