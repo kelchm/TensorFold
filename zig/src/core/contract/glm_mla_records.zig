@@ -9,7 +9,20 @@ pub const records = blk: {
         }
     }
     break :blk out;
-} ++ chunks;
+} ++ chunks ++ mma;
+
+const mma = blk: {
+    var out: [4]registry.CudaRecord = undefined;
+    for ([_][]const u8{ "kn", "nk" }, 0..) |suffix, i| {
+        const dynamic = if (i == 0) 56832 else 61440;
+        for ([_]bool{ false, true }, 0..) |control, j| {
+            const symbol = (if (control) "tf_ctl_glm_mma_" else "tf_glm_latent_mma_") ++ suffix;
+            const image = if (control) "contract_controls" else "glm_glue";
+            out[i * 2 + j] = .{ .launch = .{ .name = image ++ " " ++ symbol, .symbol = symbol, .image = image, .threads = 256, .dynamic = dynamic, .opt_in = true, .min_sm = 80 }, .usage = registry.none };
+        }
+    }
+    break :blk out;
+};
 
 const chunks = blk: {
     var out: [2]registry.CudaRecord = undefined;

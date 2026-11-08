@@ -5,7 +5,6 @@
 #include <stdint.h>
 #include "common/reduce.cuh"
 #include "gemma4_ple.cuh"
-
 __device__ __forceinline__ float tf_ctl_x(const __nv_bfloat16* x, int64_t i) { return __bfloat162float(x[i]); }
 
 // Gate 1: a row's maximum by fmaxf, which drops a NaN input, so a row holding NaN reads as its largest number.
@@ -272,6 +271,7 @@ extern "C" __global__ void tf_ctl_q35_dense_half(const __nv_bfloat16 *X, const _
 // The pre-template GLM BF16 operators, kept apart from the candidate math for byte equality.
 #include "contract_glm_bf16_baseline.cuh"
 #include "contract_glm_attn_baseline.cuh"
+#include "contract_glm_mma.cuh"
 // Gate 4: flashnext_hc's fn_hc_dense_mix8 with each 32-column group summed in bf16, while its spec declares fp32 sums.
 #include "common/glue_math.cuh"
 
