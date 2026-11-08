@@ -1,4 +1,4 @@
-//! A solo prompt pass (TF_GLM_CHUNK_SOLO): two grid chunks in one pass, while no other stream decodes.
+//! A solo prompt pass (TF_GLM_CHUNK_SOLO): whole grid chunks in one pass, while no other stream decodes.
 const std = @import("std");
 const fw = @import("cuda_forward.zig");
 const engine = @import("cuda_engine.zig");
@@ -9,40 +9,47 @@ pub fn othersDecode(lanes: anytype, s: anytype) bool {
     return @import("lanes").solo_chunk.othersDecode(lanes, s, "fill");
 }
 
-/// The rows an engine sizes its prompt buffers for: at start, as they hold memory all the time.
-pub fn bufferRows(on: bool) usize {
-    return if (on) fw.solo_rows else fw.prefill_rows;
-}
-
 /// Whether a pass at `start` of a `len`-id prompt can reach past the next grid point: two rows, and no mark at it.
 pub fn takesTwo(start: usize, len: usize, marks: []const u32) bool {
-    const next = start + fw.prefill_rows;
-    return next + 1 < len and std.mem.indexOfScalar(u32, marks, @intCast(next)) == null; // one row: a chunk's part as sent
+    return takesChunks(start, len, 2 * fw.prefill_rows, marks);
+}
+
+/// Every grid boundary inside a solo pass must be unmarked; the last row may end the prompt off the grid.
+pub fn takesChunks(start: usize, len: usize, width: usize, marks: []const u32) bool {
+    if (start >= len or start % fw.prefill_rows != 0 or width <= fw.prefill_rows) return false;
+    if (len - start <= fw.prefill_rows + 1) return false; // one row: a chunk's part as sent
+    const end = start + rowsAt(start, len, width);
+    var next = start + fw.prefill_rows;
+    while (next < end) : (next += fw.prefill_rows) {
+        if (std.mem.indexOfScalar(u32, marks, @intCast(next)) != null) return false;
+    }
+    return true;
 }
 
 /// Whether a pass at `start` to `rows` rebases the index rings where chunks one at a time do: at its start, or not.
 pub fn ringsAgree(base: usize, ring: usize, start: usize, rows: usize) bool {
+    if (start < base or rows > ring) return false;
     return start + fw.prefill_rows > base + ring or start + rows <= base + ring;
 }
 
 /// The rows a solo pass takes at `start` of a `len`-id prompt.
-fn rowsAt(start: usize, len: usize) usize {
-    return @min(len - start, fw.solo_rows);
+pub fn rowsAt(start: usize, len: usize, width: usize) usize {
+    return @min(len - start, width);
 }
 
 /// Rank 0's choice for the step at `start`; not beside what reads a chunk's rows, nor with request starts (cut there).
 pub fn at(e: *const Engine, start: usize, len: usize, from: ?engine.Resume, marks: ?engine.Marks) bool {
-    if (e.bp.rows < fw.solo_rows or e.prompt_logprobs != null or e.prompt_profs[3] != null or e.cur.cuts.items.len > 0) return false;
+    if (e.bp.rows <= fw.prefill_rows or e.prompt_logprobs != null or e.prompt_profs[3] != null or e.cur.cuts.items.len > 0) return false;
     if (e.images) |v| if (v.rowCount() > 0) return false;
-    if (!takesTwo(start, len, if (marks) |m| m.at else &.{})) return false;
+    if (!takesChunks(start, len, e.bp.rows, if (marks) |m| m.at else &.{})) return false;
     // a resumed step restores its kept state, and the rings' base, after this choice
     const base = if (from) |r| (e.snaps.get(r.id) orelse return false).bases[0] else e.cur.st.base;
-    return ringsAgree(base, e.cur.st.ring_rows, start, rowsAt(start, len));
+    return ringsAgree(base, e.cur.st.ring_rows, start, rowsAt(start, len, e.bp.rows));
 }
 
 /// Whether a pass of `rows` past a chunk may run: `at`'s rule on every rank, its kept state restored.
 pub fn allowed(e: *const Engine, start: usize, rows: usize) bool {
-    if (e.bp.rows < rows or e.prompt_logprobs != null or e.cur.cuts.items.len > 0) return false;
+    if (e.bp.rows < rows or rows <= fw.prefill_rows or start % fw.prefill_rows != 0 or e.prompt_logprobs != null or e.cur.cuts.items.len > 0) return false;
     return ringsAgree(e.cur.st.base, e.cur.st.ring_rows, start, rows);
 }
 
@@ -81,7 +88,8 @@ test "a solo pass rebases the rings where chunks one at a time do" {
 }
 
 test "a solo pass fits a whole ring once it rebases, and its buffers only when asked" {
-    try std.testing.expectEqual(@as(usize, fw.solo_rows), @import("cuda_state.zig").index_ring);
-    try std.testing.expectEqual(@as(usize, fw.prefill_rows), bufferRows(false));
-    try std.testing.expectEqual(@as(usize, fw.solo_rows), bufferRows(true));
+    const state = @import("cuda_state.zig");
+    for ([_]usize{ 2048, 4096, 8192 }) |width| {
+        try std.testing.expectEqual(@max(state.index_ring, width), state.ringRows(1 << 20, width));
+    }
 }

@@ -231,24 +231,23 @@ test "GLM prompt workflow: context window cut preserves sequence positions indep
     try t.expectError(error.BadPromptContext, dr.promptRun(0, 0, 9, 2, 10, 0, C));
     try t.expectError(error.DrafterContextTooWide, dr.promptRun(0, 0, 0, 5, 5, 2044, C));
 }
-test "GLM prompt workflow: a solo pass's taps fit the drafter's buffer and an ingest keeps only the window's rows" {
+test "GLM prompt workflow: solo taps hold the whole pass and ingest only the final window" {
     const dr = glm.dflash;
-    const solo = 2 * dr.MAX_CTX; // TF_GLM_CHUNK_SOLO=4096's prompt buffers
-    try t.expectEqual(@as(usize, dr.MAX_CTX), dr.tapRows(dr.MAX_CTX));
-    try t.expectEqual(solo, dr.tapRows(solo));
-    try t.expectError(error.DrafterContextTooWide, dr.promptRun(1000, 2000, 0, solo, solo, 0, dr.MAX_CTX));
-    // a solo pass to the prompt's end: its last window, the second chunk's rows
-    const last = (try dr.promptRun(1000, 2000, 0, solo, solo, 0, dr.tapRows(solo))).?;
-    try t.expectEqual(@as(usize, dr.MAX_CTX), last.n);
-    try t.expectEqual(@as(i64, 2048), last.pos0);
-    try t.expectEqual(@as(u64, 2000 + 2048 * dr.TAP_ROW), last.taps);
-    // the window across two passes: a solo pass ending before the prompt does, then the rest
-    const len: usize = 10_000;
-    const first = (try dr.promptRun(1000, 2000, solo, solo, len, 0, solo)).?;
-    const rest = (try dr.promptRun(1000, 2000, 2 * solo, len - 2 * solo, len, 0, solo)).?;
-    try t.expectEqual(@as(usize, @intCast(dr.WIN)), first.n + rest.n);
-    try t.expectEqual(@as(i64, @intCast(len)) - dr.WIN, first.pos0);
-    try t.expectEqual(first.pos0 + @as(i64, @intCast(first.n)), rest.pos0);
+    for ([_]usize{ 4096, 8192 }) |solo| {
+        try t.expectEqual(solo, dr.tapRows(solo));
+        try t.expectError(error.DrafterContextTooWide, dr.promptRun(1000, 2000, 0, solo, solo, 0, dr.MAX_CTX));
+        const last = (try dr.promptRun(1000, 2000, 0, solo, solo, 0, dr.tapRows(solo))).?;
+        try t.expectEqual(@as(usize, dr.MAX_CTX), last.n);
+        try t.expectEqual(@as(i64, @intCast(solo - dr.MAX_CTX)), last.pos0);
+        try t.expectEqual(@as(u64, 2000 + (solo - dr.MAX_CTX) * dr.TAP_ROW), last.taps);
+        const len = 2 * solo + 1808;
+        const first = (try dr.promptRun(1000, 2000, solo, solo, len, 0, solo)).?;
+        const rest = (try dr.promptRun(1000, 2000, 2 * solo, len - 2 * solo, len, 0, solo)).?;
+        try t.expectEqual(@as(usize, @intCast(dr.WIN)), first.n + rest.n);
+        try t.expectEqual(@as(i64, @intCast(len)) - dr.WIN, first.pos0);
+        try t.expectEqual(first.pos0 + @as(i64, @intCast(first.n)), rest.pos0);
+        try t.expectError(error.DrafterContextTooWide, dr.promptRun(0, 0, 0, solo, solo, 1, solo));
+    }
 }
 
 test "GLM prompt workflow: both ranks share exact packets and reject malformed batches" {

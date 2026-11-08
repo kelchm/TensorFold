@@ -37,7 +37,7 @@ pub const snap_tail = "TF_GLM_PROMPT_TAIL";
 pub const explains_open = true;
 
 /// The server's reading of this rank's room after its load (the budget streams are admitted by); null if unreadable.
-pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
+pub const Room = @import("cuda_engine_types.zig").Room;
 /// `slide` stays false: the server refuses --slide for a family without a learner (no `slide` here).
 pub const Options = struct {
     context: usize,
@@ -271,7 +271,7 @@ fn openRank(a: StartArgs, set: ranks.Settings) !Loaded {
     cuda.p2p_report.afterInit(&diag, .{ .lib = &own.group.lib, .comm = comm, .d = ctx.d, .later = true });
     const cap = capacity(o.context);
     own.progress.enter(.weights);
-    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.group.lib, own.group.comm, p.rank, p.world, .{ .capacity = cap, .mtp = o.drafts, .settings = set, .vision = o.vision, .drafter = o.drafter != null });
+    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.group.lib, own.group.comm, p.rank, p.world, .{ .capacity = cap, .mtp = o.drafts, .settings = set, .vision = o.vision, .drafter = o.drafter != null, .room = o.room });
     errdefer own.e.deinit();
     if (o.vision) |lim| { // before the rooms: the tower's bytes count against rank 0's
         var problem: []const u8 = "";
@@ -391,8 +391,6 @@ fn finishRank(a: OpenArgs) !Loaded {
     };
 }
 
-// Each rank keeps a copy under rank 0's id, in the room rank 0 admitted by (the smallest over the ranks).
-
 /// The rounded pages for a committed prefix, including the head's possible verify window.
 pub fn snap_bytes(ptr: *anyopaque, at: u32) u64 {
     const e: *engine.Engine = @ptrCast(@alignCast(ptr));
@@ -507,6 +505,7 @@ fn release(own: *Owned) void {
 /// The server's words for this family's refusals.
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
+        error.GlmSoloMemory => "TF_GLM_CHUNK_SOLO=8192 does not fit the startup memory budget; use 4096 or 2048, or reduce --context / --parallel",
         error.BadRoceCap => "TF_ROCE_MAX_KB: give an integer from 1 through 4194303 KiB, or unset it for 4096 KiB",
         error.NoRank => "GLM-5.3-Flash runs at TP over hosts: set TF_GLM_RANK and TF_GLM_WORLD on every host (WORLD 1: one GPU, with TF_GLM_LAYERS for a thin model)",
         error.NoCommId => "GLM-5.3-Flash's ranks meet over NCCL: with TF_GLM_WORLD 2 or more, set NCCL_COMM_ID to rank 0's address:port on every host",
