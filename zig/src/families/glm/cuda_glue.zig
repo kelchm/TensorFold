@@ -6,7 +6,7 @@ const mm_mod = @import("cuda_mm.zig");
 const index_mod = @import("cuda_index.zig");
 
 /// What the forward's kernels launch from: our glue's, glm_mm's when tiled, qlinear's lane for FP8 kinds, copy_rows.
-pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null };
+pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false };
 
 /// A hidden-size norm's weight: bf16, or float32 (FP4-Local's) read as float32 by the _f32w kernels.
 pub const Norm = union(enum) { bf16: u64, f32: u64 };
@@ -60,6 +60,8 @@ pub const Kernels = struct {
     chunks_32_fp8: cuda.Function,
     merge: cuda.Function,
     scores: cuda.Function,
+    latent_mma_kn: cuda.Function,
+    latent_mma_nk: cuda.Function,
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
@@ -70,6 +72,8 @@ pub const Kernels = struct {
         try k.chunks_32.allowDynamicShared(chunksSmem(32));
         try k.chunks_16_fp8.allowDynamicShared(chunksSmem(16));
         try k.chunks_32_fp8.allowDynamicShared(chunksSmem(32));
+        try k.latent_mma_kn.allowDynamicShared(latent_mma_smem[0]);
+        try k.latent_mma_nk.allowDynamicShared(latent_mma_smem[1]);
         return k;
     }
 };
@@ -154,6 +158,8 @@ pub fn swiglu(set: Set, stream: cuda.Stream, gu: u64, out: u64, xs: u64, limit: 
 pub const bmm_tile_smem: u32 = 3 * (128 + 64) * 64 * 2;
 /// tf_glm_bmm_tile1's [bf16, fp32 out]: 3 stages of 128 x and 128 w rows, 32 bf16 a row, or the fp32 tile if larger.
 pub const bmm_tile1_smem = [2]u32{ 3 * (128 + 128) * 32 * 2, 128 * (128 + 4) * 4 };
+/// glm_glue_num.cuh's three-stage [absorb, expand] dynamic shared bytes.
+pub const latent_mma_smem = [2]u32{ 3 * (128 * 40 + 32 * 136) * 2, 3 * (128 * 40 + 128 * 40) * 2 };
 /// glm_glue_attn.cuh's wide_smem<hb>(): q (hb x 512), two 32-key tiles, p (hb x 32) in bf16, then max/sum scratch.
 pub fn chunksSmem(comptime hb: u32) u32 {
     return (hb * 512 + 2 * 32 * 512 + hb * 32) * 2 + (hb * 4 + 2 * hb) * 4;

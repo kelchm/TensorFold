@@ -5,6 +5,15 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
     // GLM CUDA's startup watcher (named phases, a warning while NCCL init or a load blocks), from cuda.zig's room
     b.step("test-startup-watch-host", "Blocked startup phase warnings without a driver or communicator").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{"startup watcher:"} })).step);
     const host = b.graph.host;
+    const mla_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM MLA:"} }));
+    const mla_step = b.step("test-glm-mla-host", "MLA opt-in, rank agreement, launch fallbacks and FP64 fixtures without devices");
+    mla_step.dependOn(&mla_run.step);
+    step.dependOn(&mla_run.step);
+    const mla_contract = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_mla_host.zig"), .target = host, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{ .{ .name = "glm_cuda", .module = glm }, .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } });
+    const mla_contract_run = b.addRunArtifact(b.addTest(.{ .root_module = mla_contract, .filters = &.{"GLM MLA:"} }));
+    mla_step.dependOn(&mla_contract_run.step);
+    step.dependOn(&mla_contract_run.step);
+
     const warm = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/cuda_warm_peers_test.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "heat", .module = mods.heat } } });
     const warm_run = b.addRunArtifact(b.addTest(.{ .root_module = warm, .filters = &.{"GLM warm peers:"} }));
     b.step("test-glm-warm-peers-host", "Selected GLM warm-up peers and NCCL posting failures without devices").dependOn(&warm_run.step);

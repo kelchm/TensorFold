@@ -3,7 +3,7 @@ const std = @import("std");
 const sys = @import("sys.zig");
 
 pub const Error = error{InvalidEnvironment};
-pub const Scope = enum { common, cuda, metal, xpu, slide, hooks, dsv41 };
+pub const Scope = enum { common, cuda, metal, xpu, slide, hooks, dsv41, glm };
 pub const Kind = enum { u32, u64, size, percent, positive, device, segments, mib, bit_width, word, prompt, flag, toggle, real, positive_real, signed_real, range };
 pub const Rule = struct {
     name: [:0]const u8,
@@ -30,6 +30,7 @@ pub fn isReal(kind: Kind) bool {
 }
 
 pub const rules = [_]Rule{
+    .{ .name = "TF_GLM_ABSORB_MMA", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TENSORFOLD_VIDEO_TOKENS", .scope = .common, .kind = .u64, .forms = "a nonnegative whole video-token budget (default 16384; unsigned 64-bit count)" },
     .{ .name = "TENSORFOLD_MAX_PDF_PAGES", .scope = .common, .kind = .positive, .forms = "a whole number from 1 to 4294967295 (capped by --vision-max-images)" },
     .{ .name = "TENSORFOLD_PRESSURE_CACHE_PERCENT", .scope = .common, .kind = .percent, .trim = " \t", .forms = "a whole percentage from 0 to 100" },
@@ -276,6 +277,7 @@ pub const Flags = struct {
     slide: bool = false,
     hooks: bool = false,
     dsv41: bool = false,
+    glm: bool = false,
     device: ?u32 = null,
     segments: ?u32 = null,
     carveout: bool = false,
@@ -289,6 +291,7 @@ pub const Flags = struct {
             .slide => f.slide,
             .hooks => f.hooks,
             .dsv41 => f.dsv41,
+            .glm => f.glm,
         };
     }
 };

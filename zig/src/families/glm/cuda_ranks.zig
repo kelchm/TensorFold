@@ -23,6 +23,7 @@ pub const Settings = struct {
     heat: ?heat.Bands = null, // TF_HEAT_HIGH and TF_HEAT_LOW (upstream's names): a prompt chunk waits on every rank's hottest zone
     layers: u32 = 0, // TF_GLM_LAYERS: the first this many layers only, a thin model for one-GPU checks (0: all)
     dense_bits: u8 = 16, // TF_GLM_DENSE_BITS: the dense linears packed at load to 4, 6 or 8 bits (16: bf16)
+    numerics: Numerics = .{},
     head_bits: u8 = 16, // TF_GLM_HEAD_BITS: the head, likewise
     roce_multi: bool = false, // TF_GLM_ROCE_MULTI: 1 (three ranks or more: small all-gathers on fabric/tp's multirank RoCE beside NCCL) or 0
     kv_host: u8 = 0, // TF_GLM_KV_HOST=1: KV pages in host memory (1); with TF_GLM_KV_HOST_SHARED=1, one copy a host (2)
@@ -127,6 +128,10 @@ pub const Settings = struct {
                 },
             };
         };
+        s.numerics.absorb_mma = @import("sys").environment.value(bool, "TF_GLM_ABSORB_MMA", get("TF_GLM_ABSORB_MMA"), false) catch {
+            problem.* = "TF_GLM_ABSORB_MMA: 0 or 1";
+            return error.BadSetting;
+        };
         s.heat = heat.bandsFrom(get("TF_HEAT_HIGH"), get("TF_HEAT_LOW")) catch {
             problem.* = "TF_HEAT_HIGH and TF_HEAT_LOW: both or neither, in degrees, with low at or under high";
             return error.BadSetting;
@@ -167,6 +172,15 @@ pub const Settings = struct {
     }
 };
 
+/// Off-by-default prompt arithmetic, agreed by every rank before weights load.
+pub const Numerics = packed struct(u32) {
+    absorb_mma: bool = false,
+    unused: u31 = 0,
+    pub fn bits(n: Numerics) u32 {
+        return @bitCast(n);
+    }
+};
+
 /// The most ranks a world holds: rank 0's greedy pick gathers every rank's top-1 into one host array of this size.
 pub const max_world = 16;
 
@@ -183,7 +197,7 @@ fn wireOpens(get: *const fn ([:0]const u8) ?[]const u8) bool {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 19, // this struct's version (18 plus the prompt pair)
+    layout: u32 = 20, // prompt arithmetic is part of the ranks' agreement
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -207,6 +221,7 @@ pub const Fingerprint = extern struct {
     solo: u32 = 0, // TF_GLM_CHUNK_SOLO: rank 0's solo passes need the wider prompt buffers on every rank
     l2pf: [4]u32 = @splat(0), // TF_GLM_L2PF's words: every rank prefetches alike, so none waits on a slower one's windows
     bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
+    numerics: u32 = 0,
     capacity: u64, // tokens a sequence holds
     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
     heat_low: f64,
@@ -240,6 +255,7 @@ pub const Fingerprint = extern struct {
         solo,
         l2pf,
         bits,
+        numerics,
         capacity,
         heat_high,
         heat_low,
@@ -279,6 +295,7 @@ pub const Fingerprint = extern struct {
             .solo = @intFromBool(s.solo),
             .l2pf = s.l2pf.words(),
             .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
+            .numerics = s.numerics.bits(),
             .capacity = capacity,
             .heat_high = if (s.heat) |b| b.high_c else 0,
             .heat_low = if (s.heat) |b| b.low_c else 0,
@@ -320,6 +337,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "solo",
             "l2pf",
             "bits",
+            "numerics",
             "capacity",
             "heat_high",
             "heat_low",
@@ -443,6 +461,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .solo => "TF_GLM_CHUNK_SOLO",
         .l2pf => "TF_GLM_L2PF, _MB, _CTAS or _PACE_GBPS",
         .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
+        .numerics => "TF_GLM_ABSORB_MMA",
         .capacity => "the sequence capacity (the context)",
         .heat_high => "TF_HEAT_HIGH",
         .heat_low => "TF_HEAT_LOW",

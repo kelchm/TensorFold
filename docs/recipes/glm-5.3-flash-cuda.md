@@ -102,6 +102,11 @@ opposite-peer warm-up; it does not add a switchless RoCE relay or qualify a four
 (`TF_GLM_PREFILL_REDUCE`) and the two-rank RoCE gathers (`TF_ROCE`) are in
 [placement](../multi-rank-receipts.md#the-settings-the-ranks-agreed-on).
 
+## Prompt MLA experiment
+
+The fork-only [MLA port](glm-prompt-mla.md) adds the default-off arithmetic switch
+`TF_GLM_ABSORB_MMA=1` and bit-preserving FP8 tile-load changes. Device qualification is pending.
+
 ## Prompt chunk size
 
 A prompt runs in passes of 2,048 rows. Kept prompt states sit on that grid, and a stream decoding beside a prompt waits
