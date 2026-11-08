@@ -102,7 +102,11 @@ memory={logical_pages,key_page_bytes,latent_page_bytes,row_page_bytes,
 tables_bytes,scratch_bytes,other_bytes,peak_physical_bytes}. logical_pages/key_page_bytes/latent_page_bytes/row_page_bytes
 are nonnegative integers; tables_bytes/scratch_bytes/other_bytes/peak_physical_bytes may be
 null when unmeasured, never fabricated zero. Physical peak, if provided, covers known allocations.
-telemetry_sha256 identifies an external post-block telemetry receipt (never timed scraping).
+telemetry_sha256 hashes the exact external post-block telemetry receipt bytes actually parsed.
+Both runners require measured sample coverage of actual rank-local realtime windows, matching
+source/runtime/work/session/checkpoint/ID bindings and actual GPU UUIDs; prehashed future
+metadata and stubs fail. See telemetry.py and NATIVE.md for the controller contract.
+The offline common result validator authenticates anchors; it does not reopen telemetry files.
 forwards = [{forward_id,round_id,parts,phases_ns,owner,graph_replays,eager_fallbacks,
 target_commits,context_commits,ingest_calls,proposer_calls,lost}].
 parts EXACTLY equals fixture timed parts, no reorder. target_commits=context_commits=sum(kept),

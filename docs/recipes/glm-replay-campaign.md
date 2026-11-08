@@ -127,13 +127,14 @@ All four slots are freshly prepared even for solo cases.
 
 ## Existing metadata and gates
 
-Every descriptor requires a complete `glm-replay-native-metadata-v1` file. Its exact fields
+Every descriptor requires a complete `glm-replay-native-metadata-v2` file. Its exact fields
 are `schema`, `run_id`, `pair_id`, `start_id`, `start_order` (integer 0 or 1), `block_id`
 (nonempty string), `cell_id`, `fixture_sha256`, `config_sha256`, `source`, `fatbin`,
 `compiler`, `telemetry`, `correctness`, `sharding_equality`, `timing_neutrality` and
 `default_server_neutrality`, `default_server_contract` and `logical_evidence`. IDs are nonempty strings. Fixture/config hashes must match
 the fully validated fixture. No fields are inferred from filenames or case indices.
 `expected_checkpoints` is optional and defaults to null; when present all four pins are required.
+`source_manifest` is required for measurement and binds the committed native source export.
 
 `source` has exactly `engine_commit`, `harness_commit`, `binary_sha256`, `fatbin_sha256`,
 `compiler_sha256`, `kit_commit`, `image_digest` and `device_image_digest`.
@@ -142,10 +143,14 @@ digests use the `sha256:` prefix. The historical engine commit is
 `e52eb42b52b1e50f3f23a5eae8115bbe80c5e7d9`; kit/image identities retain the existing frozen
 metadata checks. The binary hash is verified against the running executable.
 
-Every artifact is exactly `{"path":"LOCAL_FILE","sha256":"64 lowercase hex digits"}`.
+Every frozen artifact is exactly `{"path":"LOCAL_FILE","sha256":"64 lowercase hex digits"}`.
 `fatbin` and `compiler` must agree with their source hashes. All four gate artifacts are
-mandatory for `measure-many`; `null` is refused. Telemetry must already be a frozen external
-artifact and is checked before loading, then checked again after each block.
+mandatory for `measure-many`; `null` is refused. Telemetry instead uses a future `{path}` only;
+prehashed metadata is rejected. The runner writes each actual both-rank block window after
+completion, then waits up to 30 seconds for matching measured samples from the coordinator.
+See [NATIVE.md](../../tools/perf/glm_replay/NATIVE.md#post-block-telemetry-and-source-export) for
+the source-export command and exact telemetry contract. Telemetry and request paths must be
+absent before CUDA opens and distinct from every result, anchor and other telemetry path.
 This mode cannot emit validation gates or manufacture a passing hardware receipt.
 
 The correctness, timing and sharding gate files have these fields:
@@ -173,7 +178,8 @@ Before `Driver.open`, both ranks independently validate every fixture, token/sou
 tokenizer asset, model config, metadata, gate and artifact; compile every unique fixture's
 preparation and block buffers; and reject mixed identities and output collisions. The
 ordered content/start/source digest plus settings hash is passed through existing Session
-agreement before engine allocation. Rank-local paths are excluded from that digest.
+agreement before engine allocation. Frozen-artifact paths are excluded from that digest;
+the future relative telemetry names and source-manifest digest are included.
 Receipt/event capacity is the maximum forward count over every preparation and block.
 After load, every gate is matched to the actual combined `Session.runtime_sha256` on each
 rank, followed by a rank agreement barrier before any preparation or inference.
@@ -200,8 +206,8 @@ Saved completion receipts also expose `realtime_start_ns` and `realtime_end_ns` 
 nanoseconds from `.real`, sampled before monotonic start and after the all-rank monotonic
 stop respectively. The same untimed receipt exchange gathers each rank's own window before
 record/timing readbacks or correctness comparisons. Host fakes may leave these fields zero;
-a telemetry window producer must require positive ordered real windows. No telemetry scrape,
-file, schema or controller is added by these clock seams.
+the post-block telemetry producer requires positive ordered real windows. No telemetry scrape
+is added to the replay block; the external collector is still separately coordinated.
 Replay Session setup also gathers `Session.device_uuids: [2][40]u8` from each actual
 `Context.device`, querying `cuDeviceGetUuid_v2` with explicit symbol fallback to `cuDeviceGetUuid`.
 The 16-byte ABI is checked and formatted as `GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` outside

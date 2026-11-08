@@ -143,8 +143,8 @@ Phase durations remain separate rank-local intervals. They can overlap and inclu
 submission starvation; no phase sum is presented as busy time or subtracted to invent CPU
 cost. Preparation is outside replay wall time. Missing physical peak/tables/scratch/other
 measurements use `null`, and exact row-page allocation bytes remain separate from logical
-capacity. Telemetry hashes identify external post-block receipts; this host code does not
-validate their contents or scrape telemetry.
+capacity. Telemetry hashes identify actual external post-block receipts. Both runners validate
+their sample coverage and bindings outside the block; neither runner scrapes telemetry.
 
 ## Adapter imports and remaining gates
 
@@ -163,7 +163,7 @@ collectives. Result validation also binds effective configuration and schedule. 
 hashing/validation utilities may be imported by the external Python adapter; that adapter
 is maintained separately from these files and never changes the frozen Python engine.
 
-Pinned-model tokenization, GPU/model correctness, production TP transport, timing neutrality,
+Pinned-tokenizer offline fixture checks do not qualify device execution. GPU/model correctness, production TP transport, timing neutrality,
 server neutrality, live owner counters, graph activation, physical memory and replay
 performance are **UNRUN**. Passing host tests or accepting externally supplied gate booleans
 does not establish those facts. Hardware runs remain separately coordinated.

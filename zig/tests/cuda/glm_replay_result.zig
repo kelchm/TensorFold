@@ -104,7 +104,7 @@ const Result = struct {
     telemetry_sha256: []const u8,
 };
 
-pub fn write(a: std.mem.Allocator, io: std.Io, output: []const u8, f: fixture.Fixture, b: ctl.Budget, m: meta.Metadata, completion: replay.Completion, profile: replay.Completion, anchor_hash: []const u8, prep_ns: u64, sharded: bool, e: *glm.engine.Engine, g: ctl.Geometry, runtime_hash: []const u8, provenance: Provenance) !void {
+pub fn write(a: std.mem.Allocator, io: std.Io, output: []const u8, f: fixture.Fixture, b: ctl.Budget, m: meta.Metadata, completion: replay.Completion, profile: replay.Completion, anchor_hash: []const u8, prep_ns: u64, sharded: bool, e: *glm.engine.Engine, g: ctl.Geometry, runtime_hash: []const u8, provenance: Provenance, telemetry_hash: []const u8) !void {
     try @import("glm_replay_measure.zig").checkObserver(completion, f.forwards.len, false);
     try @import("glm_replay_measure.zig").checkObserver(profile, f.forwards.len, true);
     const rb = g.heads * g.latent * 2;
@@ -136,7 +136,7 @@ pub fn write(a: std.mem.Allocator, io: std.Io, output: []const u8, f: fixture.Fi
         }
         const rank_receipt = completion.ranks[rank];
         if (rank_receipt.elapsed_ns == 0) return error.IncompleteReplay;
-        const result: Result = .{ .fixture_sha256 = f.fixture_sha256, .schedule_sha256 = f.schedule_sha256, .tokens_sha256 = f.tokens_sha256, .config_sha256 = f.config_sha256, .run_id = m.run_id, .pair_id = m.pair_id, .start_id = m.start_id, .session_nonce = provenance.session_nonce, .campaign_sha256 = provenance.campaign_sha256, .checkpoints = provenance.checkpoints, .start_order = m.start_order, .block_id = m.block_id, .cell_id = m.cell_id, .arm = if (sharded) "B" else "A", .rank = rank, .source = m.source, .effective_config = effective, .effective_config_sha256 = &effective_hash, .preparation_ns = prep_ns, .wall_ns = rank_receipt.elapsed_ns, .layout_checks = rank_receipt.checks, .timing_source = .{ .anchor_sha256 = anchor_hash }, .forwards = records, .memory = memory, .telemetry_sha256 = m.telemetry.sha256 };
+        const result: Result = .{ .fixture_sha256 = f.fixture_sha256, .schedule_sha256 = f.schedule_sha256, .tokens_sha256 = f.tokens_sha256, .config_sha256 = f.config_sha256, .run_id = m.run_id, .pair_id = m.pair_id, .start_id = m.start_id, .session_nonce = provenance.session_nonce, .campaign_sha256 = provenance.campaign_sha256, .checkpoints = provenance.checkpoints, .start_order = m.start_order, .block_id = m.block_id, .cell_id = m.cell_id, .arm = if (sharded) "B" else "A", .rank = rank, .source = m.source, .effective_config = effective, .effective_config_sha256 = &effective_hash, .preparation_ns = prep_ns, .wall_ns = rank_receipt.elapsed_ns, .layout_checks = rank_receipt.checks, .timing_source = .{ .anchor_sha256 = anchor_hash }, .forwards = records, .memory = memory, .telemetry_sha256 = telemetry_hash };
         try std.json.Stringify.value(result, .{}, &out.writer);
         try out.writer.writeByte('\n');
     }

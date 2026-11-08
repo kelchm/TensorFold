@@ -5,6 +5,7 @@ const ctl = @import("glm_replay_control.zig");
 test {
     _ = @import("glm_replay_metadata.zig");
     _ = @import("glm_replay_campaign_test.zig");
+    _ = @import("glm_replay_telemetry_test.zig");
 }
 const clean =
     \\{

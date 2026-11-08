@@ -2,6 +2,7 @@
 const std = @import("std");
 const fixture = @import("glm_replay_fixture.zig");
 const hash = @import("glm_replay_hash.zig");
+const telemetry = @import("glm_replay_telemetry.zig");
 pub const Checkpoints = @import("glm_replay_provenance.zig").Checkpoints;
 pub const Source = struct {
     engine_commit: []const u8,
@@ -27,7 +28,7 @@ pub const Metadata = struct {
     source: Source,
     fatbin: Artifact,
     compiler: Artifact,
-    telemetry: Artifact,
+    telemetry: telemetry.Ref,
     correctness: ?Artifact,
     sharding_equality: ?Artifact,
     timing_neutrality: ?Artifact,
@@ -35,6 +36,7 @@ pub const Metadata = struct {
     logical_evidence: ?Artifact = null,
     default_server_contract: ?Artifact = null,
     expected_checkpoints: ?Checkpoints = null,
+    source_manifest: ?Artifact = null,
 };
 pub const Gate = struct {
     schema: []const u8,
@@ -57,7 +59,7 @@ pub fn read(a: std.mem.Allocator, io: std.Io, path: []const u8, f: fixture.Fixtu
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
     const m = try std.json.parseFromSliceLeaky(Metadata, a, raw, .{ .allocate = .alloc_always });
     if (m.expected_checkpoints) |pins| try pins.check();
-    if (!eq(m.schema, "glm-replay-native-metadata-v1") or m.start_order > 1 or m.run_id.len == 0 or m.pair_id.len == 0 or m.start_id.len == 0 or m.block_id.len == 0 or m.cell_id.len == 0) return error.Metadata;
+    if (!eq(m.schema, "glm-replay-native-metadata-v2") or m.start_order > 1 or m.run_id.len == 0 or m.pair_id.len == 0 or m.start_id.len == 0 or m.block_id.len == 0 or m.cell_id.len == 0) return error.Metadata;
     if (!eq(m.fixture_sha256, f.fixture_sha256) or !eq(m.config_sha256, f.config_sha256)) return error.MetadataFixture;
     if (!eq(m.source.engine_commit, fixture.base_commit)) return error.HistoricalBase;
     if (!eq(m.source.kit_commit, "13f2464ee84ab2b5dabf0bb264d1144b02cf5fb7") or
@@ -76,6 +78,8 @@ pub fn read(a: std.mem.Allocator, io: std.Io, path: []const u8, f: fixture.Fixtu
     try artifact(a, io, m.compiler);
     if (!eq(m.fatbin.sha256, m.source.fatbin_sha256) or !eq(m.compiler.sha256, m.source.compiler_sha256)) return error.ArtifactIdentity;
     if (measure) {
+        try telemetry.preflight(a, io, m.telemetry);
+        try telemetry.sourceManifest(a, io, m.source_manifest orelse return error.SourceManifestUnrun, m.source);
         try artifact(a, io, m.logical_evidence orelse return error.LogicalEvidenceUnrun);
         try gate(a, io, m.sharding_equality orelse return error.ShardingEqualityUnrun, m, "sharding_equality", sharded, null, null);
         try gate(a, io, m.correctness orelse return error.CorrectnessUnrun, m, "correctness", sharded, null, null);
@@ -124,10 +128,6 @@ pub fn checkRuntime(a: std.mem.Allocator, io: std.Io, m: Metadata, sharded: bool
     try gate(a, io, m.sharding_equality.?, m, "sharding_equality", sharded, runtime_hash, checkpoints);
     try gate(a, io, m.correctness.?, m, "correctness", sharded, runtime_hash, checkpoints);
     try gate(a, io, m.timing_neutrality.?, m, "timing_neutrality", sharded, runtime_hash, checkpoints);
-}
-
-pub fn checkTelemetry(a: std.mem.Allocator, io: std.Io, m: Metadata) !void {
-    try artifact(a, io, m.telemetry);
 }
 
 fn gate(a: std.mem.Allocator, io: std.Io, v: Artifact, m: Metadata, name: []const u8, sharded: bool, runtime_hash: ?[]const u8, actual: ?Checkpoints) !void {

@@ -218,3 +218,28 @@ test "native metadata validates explicit checkpoint pin schema before artifacts 
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/metadata.json", .{tmp.sub_path});
     try std.testing.expectError(error.InvalidDigest, meta.read(a, io, path, c.f, false, false));
 }
+
+test "campaign refuses reused telemetry requests and collisions with results before the driver" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const first = try std.fs.path.join(a, &.{ dir, "first.jsonl" });
+    const second = try std.fs.path.join(a, &.{ dir, "second.jsonl" });
+    var cases = [_]campaign.Case{ control("solo", "0", first), control("solo", "1", second) };
+    cases[0].m.telemetry.path = try std.fs.path.join(a, &.{ dir, "first.telemetry.json" });
+    cases[1].m.telemetry.path = try std.fs.path.join(a, &.{ dir, "second.telemetry.json" });
+    try campaign.checkDestinations(a, io, &cases);
+    const original = cases;
+    cases[1].m.telemetry = cases[0].m.telemetry;
+    try std.testing.expectError(error.CampaignDuplicateOutput, campaign.checkDestinations(a, io, &cases));
+    cases = original;
+    cases[1].m.telemetry.path = first;
+    try std.testing.expectError(error.CampaignDuplicateOutput, campaign.checkDestinations(a, io, &cases));
+    cases = original;
+    cases[1].output = try std.fmt.allocPrint(a, "{s}.window.json", .{cases[0].m.telemetry.path});
+    try std.testing.expectError(error.CampaignDuplicateOutput, campaign.checkDestinations(a, io, &cases));
+}

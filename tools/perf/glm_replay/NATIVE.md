@@ -50,11 +50,13 @@ row through solo verify/keep/ingest in the declared tape/position order before t
 
 ## Metadata and gates
 
-Metadata schema `glm-replay-native-metadata-v1` requires:
+Metadata schema `glm-replay-native-metadata-v2` requires:
 
 - `run_id`, `pair_id`, `start_id`, `start_order` (0 or 1), `block_id` (nonempty string), `cell_id`.
 - `fixture_sha256`, `config_sha256` and the common `source` object from [SCHEMA.md](SCHEMA.md).
-- `fatbin`, `compiler`, `telemetry`: local `{path,sha256}` artifact references.
+- `fatbin`, `compiler`: local `{path,sha256}` artifact references.
+- `telemetry`: a future `{path}` only, relative to the process working directory.
+- `source_manifest`: null for validation, or the authenticated committed source export for measurement.
 - `correctness`, `timing_neutrality`, `sharding_equality`, `default_server_neutrality`: null for
   validation, or local `{path,sha256}` gate artifacts for measurement.
 - `logical_evidence`: null for validation, or the exact retained logical artifact for measurement.
@@ -64,8 +66,8 @@ Metadata schema `glm-replay-native-metadata-v1` requires:
 The complete required metadata object also has `schema`. Source binary hashes are checked
 against the running executable; compiler/fatbin artifacts and tokenizer assets are hashed before
 CUDA opens. Gate runtime bindings are compared with the actual combined rank/transport digest
-after production startup and before replay preparation. Frozen external telemetry is authenticated
-before startup and rechecked after completion.
+after production startup and before replay preparation. Telemetry destinations must be absent
+before startup; a predeclared telemetry hash is refused. Old metadata v1 is refused.
 Explicit checkpoint pins require all four 64-lowercase-hex digests. They are schema-checked
 and bound in preflight before CUDA opens, then compared with actual gathered identities
 on both ranks before inference. Replay alone adds CPU drafter-directory hashing; serving is unchanged.
@@ -81,6 +83,39 @@ producer in [SERVER_EVIDENCE.md](SERVER_EVIDENCE.md), rather than the replay gat
 The host implementation supplies no passing device gates.
 Actual target and drafter checkpoint identities bind the stable loaded runtime and logical
 evidence as well as gates. Missing checkpoint receipts and changed weights on either rank fail.
+
+## Post-block telemetry and source export
+
+After committing the harness, export the exact committed source inventory on the build host:
+
+```sh
+python3 -m tools.perf.glm_replay.native_source_manifest --repo . --output native-source.json
+```
+
+The exporter refuses dirty or untracked source files and checks historical-base ancestry.
+Bind that file's SHA-256 through `source_manifest` and use its commit as `source.harness_commit`.
+The inventory, executable, compiler and fatbin identities are separate; host cross-compilation
+with inert images supplies no qualified GPU binary or fatbin identity.
+
+Start a separately coordinated telemetry collector before replay. After the observer-off block
+completes and correctness readbacks finish, the runner exclusively writes
+`telemetry.path + ".window.json"`. It then waits at most 30 seconds for the controller's receipt.
+The window follows `glm-replay-block-window-v1` in [telemetry.py](telemetry.py): fixture/config/
+schedule/token hashes, arm, canonical source hash, source-inventory file hash, runtime,
+canonical native checkpoint-object hash, IDs, nonce, ordered campaign hash and each actual
+rank's positive realtime start/end. These realtime windows enclose the monotonic headline wall;
+they are not used to calculate throughput. Telemetry names also enter startup agreement.
+
+The controller joins already collected samples to those windows and atomically publishes
+`glm-replay-telemetry-v1`, `status="measured"` at the future path. Each rank needs its actual
+GPU UUID, at least two ordered clock/temperature/power/memory samples bracketing its window,
+an in-window sample, and a declared maximum sample gap no greater than five seconds.
+The runner checks actual gathered UUIDs, both rank windows and every binding, then hashes
+the exact bytes it parsed into both JSONL records. Missing samples, stubs, stale windows,
+old sessions and reused or colliding paths fail. Paths must be canonical relative POSIX names,
+with no symlink components. Result and request destinations must be distinct across cases.
+No telemetry scrape or file operation runs inside the timed block. The collector and real
+telemetry remain unrun; host negative controls use explicitly invented samples.
 
 ## Measurement boundary
 

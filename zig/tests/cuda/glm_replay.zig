@@ -10,6 +10,7 @@ const validation = @import("glm_replay_validate.zig");
 const result = @import("glm_replay_result.zig");
 const binding = @import("glm_replay_binding.zig");
 const provenance = @import("glm_replay_provenance.zig");
+const delivery = @import("glm_replay_delivery.zig");
 
 pub fn command(init: std.process.Init, cmd: []const u8, args: []const [:0]const u8) !u8 {
     run(init, cmd, args) catch |err| {
@@ -46,10 +47,10 @@ fn run(init: std.process.Init, cmd: []const u8, args: []const [:0]const u8) !voi
     const f = loaded.fixture;
     const preliminary_hash = try replay.runtime.settingsHash(a, set, &.{});
     const m = try metadata.read(a, init.io, args[5], f, measure, sharded);
-    try metadata.checkTelemetry(a, init.io, m);
     const reference = if (measure) try binding.load(a, init.io, m, f, sharded) else null;
     const campaign = @import("glm_replay_campaign.zig");
     if (measure) try campaign.checkOutput(a, init.io, args[4]) else try campaign.checkValidationOutput(a, init.io, args[4]);
+    if (measure) try campaign.checkDestinations(a, init.io, &.{.{ .f = f, .budget = loaded.budget, .m = m, .output = args[4] }});
     try metadata.checkTokenizer(a, init.io, args[2], f);
     const prep = try exec.compile(a, f, f.preparation);
     const compiled = try exec.compile(a, f, f.forwards);
@@ -100,11 +101,12 @@ pub fn measureBlock(init: std.process.Init, output: []const u8, s: *replay.Sessi
     const a = init.arena.allocator();
     const measured = try @import("glm_replay_measure.zig").run(a, init.io, s, f, budget, prep, compiled, sharded, g, reference);
     defer measured.deinit(a);
-    try metadata.checkTelemetry(a, init.io, m);
     const completed = measured.headline;
     const identity = try provenance.Provenance.fromSession(a, s);
+    const window = try delivery.window(a, f, m, completed, sharded, runtime_hash, identity);
+    const telemetry_hash = try @import("glm_replay_telemetry.zig").receive(a, init.io, m.telemetry, window, .{ &s.device_uuids[0], &s.device_uuids[1] }, 30000);
     const anchor_hash = try result.anchor(a, init.io, output, f, m, measured.anchor, completed, sharded, runtime_hash, identity);
-    try result.write(a, init.io, output, f, budget, m, completed, measured.anchor, &anchor_hash, measured.preparation_ns, sharded, s.owned.e, g, runtime_hash, identity);
+    try result.write(a, init.io, output, f, budget, m, completed, measured.anchor, &anchor_hash, measured.preparation_ns, sharded, s.owned.e, g, runtime_hash, identity, &telemetry_hash);
     const seconds = @as(f64, @floatFromInt(@max(completed.ranks[0].elapsed_ns, completed.ranks[1].elapsed_ns))) / 1e9;
     const rate = @as(f64, @floatFromInt(completed.ranks[0].rows)) / seconds;
     std.debug.print("PASS glm-replay: both ranks completed {d} forwards; replay throughput {d:.3} forced tokens/s\n", .{ f.forwards.len, rate });

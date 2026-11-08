@@ -112,7 +112,7 @@ test "replay native writer emits rank-local elapsed and headline layout deltas w
     const b: ctl.Budget = .{ .half_pages = 256, .logical_pages = 512, .page_argument = 512, .reservation = .{ 1, 1, 1, 1 }, .owner_pages = .{ 2, 2 }, .twin_headroom = 1 };
     const g: ctl.Geometry = .{ .layers = 11, .heads = 32, .latent = 512 };
     const anchor_hash = try result.anchor(a, io, path, f, m, profile, headline, false, zero, identity);
-    try result.write(a, io, path, f, b, m, headline, profile, &anchor_hash, 42, false, &e, g, zero, identity);
+    try result.write(a, io, path, f, b, m, headline, profile, &anchor_hash, 42, false, &e, g, zero, identity, one);
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
     var lines = std.mem.tokenizeScalar(u8, raw, '\n');
     for (0..2) |rank| {
@@ -121,6 +121,7 @@ test "replay native writer emits rank-local elapsed and headline layout deltas w
         try std.testing.expectEqual(@as(i64, @intCast(headline.ranks[rank].checks)), v.object.get("layout_checks").?.integer);
         try std.testing.expectEqualStrings(identity.session_nonce, v.object.get("session_nonce").?.string);
         try std.testing.expectEqualStrings(identity.campaign_sha256, v.object.get("campaign_sha256").?.string);
+        try std.testing.expectEqualStrings(one, v.object.get("telemetry_sha256").?.string);
         try std.testing.expectEqualStrings(one, v.object.get("checkpoints").?.object.get("drafter").?.array.items[1].string);
     }
     try std.testing.expect(lines.next() == null);
@@ -138,7 +139,7 @@ test "replay native writer emits rank-local elapsed and headline layout deltas w
     const preserved = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
     try std.testing.expectEqualStrings(raw, preserved);
     headline.ranks[1].elapsed_ns = 0;
-    try std.testing.expectError(error.IncompleteReplay, result.write(a, io, "unused", f, b, m, headline, profile, &anchor_hash, 42, false, &e, g, zero, identity));
+    try std.testing.expectError(error.IncompleteReplay, result.write(a, io, "unused", f, b, m, headline, profile, &anchor_hash, 42, false, &e, g, zero, identity, one));
 }
 
 const Preparation = struct {

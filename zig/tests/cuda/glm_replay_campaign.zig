@@ -58,11 +58,11 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, model: []const
         };
         const f = cache.items[index].loaded.fixture;
         const m = try meta.read(a, io, d.metadata, f, true, sharded);
-        try meta.checkTelemetry(a, io, m);
         c.* = .{ .f = f, .budget = cache.items[index].loaded.budget, .m = m, .output = try outputPath(a, io, d.output) };
         try checkOutput(a, io, c.output);
     }
     const ordered = try check(a, cases);
+    try checkDestinations(a, io, cases);
     return .{ .arena = arena, .fixtures = cache.items, .cases = cases, .ordered_hash = ordered };
 }
 
@@ -94,6 +94,36 @@ pub fn checkValidationOutput(a: std.mem.Allocator, io: std.Io, prefix: []const u
         defer a.free(path);
         const canonical = try outputPath(a, io, path);
         a.free(canonical);
+    }
+}
+
+pub fn checkDestinations(a: std.mem.Allocator, io: std.Io, cases: []const Case) !void {
+    const telemetry = @import("glm_replay_telemetry.zig");
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", a);
+    defer a.free(cwd);
+    var paths = std.StringHashMap(void).init(a);
+    defer paths.deinit();
+    var owned: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (owned.items) |path| a.free(path);
+        owned.deinit(a);
+    }
+    for (cases) |c| {
+        const request = try std.fmt.allocPrint(a, "{s}.window.json", .{c.m.telemetry.path});
+        defer a.free(request);
+        const anchor = try std.fmt.allocPrint(a, "{s}.anchor.json", .{c.output});
+        defer a.free(anchor);
+        for ([_][]const u8{ c.m.telemetry.path, request }) |path| {
+            try telemetry.safePath(io, path);
+            const canonical = try std.fs.path.resolve(a, &.{ cwd, path });
+            try owned.append(a, canonical);
+            if ((try paths.getOrPut(canonical)).found_existing) return error.CampaignDuplicateOutput;
+        }
+        for ([_][]const u8{ c.output, anchor }) |path| {
+            const canonical = try outputPath(a, io, path);
+            try owned.append(a, canonical);
+            if ((try paths.getOrPut(canonical)).found_existing) return error.CampaignDuplicateOutput;
+        }
     }
 }
 
@@ -131,7 +161,8 @@ pub fn check(a: std.mem.Allocator, cases: []const Case) ![32]u8 {
             .block = m.block_id,
             .source = m.source,
             .pool = c.f.config.pool,
-            .telemetry = m.telemetry.sha256,
+            .telemetry = m.telemetry.path,
+            .source_manifest = if (m.source_manifest) |v| v.sha256 else null,
             .expected_checkpoints = m.expected_checkpoints,
             .logical_evidence = if (m.logical_evidence) |v| v.sha256 else null,
             .correctness = if (m.correctness) |v| v.sha256 else null,
