@@ -328,3 +328,41 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const h
         }
     }
 }
+
+// Block (256 model-width columns, item): y[row][slot][:] = the down epilogue of the item's pairs (this rank's share).
+extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_slots(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+        float* __restrict__ y, int K, int D, int ys, int yrow) {
+
+    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes()];
+    __shared__ int rows_sh[TPM];
+    const int cb = blockIdx.x, item = blockIdx.y;
+    if (item >= counts[0]) return;
+    const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
+    if (threadIdx.x < TPM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    float acc[TMT][TNB][4];
+    tmain<1, TPM>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc);
+    float* Ed = reinterpret_cast<float*>(smem_raw);
+    for (int hf = 0; hf < 2 && hf * TPH < cnt; ++hf) {
+        if (hf) __syncthreads();
+        tspill(Ed, DN_ES, warp * TMT * 16, acc, hf);
+        __syncthreads();
+        for (int i = warp; i < TPH && hf * TPH + i < cnt; i += TNW) {
+            const int p = rows_sh[hf * TPH + i];
+#pragma unroll
+            for (int blk = 0; blk < 2; ++blk) {
+                const int n = cb * 256 + blk * 128 + 4 * lane;
+                float v[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) v[j] = Ed[(size_t)i * DN_ES + blk * 128 + 4 * lane + j];
+                fwht128(v, lane);
+                const size_t at = yrow ? (size_t)(p / ys) * yrow + p % ys : (size_t)p;
+                float* o = y + at * D + n;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
+            }
+        }
+    }
+}
