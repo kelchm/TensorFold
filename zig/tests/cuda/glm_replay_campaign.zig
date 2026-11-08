@@ -88,6 +88,15 @@ pub fn checkOutput(a: std.mem.Allocator, io: std.Io, output: []const u8) !void {
     a.free(canonical);
 }
 
+pub fn checkValidationOutput(a: std.mem.Allocator, io: std.Io, prefix: []const u8) !void {
+    for ([_][]const u8{ "logical", "correctness", "timing" }) |suffix| {
+        const path = try std.fmt.allocPrint(a, "{s}.{s}.json", .{ prefix, suffix });
+        defer a.free(path);
+        const canonical = try outputPath(a, io, path);
+        a.free(canonical);
+    }
+}
+
 pub fn check(a: std.mem.Allocator, cases: []const Case) ![32]u8 {
     if (cases.len == 0 or cases.len > max_cases) return error.CampaignSchema;
     const first = cases[0];
@@ -123,6 +132,7 @@ pub fn check(a: std.mem.Allocator, cases: []const Case) ![32]u8 {
             .source = m.source,
             .pool = c.f.config.pool,
             .telemetry = m.telemetry.sha256,
+            .expected_checkpoints = m.expected_checkpoints,
             .logical_evidence = if (m.logical_evidence) |v| v.sha256 else null,
             .correctness = if (m.correctness) |v| v.sha256 else null,
             .sharding_equality = if (m.sharding_equality) |v| v.sha256 else null,

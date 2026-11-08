@@ -10,6 +10,7 @@ const pages = @import("cuda_pages.zig");
 const kvs = @import("cuda_kv_shard.zig");
 const dflash = @import("dflash.zig");
 const boundary = @import("cuda_replay_boundary.zig");
+const device = @import("cuda_replay_device.zig");
 pub const runtime = @import("cuda_replay_runtime.zig");
 pub const timing = @import("cuda_replay_timing.zig");
 pub const capture_mod = @import("cuda_replay_capture.zig");
@@ -91,6 +92,9 @@ pub const Session = struct {
     options: Options,
     runtime_sha256: [32]u8 = undefined,
     runtime_ranks: [2][32]u8 = undefined,
+    session_nonce: [32]u8 = undefined,
+    checkpoints: runtime.Checkpoints = undefined,
+    device_uuids: [2][40]u8 = undefined,
     prepared: bool = false,
     ended: bool = false,
     failed: bool = false,
@@ -115,8 +119,18 @@ pub const Session = struct {
             s.state.trace_store = t;
             s.state.audit.trace = if (r.observe) t else null;
         }
-        const mine = try runtime.loaded(owned.e);
-        try ranks.gather([32]u8, ctx.d, &owned.group.lib, owned.group.comm, owned.e.stream, owned.group.rank, mine, &s.runtime_ranks);
+        const drafter = try ranks.artifact(gpa, io, o.drafter.?);
+        const Loaded = extern struct { runtime: [32]u8, target: [32]u8, drafter: [32]u8, nonce: [32]u8, device_uuid: [40]u8 };
+        const mine: Loaded = .{ .runtime = try runtime.loaded(owned.e, drafter), .target = owned.e.checkpoint_digest, .drafter = drafter, .nonce = try runtime.nonce(io), .device_uuid = try device.uuid(ctx) };
+        var all: [2]Loaded = undefined;
+        try ranks.gather(Loaded, ctx.d, &owned.group.lib, owned.group.comm, owned.e.stream, owned.group.rank, mine, &all);
+        for (all, 0..) |value, i| {
+            s.runtime_ranks[i] = value.runtime;
+            s.checkpoints.target[i] = value.target;
+            s.checkpoints.drafter[i] = value.drafter;
+            s.device_uuids[i] = value.device_uuid;
+        }
+        s.session_nonce = all[0].nonce;
         s.runtime_sha256 = runtime.combine(s.runtime_ranks);
         owned.e.replay = &s.state;
         owned.e.replay_capture = .{ .ptr = s, .run = captureRank };
@@ -126,6 +140,13 @@ pub const Session = struct {
     pub fn leader(s: *Session) !follow_mod.Leader {
         if (s.owned.group.rank != 0) return error.ReplayNotLeader;
         return .{ .e = s.owned.e, .link = &s.owned.link };
+    }
+
+    pub fn agree(s: *Session) !void {
+        var accepted: [2][32]u8 = undefined;
+        const owned = s.owned;
+        try ranks.gather([32]u8, owned.e.d, &owned.group.lib, owned.group.comm, owned.e.stream, owned.group.rank, s.runtime_sha256, &accepted);
+        if (!std.mem.eql(u8, &accepted[0], &accepted[1])) return error.ReplayHashMismatch;
     }
 
     pub fn follow(s: *Session) !void {
@@ -300,6 +321,7 @@ test {
     _ = capture_mod;
     _ = timing;
     _ = runtime;
+    _ = device;
 }
 
 test "replay completion copy survives the next block overwriting borrowed records and timings" {

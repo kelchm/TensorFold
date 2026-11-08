@@ -9,6 +9,7 @@ const exec = @import("glm_replay_execute.zig");
 const validation = @import("glm_replay_validate.zig");
 const result = @import("glm_replay_result.zig");
 const binding = @import("glm_replay_binding.zig");
+const provenance = @import("glm_replay_provenance.zig");
 
 pub fn command(init: std.process.Init, cmd: []const u8, args: []const [:0]const u8) !u8 {
     run(init, cmd, args) catch |err| {
@@ -47,7 +48,8 @@ fn run(init: std.process.Init, cmd: []const u8, args: []const [:0]const u8) !voi
     const m = try metadata.read(a, init.io, args[5], f, measure, sharded);
     try metadata.checkTelemetry(a, init.io, m);
     const reference = if (measure) try binding.load(a, init.io, m, f, sharded) else null;
-    if (measure) try @import("glm_replay_campaign.zig").checkOutput(a, init.io, args[4]);
+    const campaign = @import("glm_replay_campaign.zig");
+    if (measure) try campaign.checkOutput(a, init.io, args[4]) else try campaign.checkValidationOutput(a, init.io, args[4]);
     try metadata.checkTokenizer(a, init.io, args[2], f);
     const prep = try exec.compile(a, f, f.preparation);
     const compiled = try exec.compile(a, f, f.forwards);
@@ -74,17 +76,20 @@ fn drive(init: std.process.Init, args: []const [:0]const u8, s: *replay.Session,
     const a = init.arena.allocator();
     const capacity = f.config.pool.configured_capacity;
     const runtime_hash = std.fmt.bytesToHex(s.runtime_sha256, .lower);
+    const identity = try provenance.Provenance.fromSession(a, s);
+    if (m.expected_checkpoints) |pins| try pins.require(identity.checkpoints);
     if (measure) {
-        try metadata.checkRuntime(a, init.io, m, sharded, &runtime_hash);
-        try binding.runtime(reference.?, &runtime_hash);
+        try metadata.checkRuntime(a, init.io, m, sharded, &runtime_hash, identity.checkpoints);
+        try binding.runtime(reference.?, &runtime_hash, identity.checkpoints);
     }
+    try s.agree();
     if (rank != 0) return s.follow();
     if (s.owned.e.capacity != capacity or s.owned.e.c.vocab < f.provenance.tokenizer.vocab_size) return error.LoadedConfiguration;
     const g = try exec.geometry(s.owned.e);
     if (g.layers != 11 or g.heads != 32 or g.latent != 512) return error.LoadedGeometry;
     if (!measure) {
         const evidence = try validation.run(a, s, f, budget, prep, compiled, sharded);
-        try binding.retain(a, init.io, args[4], f, m, evidence.observations, evidence.comparisons, sharded, &runtime_hash);
+        try binding.retain(a, init.io, args[4], f, m, evidence.observations, evidence.comparisons, sharded, &runtime_hash, identity.checkpoints);
         std.debug.print("PASS glm-replay validation: {d} both-rank forward comparisons; default-server neutrality remains external\n", .{evidence.comparisons});
         return;
     }
@@ -97,9 +102,10 @@ pub fn measureBlock(init: std.process.Init, output: []const u8, s: *replay.Sessi
     defer measured.deinit(a);
     try metadata.checkTelemetry(a, init.io, m);
     const completed = measured.headline;
-    const anchor_hash = try result.anchor(a, init.io, output, f, m, measured.anchor, completed, sharded, runtime_hash);
-    try result.write(a, init.io, output, f, budget, m, completed, measured.anchor, &anchor_hash, measured.preparation_ns, sharded, s.owned.e, g, runtime_hash);
-    const seconds = @as(f64, @floatFromInt(completed.elapsed_ns)) / 1e9;
+    const identity = try provenance.Provenance.fromSession(a, s);
+    const anchor_hash = try result.anchor(a, init.io, output, f, m, measured.anchor, completed, sharded, runtime_hash, identity);
+    try result.write(a, init.io, output, f, budget, m, completed, measured.anchor, &anchor_hash, measured.preparation_ns, sharded, s.owned.e, g, runtime_hash, identity);
+    const seconds = @as(f64, @floatFromInt(@max(completed.ranks[0].elapsed_ns, completed.ranks[1].elapsed_ns))) / 1e9;
     const rate = @as(f64, @floatFromInt(completed.ranks[0].rows)) / seconds;
     std.debug.print("PASS glm-replay: both ranks completed {d} forwards; replay throughput {d:.3} forced tokens/s\n", .{ f.forwards.len, rate });
 }

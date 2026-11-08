@@ -2,6 +2,7 @@
 const std = @import("std");
 const fixture = @import("glm_replay_fixture.zig");
 const hash = @import("glm_replay_hash.zig");
+pub const Checkpoints = @import("glm_replay_provenance.zig").Checkpoints;
 pub const Source = struct {
     engine_commit: []const u8,
     harness_commit: []const u8,
@@ -33,6 +34,7 @@ pub const Metadata = struct {
     default_server_neutrality: ?Artifact,
     logical_evidence: ?Artifact = null,
     default_server_contract: ?Artifact = null,
+    expected_checkpoints: ?Checkpoints = null,
 };
 pub const Gate = struct {
     schema: []const u8,
@@ -45,14 +47,16 @@ pub const Gate = struct {
     comparisons: u64,
     kv_shard: bool,
     runtime_sha256: []const u8,
+    checkpoints: Checkpoints,
     evidence_sha256: ?[]const u8 = null,
     coverage: ?[]const u8 = null,
 };
-pub const coverage = "adversarial-and-whole-block-v1";
+pub const coverage = "adversarial-one-row-preparation-and-whole-block-v2";
 
 pub fn read(a: std.mem.Allocator, io: std.Io, path: []const u8, f: fixture.Fixture, measure: bool, sharded: bool) !Metadata {
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
     const m = try std.json.parseFromSliceLeaky(Metadata, a, raw, .{ .allocate = .alloc_always });
+    if (m.expected_checkpoints) |pins| try pins.check();
     if (!eq(m.schema, "glm-replay-native-metadata-v1") or m.start_order > 1 or m.run_id.len == 0 or m.pair_id.len == 0 or m.start_id.len == 0 or m.block_id.len == 0 or m.cell_id.len == 0) return error.Metadata;
     if (!eq(m.fixture_sha256, f.fixture_sha256) or !eq(m.config_sha256, f.config_sha256)) return error.MetadataFixture;
     if (!eq(m.source.engine_commit, fixture.base_commit)) return error.HistoricalBase;
@@ -73,9 +77,9 @@ pub fn read(a: std.mem.Allocator, io: std.Io, path: []const u8, f: fixture.Fixtu
     if (!eq(m.fatbin.sha256, m.source.fatbin_sha256) or !eq(m.compiler.sha256, m.source.compiler_sha256)) return error.ArtifactIdentity;
     if (measure) {
         try artifact(a, io, m.logical_evidence orelse return error.LogicalEvidenceUnrun);
-        try gate(a, io, m.sharding_equality orelse return error.ShardingEqualityUnrun, m, "sharding_equality", sharded, null);
-        try gate(a, io, m.correctness orelse return error.CorrectnessUnrun, m, "correctness", sharded, null);
-        try gate(a, io, m.timing_neutrality orelse return error.TimingNeutralityUnrun, m, "timing_neutrality", sharded, null);
+        try gate(a, io, m.sharding_equality orelse return error.ShardingEqualityUnrun, m, "sharding_equality", sharded, null, null);
+        try gate(a, io, m.correctness orelse return error.CorrectnessUnrun, m, "correctness", sharded, null, null);
+        try gate(a, io, m.timing_neutrality orelse return error.TimingNeutralityUnrun, m, "timing_neutrality", sharded, null, null);
         try @import("glm_replay_server_gate.zig").read(a, io, m.default_server_neutrality orelse return error.DefaultServerNeutralityUnrun, m.default_server_contract orelse return error.ServerContractUnrun, m.source);
     }
     return m;
@@ -116,25 +120,28 @@ fn artifact(a: std.mem.Allocator, io: std.Io, v: Artifact) !void {
     try hash.matches(v.sha256, try fileHash(a, io, v.path));
 }
 
-pub fn checkRuntime(a: std.mem.Allocator, io: std.Io, m: Metadata, sharded: bool, runtime_hash: []const u8) !void {
-    try gate(a, io, m.sharding_equality.?, m, "sharding_equality", sharded, runtime_hash);
-    try gate(a, io, m.correctness.?, m, "correctness", sharded, runtime_hash);
-    try gate(a, io, m.timing_neutrality.?, m, "timing_neutrality", sharded, runtime_hash);
+pub fn checkRuntime(a: std.mem.Allocator, io: std.Io, m: Metadata, sharded: bool, runtime_hash: []const u8, checkpoints: Checkpoints) !void {
+    try gate(a, io, m.sharding_equality.?, m, "sharding_equality", sharded, runtime_hash, checkpoints);
+    try gate(a, io, m.correctness.?, m, "correctness", sharded, runtime_hash, checkpoints);
+    try gate(a, io, m.timing_neutrality.?, m, "timing_neutrality", sharded, runtime_hash, checkpoints);
 }
 
 pub fn checkTelemetry(a: std.mem.Allocator, io: std.Io, m: Metadata) !void {
     try artifact(a, io, m.telemetry);
 }
 
-fn gate(a: std.mem.Allocator, io: std.Io, v: Artifact, m: Metadata, name: []const u8, sharded: bool, runtime_hash: ?[]const u8) !void {
+fn gate(a: std.mem.Allocator, io: std.Io, v: Artifact, m: Metadata, name: []const u8, sharded: bool, runtime_hash: ?[]const u8, actual: ?Checkpoints) !void {
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, v.path, a, .limited(1 << 20));
     try hash.matches(v.sha256, hash.bytes(raw));
     const g = try std.json.parseFromSliceLeaky(Gate, a, raw, .{});
     try fixture.hex(g.runtime_sha256, 64);
     try checkGate(g, m, name, sharded, runtime_hash);
+    if (actual) |checkpoints| try g.checkpoints.require(checkpoints);
 }
 
 pub fn checkGate(g: Gate, m: Metadata, name: []const u8, sharded: bool, runtime_hash: ?[]const u8) !void {
+    try g.checkpoints.check();
+    if (m.expected_checkpoints) |pins| try pins.require(g.checkpoints);
     if (!eq(g.schema, "glm-replay-native-gate-v1") or !eq(g.gate, name) or !eq(g.status, "pass") or g.comparisons == 0 or g.kv_shard != sharded or (runtime_hash != null and !eq(g.runtime_sha256, runtime_hash.?)) or !std.mem.eql(u8, &g.completed_ranks, &.{ 0, 1 })) return error.GateUnproven;
     if (!eq(g.fixture_sha256, m.fixture_sha256) or !eq(g.config_sha256, m.config_sha256) or !eq(g.binary_sha256, m.source.binary_sha256)) return error.GateIdentity;
     const proof = m.logical_evidence orelse return error.LogicalEvidenceUnrun;
@@ -147,8 +154,14 @@ test "replay gates reject unrun, wrong arm and changed runtime evidence" {
     m.config_sha256 = "config";
     m.source.binary_sha256 = "binary";
     m.logical_evidence = .{ .path = "logical", .sha256 = "proof" };
-    var g: Gate = .{ .schema = "glm-replay-native-gate-v1", .gate = "correctness", .status = "pass", .fixture_sha256 = "fixture", .config_sha256 = "config", .binary_sha256 = "binary", .completed_ranks = .{ 0, 1 }, .comparisons = 1, .kv_shard = false, .runtime_sha256 = "runtime", .evidence_sha256 = "proof", .coverage = coverage };
+    var g: Gate = .{ .schema = "glm-replay-native-gate-v1", .gate = "correctness", .status = "pass", .fixture_sha256 = "fixture", .config_sha256 = "config", .binary_sha256 = "binary", .completed_ranks = .{ 0, 1 }, .comparisons = 1, .kv_shard = false, .runtime_sha256 = "runtime", .checkpoints = .{ .scheme = "tensorfold-full-identity-v1", .target = .{ "0000000000000000000000000000000000000000000000000000000000000000", "0000000000000000000000000000000000000000000000000000000000000000" }, .drafter = .{ "1111111111111111111111111111111111111111111111111111111111111111", "1111111111111111111111111111111111111111111111111111111111111111" } }, .evidence_sha256 = "proof", .coverage = coverage };
     try checkGate(g, m, "correctness", false, "runtime");
+    m.expected_checkpoints = g.checkpoints;
+    inline for (.{ "target", "drafter" }) |field| for (0..2) |rank| {
+        var wrong = g;
+        @field(wrong.checkpoints, field)[rank] = "2222222222222222222222222222222222222222222222222222222222222222";
+        try std.testing.expectError(error.CheckpointMismatch, checkGate(wrong, m, "correctness", false, "runtime"));
+    };
     g.evidence_sha256 = "changed";
     try std.testing.expectError(error.GateEvidence, checkGate(g, m, "correctness", false, "runtime"));
     g.evidence_sha256 = "proof";

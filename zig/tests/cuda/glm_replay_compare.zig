@@ -9,6 +9,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
     if (args.len != 2 and args.len != 3) return error.ReplayArguments;
     const off = try read(a, io, args[0]);
     const on = try read(a, io, args[1]);
+    try off.checkpoints.require(on.checkpoints);
     if (off.kv_shard or !on.kv_shard or off.forwards.len != on.forwards.len or off.observations.len != off.forwards.len or on.observations.len != on.forwards.len or off.forwards.len == 0) return error.ComparisonArms;
     if (!std.mem.eql(u8, off.fixture_sha256, on.fixture_sha256) or !std.mem.eql(u8, off.config_sha256, on.config_sha256) or !std.mem.eql(u8, off.binary_sha256, on.binary_sha256) or !std.mem.eql(u8, off.runtime_sha256, on.runtime_sha256) or !std.meta.eql(off.owners, on.owners)) return error.ComparisonIdentity;
     for (off.forwards, on.forwards, off.observations, on.observations) |af, bf, aobs, bobs| {
@@ -34,7 +35,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
     if (args.len == 3) for ([_]bool{ false, true }) |sharded| {
         const path = try std.fmt.allocPrint(a, "{s}.sharding-{s}.json", .{ args[2], if (sharded) "on" else "off" });
         const evidence_hash = try meta.fileHash(a, io, args[@intFromBool(sharded)]);
-        const gate: meta.Gate = .{ .schema = "glm-replay-native-gate-v1", .gate = "sharding_equality", .status = "pass", .fixture_sha256 = off.fixture_sha256, .config_sha256 = off.config_sha256, .binary_sha256 = off.binary_sha256, .completed_ranks = .{ 0, 1 }, .comparisons = 2 * off.forwards.len, .kv_shard = sharded, .runtime_sha256 = off.runtime_sha256, .coverage = meta.coverage, .evidence_sha256 = &evidence_hash };
+        const gate: meta.Gate = .{ .schema = "glm-replay-native-gate-v1", .gate = "sharding_equality", .status = "pass", .fixture_sha256 = off.fixture_sha256, .config_sha256 = off.config_sha256, .binary_sha256 = off.binary_sha256, .completed_ranks = .{ 0, 1 }, .comparisons = 2 * off.forwards.len, .kv_shard = sharded, .runtime_sha256 = off.runtime_sha256, .checkpoints = off.checkpoints, .coverage = meta.coverage, .evidence_sha256 = &evidence_hash };
         const raw = try std.json.Stringify.valueAlloc(a, gate, .{ .whitespace = .indent_2 });
         try result.writeNew(io, path, raw);
     };
@@ -44,6 +45,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
 fn read(a: std.mem.Allocator, io: std.Io, path: []const u8) !Logical {
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(512 << 20));
     const v = try std.json.parseFromSliceLeaky(Logical, a, raw, .{});
+    try v.checkpoints.check();
     if (!std.mem.eql(u8, v.schema, "glm-replay-native-logical-v1")) return error.Schema;
     if (!std.mem.eql(u8, v.coverage, meta.coverage)) return error.ReferenceCoverage;
     try @import("glm_replay_evidence.zig").checkObservations(v.forwards, v.observations);

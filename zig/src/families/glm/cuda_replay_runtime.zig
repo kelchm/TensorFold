@@ -38,7 +38,24 @@ pub fn settingsHash(gpa: std.mem.Allocator, settings: ranks.Settings, entries: [
     return h.finalResult();
 }
 
-pub fn loaded(e: anytype) ![32]u8 {
+pub const Checkpoints = struct { target: [2][32]u8, drafter: [2][32]u8 };
+
+pub fn nonce(io: std.Io) ![32]u8 {
+    var value: [32]u8 = undefined;
+    try std.Io.randomSecure(io, &value);
+    return value;
+}
+
+pub fn bindCheckpoints(base: [32]u8, target: [32]u8, drafter: [32]u8) [32]u8 {
+    var h = Sha.init(.{});
+    h.update("glm-replay-loaded-checkpoints-v1\x00");
+    h.update(&base);
+    h.update(&target);
+    h.update(&drafter);
+    return h.finalResult();
+}
+
+pub fn loaded(e: anytype, drafter: [32]u8) ![32]u8 {
     var entries: std.ArrayList([]const u8) = .empty;
     defer entries.deinit(e.gpa);
     var i: usize = 0;
@@ -63,7 +80,7 @@ pub fn loaded(e: anytype) ![32]u8 {
     var h = Sha.init(.{});
     h.update(&base);
     h.update(actual);
-    return h.finalResult();
+    return bindCheckpoints(h.finalResult(), e.checkpoint_digest, drafter);
 }
 
 pub fn combine(all: [2][32]u8) [32]u8 {
@@ -84,4 +101,19 @@ test "replay runtime binding ignores treatment and env order but detects transpo
     try std.testing.expectEqual(first, second);
     const changed = try settingsHash(a, plain, &.{ "TF_ROCE=0", "TF_GLM_SHARED_SIDE=1" });
     try std.testing.expect(!std.mem.eql(u8, &first, &changed));
+}
+
+test "replay fresh session nonces do not enter runtime while either rank checkpoint changes it" {
+    const first = try nonce(std.testing.io);
+    const second = try nonce(std.testing.io);
+    try std.testing.expect(!std.mem.eql(u8, &first, &second));
+    const runtime = bindCheckpoints(@splat(0), @splat(1), @splat(2));
+    const stable = combine(.{ runtime, runtime });
+    for (0..2) |rank| {
+        var all = [2][32]u8{ runtime, runtime };
+        all[rank] = bindCheckpoints(@splat(0), @splat(3), @splat(2));
+        try std.testing.expect(!std.mem.eql(u8, &stable, &combine(all)));
+        all[rank] = bindCheckpoints(@splat(0), @splat(1), @splat(3));
+        try std.testing.expect(!std.mem.eql(u8, &stable, &combine(all)));
+    }
 }

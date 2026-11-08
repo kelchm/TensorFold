@@ -5,6 +5,7 @@ const meta = @import("glm_replay_metadata.zig");
 const evidence = @import("glm_replay_evidence.zig");
 const hash = @import("glm_replay_hash.zig");
 const result = @import("glm_replay_result.zig");
+const provenance = @import("glm_replay_provenance.zig");
 
 pub fn load(a: std.mem.Allocator, io: std.Io, m: meta.Metadata, f: fixture.Fixture, sharded: bool) !evidence.Logical {
     const artifact = m.logical_evidence orelse return error.LogicalEvidenceUnrun;
@@ -13,11 +14,12 @@ pub fn load(a: std.mem.Allocator, io: std.Io, m: meta.Metadata, f: fixture.Fixtu
     return evidence.load(a, raw, f, m.source.binary_sha256, sharded);
 }
 
-pub fn runtime(reference: evidence.Logical, actual: []const u8) !void {
+pub fn runtime(reference: evidence.Logical, actual: []const u8, checkpoints: provenance.Checkpoints) !void {
     if (!std.mem.eql(u8, reference.runtime_sha256, actual)) return error.ReferenceRuntime;
+    try reference.checkpoints.require(checkpoints);
 }
 
-pub fn retain(a: std.mem.Allocator, io: std.Io, prefix: []const u8, f: fixture.Fixture, m: meta.Metadata, observations: []const evidence.Observed, comparisons: u64, sharded: bool, runtime_hash: []const u8) !void {
+pub fn retain(a: std.mem.Allocator, io: std.Io, prefix: []const u8, f: fixture.Fixture, m: meta.Metadata, observations: []const evidence.Observed, comparisons: u64, sharded: bool, runtime_hash: []const u8, checkpoints: provenance.Checkpoints) !void {
     const logical: evidence.Logical = .{
         .schema = "glm-replay-native-logical-v1",
         .coverage = meta.coverage,
@@ -25,6 +27,7 @@ pub fn retain(a: std.mem.Allocator, io: std.Io, prefix: []const u8, f: fixture.F
         .config_sha256 = f.config_sha256,
         .binary_sha256 = m.source.binary_sha256,
         .runtime_sha256 = runtime_hash,
+        .checkpoints = checkpoints,
         .kv_shard = sharded,
         .forwards = f.forwards,
         .owners = .{ f.streams[0].owner, f.streams[1].owner, f.streams[2].owner, f.streams[3].owner },
@@ -36,7 +39,7 @@ pub fn retain(a: std.mem.Allocator, io: std.Io, prefix: []const u8, f: fixture.F
     const digest = hash.bytes(raw);
     inline for (.{ "correctness", "timing_neutrality" }, .{ "correctness", "timing" }) |gate, suffix| {
         const output = try std.fmt.allocPrint(a, "{s}.{s}.json", .{ prefix, suffix });
-        try result.gate(a, io, output, f, m, gate, comparisons, sharded, runtime_hash, &digest);
+        try result.gate(a, io, output, f, m, gate, comparisons, sharded, runtime_hash, &digest, checkpoints);
     }
 }
 
@@ -53,6 +56,7 @@ pub fn agreement(a: std.mem.Allocator, m: meta.Metadata, settings_hash: []const 
         .default_server_neutrality = if (m.default_server_neutrality) |v| v.sha256 else null,
         .default_server_contract = if (m.default_server_contract) |v| v.sha256 else null,
         .telemetry = m.telemetry.sha256,
+        .expected_checkpoints = m.expected_checkpoints,
     }, .{});
     var sha = std.crypto.hash.sha2.Sha256.init(.{});
     sha.update("glm-replay-bound-session-v1\x00");

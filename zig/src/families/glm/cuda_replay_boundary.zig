@@ -16,6 +16,9 @@ pub const Receipt = extern struct {
     checks: u64 = 0,
     carries: u64,
     twins: u64,
+    elapsed_ns: u64 = 0,
+    realtime_start_ns: u64 = 0,
+    realtime_end_ns: u64 = 0,
 };
 
 pub const Boundary = struct {
@@ -30,6 +33,7 @@ pub const Boundary = struct {
     all_records: []audit_mod.Forward,
     started: i96 = 0,
     elapsed_ns: i96 = 0,
+    realtime_start_ns: u64 = 0,
     block: bool = false,
     before: Counts = .{},
     prompt_before: Counts = .{},
@@ -98,7 +102,7 @@ pub const Boundary = struct {
             try e.stream.synchronize();
             b.before = audit_mod.counts(e);
             b.block = true;
-            b.started = std.Io.Clock.awake.now(e.io).toNanoseconds();
+            b.startClock(e.io);
             return;
         }
         if (action != 0 or expected == 0 or !b.block or b.audit.pending or b.audit.forwards != expected or
@@ -110,12 +114,16 @@ pub const Boundary = struct {
         if (e.pages.?.shard) |sh| for (sh.parts.slots) |s| {
             twins += s.twin.items.len;
         };
-        const r: Receipt = .{ .forwards = b.audit.forwards, .groups = b.audit.groups, .rows = b.audit.rows, .calls = e.drafter.?.calls - b.audit.calls, .lost = e.drafter.?.lost - b.audit.lost, .owner_layers = c.owner_layers, .owner_rows = c.owner_rows, .owner_bytes = c.owner_bytes, .checks = c.checks, .carries = c.carries, .twins = twins };
+        var r: Receipt = .{ .forwards = b.audit.forwards, .groups = b.audit.groups, .rows = b.audit.rows, .calls = e.drafter.?.calls - b.audit.calls, .lost = e.drafter.?.lost - b.audit.lost, .owner_layers = c.owner_layers, .owner_rows = c.owner_rows, .owner_bytes = c.owner_bytes, .checks = c.checks, .carries = c.carries, .twins = twins };
         const size = @sizeOf(Receipt);
         try b.dev.uploadAsync(e.share.rank * size, std.mem.asBytes(&r), e.stream.handle);
         try e.lib.check(e.lib.api.ncclAllGather(b.dev.ptr + e.share.rank * size, b.dev.ptr, size, .u8, e.comm, e.stream.handle), "ncclAllGather");
         try e.stream.synchronize();
-        b.elapsed_ns = std.Io.Clock.awake.now(e.io).toNanoseconds() - b.started;
+        b.stopClock(e.io, &r);
+        // Exchange local completion clocks after the timed all-rank boundary has finished.
+        try b.dev.uploadAsync(e.share.rank * size, std.mem.asBytes(&r), e.stream.handle);
+        try e.lib.check(e.lib.api.ncclAllGather(b.dev.ptr + e.share.rank * size, b.dev.ptr, size, .u8, e.comm, e.stream.handle), "ncclAllGather");
+        try e.stream.synchronize();
         try b.dev.download(0, std.mem.asBytes(&b.receipts));
         try validateReceipts(b.receipts, expected, r.rows);
         const bytes = b.audit.used * @sizeOf(audit_mod.Forward);
@@ -136,6 +144,18 @@ pub const Boundary = struct {
         b.block = false;
     }
 
+    fn startClock(b: *Boundary, io: std.Io) void {
+        b.realtime_start_ns = @intCast(std.Io.Clock.real.now(io).toNanoseconds());
+        b.started = std.Io.Clock.awake.now(io).toNanoseconds();
+    }
+
+    fn stopClock(b: *Boundary, io: std.Io, r: *Receipt) void {
+        b.elapsed_ns = std.Io.Clock.awake.now(io).toNanoseconds() - b.started;
+        r.realtime_end_ns = @intCast(std.Io.Clock.real.now(io).toNanoseconds());
+        r.elapsed_ns = @intCast(b.elapsed_ns);
+        r.realtime_start_ns = b.realtime_start_ns;
+    }
+
     // Followers map real twin pages rather than allocating them; count that replay event once at begin.
     pub fn noteMappedTwin(b: *Boundary, e: anytype, slot: u32) !void {
         if (!e.settings.kv_shard.on) return;
@@ -148,11 +168,11 @@ pub const Boundary = struct {
 
 pub fn validateReceipts(receipts: [2]Receipt, expected: u64, rows: u64) !void {
     for (receipts) |r| if (r.forwards != expected or r.groups != expected or r.rows != rows or
-        r.calls != 0 or r.lost != 0 or r.carries != 0 or r.twins != 0) return error.ReplayCompletion;
+        r.calls != 0 or r.lost != 0 or r.carries != 0 or r.twins != 0 or r.elapsed_ns == 0) return error.ReplayCompletion;
 }
 
 test "replay completion rejects unfinished follower ingest and a proposer call on either rank" {
-    const good: Receipt = .{ .forwards = 3, .groups = 3, .rows = 8, .calls = 0, .lost = 0, .owner_layers = 0, .owner_rows = 0, .owner_bytes = 0, .carries = 0, .twins = 0 };
+    const good: Receipt = .{ .forwards = 3, .groups = 3, .rows = 8, .calls = 0, .lost = 0, .owner_layers = 0, .owner_rows = 0, .owner_bytes = 0, .carries = 0, .twins = 0, .elapsed_ns = 10 };
     var receipts = [_]Receipt{ good, good };
     try validateReceipts(receipts, 3, 8);
     receipts[1].groups = 2;
@@ -180,4 +200,36 @@ test "replay follower asserts the real mapped twin instead of accepting a host b
     sh.parts.slots[0].twin.clearRetainingCapacity();
     try std.testing.expectError(error.ReplayPromptTwin, b.noteMappedTwin(e, 0));
     try std.testing.expectError(error.ReplayPreparation, b.noteMappedTwin(e, 1));
+}
+
+test "replay rank-local realtime windows enclose monotonic wall and retain independent clocks" {
+    const Clock = struct {
+        stamps: [4]i96,
+        clocks: [4]std.Io.Clock = undefined,
+        used: usize = 0,
+        fn now(ptr: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+            const c: *@This() = @ptrCast(@alignCast(ptr.?));
+            c.clocks[c.used] = clock;
+            const stamp = c.stamps[c.used];
+            c.used += 1;
+            return .fromNanoseconds(stamp);
+        }
+    };
+    var vtable: std.Io.VTable = undefined;
+    vtable.now = Clock.now;
+    var ranks: [2]Receipt = undefined;
+    const stamps = [2][4]i96{ .{ 1000, 10, 110, 1101 }, .{ 2000, 40, 213, 2174 } };
+    for (stamps, &ranks) |local, *receipt| {
+        var clock: Clock = .{ .stamps = local };
+        const io: std.Io = .{ .userdata = &clock, .vtable = &vtable };
+        var b: Boundary = undefined;
+        b.startClock(io);
+        b.stopClock(io, receipt);
+        try std.testing.expectEqualSlices(std.Io.Clock, &.{ .real, .awake, .awake, .real }, &clock.clocks);
+        try std.testing.expectEqual(@as(u64, @intCast(local[2] - local[1])), receipt.elapsed_ns);
+        try std.testing.expectEqual(@as(u64, @intCast(local[0])), receipt.realtime_start_ns);
+        try std.testing.expectEqual(@as(u64, @intCast(local[3])), receipt.realtime_end_ns);
+    }
+    try std.testing.expect(ranks[0].elapsed_ns != ranks[1].elapsed_ns);
+    try std.testing.expect(ranks[0].realtime_start_ns != ranks[1].realtime_start_ns);
 }

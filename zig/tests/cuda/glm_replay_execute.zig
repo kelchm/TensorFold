@@ -110,7 +110,7 @@ pub fn checkCompletion(c: replay.Completion, rounds: []const fixture.Round, shar
         const after: ctl.Counters = .{ .owner_layers = rec.counts.owner_layers, .owner_rows = rec.counts.owner_rows, .owner_bytes = rec.counts.owner_bytes, .carries = rec.counts.carries };
         try ctl.checkCounters(.{}, after, rows, sharded, g);
     };
-    for (c.ranks) |rank| if (rank.forwards != rounds.len or rank.groups != rounds.len or rank.calls != 0 or rank.lost != 0 or rank.carries != 0 or rank.twins != 0) return error.IncompleteReplay;
+    for (c.ranks) |rank| if (rank.forwards != rounds.len or rank.groups != rounds.len or rank.calls != 0 or rank.lost != 0 or rank.carries != 0 or rank.twins != 0 or rank.elapsed_ns == 0) return error.IncompleteReplay;
     for (c.ranks, 0..) |rank, i| {
         var layers: u64 = 0;
         var rows: u64 = 0;

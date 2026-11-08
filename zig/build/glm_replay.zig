@@ -13,6 +13,15 @@ pub fn host(b: *std.Build, all: *std.Build.Step) void {
     all.dependOn(step);
     const cli = b.addExecutable(.{ .name = "tf-glm-replay-fixture", .root_module = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_replay_fixture.zig"), .target = b.graph.host, .optimize = .debug }) });
     b.step("glm-replay-host", "Build the driver-free replay fixture preflight").dependOn(&b.addInstallArtifact(cli, .{}).step);
+    const identity = b.createModule(.{ .root_source_file = b.path("zig/src/core/checkpoint_identity.zig"), .target = b.graph.host, .optimize = .debug, .link_libc = true });
+    const identity_cli = b.addExecutable(.{ .name = "tf-glm-replay-identity", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/glm_replay_identity.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+        .link_libc = true,
+        .imports = &.{.{ .name = "checkpoint_identity", .module = identity }},
+    }) });
+    b.top_level_steps.get("glm-replay-host").?.step.dependOn(&b.addInstallArtifact(identity_cli, .{}).step);
 }
 
 pub fn compileCommand(b: *std.Build, target: std.Build.ResolvedTarget, cuda: *std.Build.Module, glm: *std.Build.Module) void {

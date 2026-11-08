@@ -6,6 +6,7 @@ const fixture = @import("glm_replay_fixture.zig");
 const ctl = @import("glm_replay_control.zig");
 const meta = @import("glm_replay_metadata.zig");
 const hash = @import("glm_replay_hash.zig");
+const Provenance = @import("glm_replay_provenance.zig").Provenance;
 const Phase = struct { staging: f64, target: f64, tap_bookkeeping: f64, selection: f64, target_commit: f64, context_commit: f64 };
 const Owner = struct { layer_visits: u64, rows: u64, query_send_bytes: u64, output_send_bytes: u64 };
 const Forward = struct {
@@ -79,6 +80,9 @@ const Result = struct {
     run_id: []const u8,
     pair_id: []const u8,
     start_id: []const u8,
+    session_nonce: []const u8,
+    campaign_sha256: []const u8,
+    checkpoints: meta.Checkpoints,
     start_order: u8,
     block_id: []const u8,
     cell_id: []const u8,
@@ -91,6 +95,7 @@ const Result = struct {
     effective_config_sha256: []const u8,
     preparation_ns: u64,
     wall_ns: u64,
+    layout_checks: u64,
     timing_source: TimingSource,
     completed_ranks: [2]u8 = .{ 0, 1 },
     forwards: []const Forward,
@@ -99,7 +104,7 @@ const Result = struct {
     telemetry_sha256: []const u8,
 };
 
-pub fn write(a: std.mem.Allocator, io: std.Io, output: []const u8, f: fixture.Fixture, b: ctl.Budget, m: meta.Metadata, completion: replay.Completion, profile: replay.Completion, anchor_hash: []const u8, prep_ns: u64, sharded: bool, e: *glm.engine.Engine, g: ctl.Geometry, runtime_hash: []const u8) !void {
+pub fn write(a: std.mem.Allocator, io: std.Io, output: []const u8, f: fixture.Fixture, b: ctl.Budget, m: meta.Metadata, completion: replay.Completion, profile: replay.Completion, anchor_hash: []const u8, prep_ns: u64, sharded: bool, e: *glm.engine.Engine, g: ctl.Geometry, runtime_hash: []const u8, provenance: Provenance) !void {
     try @import("glm_replay_measure.zig").checkObserver(completion, f.forwards.len, false);
     try @import("glm_replay_measure.zig").checkObserver(profile, f.forwards.len, true);
     const rb = g.heads * g.latent * 2;
@@ -129,18 +134,23 @@ pub fn write(a: std.mem.Allocator, io: std.Io, output: []const u8, f: fixture.Fi
             record.* = .{ .forward_id = r.forward_id, .round_id = r.round_id, .parts = r.parts, .phases_ns = phase, .owner = .{ .layer_visits = observed.counts.owner_layers, .rows = observed.counts.owner_rows, .query_send_bytes = if (sharded) g.layers * peer_rows * rb else 0, .output_send_bytes = if (sharded) g.layers * owner_rows * rb else 0 }, .target_commits = observed.kept, .context_commits = observed.kept };
             if (record.owner.query_send_bytes + record.owner.output_send_bytes != observed.counts.owner_bytes) return error.OwnerBytes;
         }
-        const result: Result = .{ .fixture_sha256 = f.fixture_sha256, .schedule_sha256 = f.schedule_sha256, .tokens_sha256 = f.tokens_sha256, .config_sha256 = f.config_sha256, .run_id = m.run_id, .pair_id = m.pair_id, .start_id = m.start_id, .start_order = m.start_order, .block_id = m.block_id, .cell_id = m.cell_id, .arm = if (sharded) "B" else "A", .rank = rank, .source = m.source, .effective_config = effective, .effective_config_sha256 = &effective_hash, .preparation_ns = prep_ns, .wall_ns = @intCast(completion.elapsed_ns), .timing_source = .{ .anchor_sha256 = anchor_hash }, .forwards = records, .memory = memory, .telemetry_sha256 = m.telemetry.sha256 };
+        const rank_receipt = completion.ranks[rank];
+        if (rank_receipt.elapsed_ns == 0) return error.IncompleteReplay;
+        const result: Result = .{ .fixture_sha256 = f.fixture_sha256, .schedule_sha256 = f.schedule_sha256, .tokens_sha256 = f.tokens_sha256, .config_sha256 = f.config_sha256, .run_id = m.run_id, .pair_id = m.pair_id, .start_id = m.start_id, .session_nonce = provenance.session_nonce, .campaign_sha256 = provenance.campaign_sha256, .checkpoints = provenance.checkpoints, .start_order = m.start_order, .block_id = m.block_id, .cell_id = m.cell_id, .arm = if (sharded) "B" else "A", .rank = rank, .source = m.source, .effective_config = effective, .effective_config_sha256 = &effective_hash, .preparation_ns = prep_ns, .wall_ns = rank_receipt.elapsed_ns, .layout_checks = rank_receipt.checks, .timing_source = .{ .anchor_sha256 = anchor_hash }, .forwards = records, .memory = memory, .telemetry_sha256 = m.telemetry.sha256 };
         try std.json.Stringify.value(result, .{}, &out.writer);
         try out.writer.writeByte('\n');
     }
     try writeNew(io, output, out.written());
 }
 
-pub fn anchor(a: std.mem.Allocator, io: std.Io, output: []const u8, f: fixture.Fixture, m: meta.Metadata, profile: replay.Completion, headline: replay.Completion, sharded: bool, runtime_hash: []const u8) ![64]u8 {
+pub fn anchor(a: std.mem.Allocator, io: std.Io, output: []const u8, f: fixture.Fixture, m: meta.Metadata, profile: replay.Completion, headline: replay.Completion, sharded: bool, runtime_hash: []const u8, provenance: Provenance) ![64]u8 {
     try @import("glm_replay_measure.zig").checkObserver(profile, f.forwards.len, true);
     try @import("glm_replay_measure.zig").checkObserver(headline, f.forwards.len, false);
     const raw = try std.json.Stringify.valueAlloc(a, .{
         .schema = "glm-replay-native-phase-anchor-v1",
+        .session_nonce = provenance.session_nonce,
+        .campaign_sha256 = provenance.campaign_sha256,
+        .checkpoints = provenance.checkpoints,
         .fixture_sha256 = f.fixture_sha256,
         .schedule_sha256 = f.schedule_sha256,
         .runtime_sha256 = runtime_hash,
@@ -158,8 +168,8 @@ pub fn anchor(a: std.mem.Allocator, io: std.Io, output: []const u8, f: fixture.F
     return hash.bytes(raw);
 }
 
-pub fn gate(a: std.mem.Allocator, io: std.Io, output: []const u8, f: fixture.Fixture, m: meta.Metadata, name: []const u8, comparisons: u64, sharded: bool, runtime_hash: []const u8, evidence_hash: []const u8) !void {
-    const record: meta.Gate = .{ .schema = "glm-replay-native-gate-v1", .gate = name, .status = "pass", .fixture_sha256 = f.fixture_sha256, .config_sha256 = f.config_sha256, .binary_sha256 = m.source.binary_sha256, .completed_ranks = .{ 0, 1 }, .comparisons = comparisons, .kv_shard = sharded, .runtime_sha256 = runtime_hash, .coverage = meta.coverage, .evidence_sha256 = evidence_hash };
+pub fn gate(a: std.mem.Allocator, io: std.Io, output: []const u8, f: fixture.Fixture, m: meta.Metadata, name: []const u8, comparisons: u64, sharded: bool, runtime_hash: []const u8, evidence_hash: []const u8, checkpoints: meta.Checkpoints) !void {
+    const record: meta.Gate = .{ .schema = "glm-replay-native-gate-v1", .gate = name, .status = "pass", .fixture_sha256 = f.fixture_sha256, .config_sha256 = f.config_sha256, .binary_sha256 = m.source.binary_sha256, .completed_ranks = .{ 0, 1 }, .comparisons = comparisons, .kv_shard = sharded, .runtime_sha256 = runtime_hash, .checkpoints = checkpoints, .coverage = meta.coverage, .evidence_sha256 = evidence_hash };
     const raw = try std.json.Stringify.valueAlloc(a, record, .{ .whitespace = .indent_2 });
     try writeNew(io, output, raw);
 }

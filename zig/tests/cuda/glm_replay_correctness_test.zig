@@ -126,10 +126,11 @@ test "replay typed logical preload refuses schedule or identity drift before dev
     const a = arena.allocator();
     var f = sample();
     const digest = "0000000000000000000000000000000000000000000000000000000000000000";
+    const checkpoints: @import("glm_replay_provenance.zig").Checkpoints = .{ .scheme = "tensorfold-full-identity-v1", .target = .{ digest, digest }, .drafter = .{ digest, digest } };
     f.fixture_sha256 = digest;
     f.config_sha256 = digest;
     const want = reference(f);
-    var v: evidence.Logical = .{ .schema = "glm-replay-native-logical-v1", .coverage = @import("glm_replay_metadata.zig").coverage, .fixture_sha256 = digest, .config_sha256 = digest, .binary_sha256 = digest, .runtime_sha256 = digest, .kv_shard = false, .forwards = f.forwards, .owners = .{ 0, 0, 1, 1 }, .observations = &want };
+    var v: evidence.Logical = .{ .schema = "glm-replay-native-logical-v1", .coverage = @import("glm_replay_metadata.zig").coverage, .fixture_sha256 = digest, .config_sha256 = digest, .binary_sha256 = digest, .runtime_sha256 = digest, .checkpoints = checkpoints, .kv_shard = false, .forwards = f.forwards, .owners = .{ 0, 0, 1, 1 }, .observations = &want };
     var raw = try std.json.Stringify.valueAlloc(a, v, .{});
     _ = try evidence.load(a, raw, f, digest, false);
     try std.testing.expectError(error.ReferenceIdentity, evidence.load(a, raw, f, digest, true));
@@ -143,8 +144,8 @@ test "replay typed logical preload refuses schedule or identity drift before dev
     m.source.binary_sha256 = digest;
     m.logical_evidence = .{ .path = path, .sha256 = &sha };
     const loaded = try binding.load(a, std.testing.io, m, f, false);
-    try binding.runtime(loaded, digest);
-    try std.testing.expectError(error.ReferenceRuntime, binding.runtime(loaded, "other runtime"));
+    try binding.runtime(loaded, digest, checkpoints);
+    try std.testing.expectError(error.ReferenceRuntime, binding.runtime(loaded, "other runtime", checkpoints));
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "logical.json", .data = try std.fmt.allocPrint(a, "{s}\n", .{raw}) });
     try std.testing.expectError(error.HashMismatch, binding.load(a, std.testing.io, m, f, false));
     v.coverage = "old-incomplete-coverage";
@@ -157,6 +158,7 @@ test "replay typed logical preload refuses schedule or identity drift before dev
 }
 
 test {
+    _ = @import("glm_replay_provenance_test.zig");
     _ = replay;
 }
 
@@ -216,7 +218,7 @@ const BlockControl = struct {
         s.active = false;
         @memcpy(s.records[s.forwards..][0..s.forwards], s.records[0..s.forwards]);
         if (s.corrupt_output and s.complete_calls == (if (s.measurement) @as(usize, 6) else 2)) s.first.?[0] ^= 1;
-        const r: replay.Receipt = .{ .forwards = expected, .groups = expected, .rows = s.kept, .calls = 0, .lost = 0, .owner_layers = 0, .owner_rows = 0, .owner_bytes = 0, .carries = 0, .twins = 0 };
+        const r: replay.Receipt = .{ .forwards = expected, .groups = expected, .rows = s.kept, .calls = 0, .lost = 0, .owner_layers = 0, .owner_rows = 0, .owner_bytes = 0, .carries = 0, .twins = 0, .elapsed_ns = 1 };
         for (s.timings[0 .. 2 * s.forwards], 0..) |*t, i| t.* = .{ .id = i % s.forwards, .ms = @splat(if (s.enabled) @as(f32, 5) else 99) };
         return .{ .ranks = .{ r, r }, .elapsed_ns = 1, .records = s.records[0 .. 2 * s.forwards], .timings = if (s.enabled or s.leak_observer) s.timings[0 .. 2 * s.forwards] else &.{} };
     }
@@ -327,7 +329,7 @@ test "replay block receipt refuses lifetime owner totals even when all forward d
         .{ .id = 0, .rows = 4, .kept = 1, .counts = .{} },
         .{ .id = 1, .rows = 3, .kept = 3, .counts = .{} },
     };
-    const rank: replay.Receipt = .{ .forwards = 2, .groups = 2, .rows = 4, .calls = 0, .lost = 0, .owner_layers = 0, .owner_rows = 0, .owner_bytes = 0, .checks = 3, .carries = 0, .twins = 0 };
+    const rank: replay.Receipt = .{ .forwards = 2, .groups = 2, .rows = 4, .calls = 0, .lost = 0, .owner_layers = 0, .owner_rows = 0, .owner_bytes = 0, .checks = 3, .carries = 0, .twins = 0, .elapsed_ns = 1 };
     var c: replay.Completion = .{ .ranks = .{ rank, rank }, .records = &records, .timings = &.{}, .elapsed_ns = 1 };
     try exec.checkCompletion(c, f.forwards, false, g);
     c.ranks[1].owner_layers = 99;

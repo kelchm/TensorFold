@@ -180,3 +180,41 @@ test "campaign metadata reader rejects numeric block identities before checking 
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/metadata.json", .{tmp.sub_path});
     try std.testing.expectError(error.UnexpectedToken, meta.read(a, io, path, c.f, true, false));
 }
+
+test "validation preflights all three exclusive outputs through parent aliases before any GPU work" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.symLink(io, ".", "alias", .{ .is_directory = true });
+    const prefix = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/alias/attempt", .{tmp.sub_path});
+    try campaign.checkValidationOutput(a, io, prefix);
+    for ([_][]const u8{ "logical", "correctness", "timing" }) |suffix| {
+        const name = try std.fmt.allocPrint(a, "attempt.{s}.json", .{suffix});
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "preserved prior attempt" });
+        try std.testing.expectError(error.CampaignOutputExists, campaign.checkValidationOutput(a, io, prefix));
+        try std.testing.expectEqualStrings("preserved prior attempt", try tmp.dir.readFileAlloc(io, name, a, .limited(100)));
+        try tmp.dir.deleteFile(io, name);
+        try tmp.dir.symLink(io, "missing-target", name, .{});
+        try std.testing.expectError(error.CampaignOutputExists, campaign.checkValidationOutput(a, io, prefix));
+        try tmp.dir.deleteFile(io, name);
+    }
+    try campaign.checkValidationOutput(a, io, prefix);
+}
+
+test "native metadata validates explicit checkpoint pin schema before artifacts or GPU startup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = control("solo", "block-7", "output");
+    c.m.expected_checkpoints = .{ .scheme = "tensorfold-full-identity-v1", .target = .{ "short", "short" }, .drafter = .{ "short", "short" } };
+    const raw = try std.json.Stringify.valueAlloc(a, c.m, .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "metadata.json", .data = raw });
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/metadata.json", .{tmp.sub_path});
+    try std.testing.expectError(error.InvalidDigest, meta.read(a, io, path, c.f, false, false));
+}

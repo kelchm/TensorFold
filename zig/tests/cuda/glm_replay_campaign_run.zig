@@ -81,16 +81,15 @@ fn execute(init: std.process.Init, args: []const [:0]const u8, progress: *Progre
 
 fn drive(init: std.process.Init, s: *glm.cuda_replay.Session, cases: []const campaign.Case, plans: []const Plan, sharded: bool, progress: *Progress) !void {
     const runtime_hash = std.fmt.bytesToHex(s.runtime_sha256, .lower);
+    const identity = try @import("glm_replay_provenance.zig").Provenance.fromSession(init.arena.allocator(), s);
     for (cases, plans) |c, p| {
         var gate_arena = std.heap.ArenaAllocator.init(init.gpa);
         defer gate_arena.deinit();
-        try meta.checkRuntime(gate_arena.allocator(), init.io, c.m, sharded, &runtime_hash);
-        try binding.runtime(p.reference.?, &runtime_hash);
+        if (c.m.expected_checkpoints) |pins| try pins.require(identity.checkpoints);
+        try meta.checkRuntime(gate_arena.allocator(), init.io, c.m, sharded, &runtime_hash, identity.checkpoints);
+        try binding.runtime(p.reference.?, &runtime_hash, identity.checkpoints);
     }
-    var accepted: [2][32]u8 = undefined;
-    const owned = s.owned;
-    try glm.ranks.gather([32]u8, owned.e.d, &owned.group.lib, owned.group.comm, owned.e.stream, owned.group.rank, s.runtime_sha256, &accepted);
-    if (!std.mem.eql(u8, &accepted[0], &accepted[1])) return error.ReplayHashMismatch;
+    try s.agree();
     if (progress.rank.? != 0) return s.follow();
     if (s.owned.e.capacity != cases[0].f.config.pool.configured_capacity) return error.LoadedConfiguration;
     const g = try exec.geometry(s.owned.e);

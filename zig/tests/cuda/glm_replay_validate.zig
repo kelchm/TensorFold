@@ -17,7 +17,7 @@ pub fn run(a: std.mem.Allocator, s: *replay.Session, f: fixture.Fixture, b: ctl.
     const g = try exec.geometry(s.owned.e);
     try s.enableTiming(false);
     try batch(s, f, b, prep, compiled, expected, sharded, g);
-    var comparisons = try oracle(s, f, b, prep, expected);
+    var comparisons = try oracle(s, f, b, expected);
     try batch(s, f, b, poison_prep.rounds, poisoned.rounds, actual, sharded, g);
     comparisons += try compareBatches(expected, actual, f.forwards);
     try s.enableTiming(true);
@@ -92,22 +92,34 @@ fn compareBatches(expected: []const Observed, actual: []const Observed, rounds: 
     return comparisons;
 }
 
-fn oracle(s: *replay.Session, f: fixture.Fixture, b: ctl.Budget, prep: []exec.Compiled, expected: []const Observed) !u64 {
+pub fn prepareOracle(s: anytype, f: fixture.Fixture, b: ctl.Budget) !void {
+    try exec.prepareStreams(s, f, b);
+    for (f.preparation) |r| for (r.parts) |p| for (0..p.kept) |row| {
+        _ = try oneRow(s, f, p, row);
+    };
+}
+
+fn oneRow(s: anytype, f: fixture.Fixture, p: ctl.Part, row: usize) !u32 {
+    var selected: [1]u32 = undefined;
+    const offset = p.tape_offset + row;
+    const tape = f.streams[p.stream_id].tape_tokens;
+    const one: replay.Part = .{ .slot = p.stream_id, .position = p.position + row, .ids = tape[offset..][0..1], .keep = 1, .anchor = tape[offset + 1], .out = &selected };
+    try s.beginBlock();
+    try s.round(0, &.{one});
+    _ = try s.complete(1);
+    return selected[0];
+}
+
+fn oracle(s: *replay.Session, f: fixture.Fixture, b: ctl.Budget, expected: []const Observed) !u64 {
     var comparisons: u64 = 0;
-    try exec.prepare(s, f, b, prep);
+    try prepareOracle(s, f, b);
     for (f.forwards, expected) |r, want| for (r.parts, 0..) |p, i| {
         var last: [2]replay.Snapshot = undefined;
         for (0..p.kept) |row| {
-            var selected: [1]u32 = undefined;
-            const offset = p.tape_offset + row;
-            const tape = f.streams[p.stream_id].tape_tokens;
-            const one: replay.Part = .{ .slot = p.stream_id, .position = p.position + row, .ids = tape[offset..][0..1], .keep = 1, .anchor = tape[offset + 1], .out = &selected };
-            try s.beginBlock();
-            try s.round(0, &.{one});
-            _ = try s.complete(1);
+            const selected = try oneRow(s, f, p, row);
             const end = row + 1 == p.kept;
             last = if (end) try s.capture(p.stream_id, p.position + row + 1) else try s.captureRows(p.stream_id, p.position + row + 1);
-            if (selected[0] != want.outputs[i][row]) return error.ReferenceSelection;
+            if (selected != want.outputs[i][row]) return error.ReferenceSelection;
             for (0..2) |rank| try evidence.rows(last[rank], 0, want.shots[i][rank], row);
             comparisons += 2;
         }

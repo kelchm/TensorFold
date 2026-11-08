@@ -17,6 +17,7 @@ pub const Logical = struct {
     config_sha256: []const u8,
     binary_sha256: []const u8,
     runtime_sha256: []const u8,
+    checkpoints: @import("glm_replay_provenance.zig").Checkpoints,
     kv_shard: bool,
     forwards: []const fixture.Round,
     owners: [4]u8,
@@ -25,6 +26,7 @@ pub const Logical = struct {
 
 pub fn load(a: std.mem.Allocator, raw: []const u8, f: fixture.Fixture, binary: []const u8, sharded: bool) !Logical {
     const v = try std.json.parseFromSliceLeaky(Logical, a, raw, .{});
+    try v.checkpoints.check();
     if (!std.mem.eql(u8, v.schema, "glm-replay-native-logical-v1")) return error.Schema;
     if (!std.mem.eql(u8, v.coverage, @import("glm_replay_metadata.zig").coverage)) return error.ReferenceCoverage;
     try fixture.hex(v.runtime_sha256, 64);
