@@ -96,7 +96,7 @@ pub const Chunks = struct {
     }
 
     /// Queries and rows in [-1, 1); dense from row k - rows / 2, across a page edge; sparse tokens under 4,096.
-    pub fn prepare(self: *Chunks, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
+    pub fn prepareRows(self: *Chunks, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
         if (shape.n != heads * lw or shape.rows == 0 or shape.k == 0) return false;
         self.free();
         self.rig.reset();
@@ -122,6 +122,15 @@ pub const Chunks = struct {
             };
             if (fill == .nonfinite and shape.rows > 1) self.cache[self.keys[shape.k] * lw + 9] = c.toBf16(std.math.inf(f32));
         }
+        return true;
+    }
+
+    pub fn prepare(self: *Chunks, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
+        if (!try self.prepareRows(shape, fill, seed)) return false;
+        const a = self.rig.gpu.gpa;
+        var prng = std.Random.DefaultPrng.init(seed ^ 0x7061676573);
+        const rng = prng.random();
+        const span = self.cache.len / lw;
         const n_pages = (span + pages.rows_a_page - 1) / pages.rows_a_page;
         self.ids = try pages.shuffled(a, rng, n_pages);
         const arena = try a.alloc(u8, (n_pages + 3) * pages.page_bytes);
