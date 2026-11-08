@@ -11,6 +11,8 @@ pub const heads_tile = 16;
 pub const heads_tile_wide = 32;
 pub const prompt_rows = 64;
 pub const prompt_rb = 64;
+/// glm_glue_attn.cuh CHUNK_THREADS: the chunk kernels trap unless their eight warps launch together.
+pub const chunk_threads = 256;
 
 /// latent.head_block: a rank's 32 heads a program in prompt chunks (each key read once), 16 in decode windows.
 pub fn headBlock(rows: usize) usize {
@@ -105,7 +107,7 @@ fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, 
         a.add(@as(i64, @intCast(t.ps)));
     }
     const shared = if (hb == heads_tile_wide) glue.chunksSmem(heads_tile_wide) else glue.chunksSmem(heads_tile);
-    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = 256 }, .shared = shared }, stream, &a);
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = chunk_threads }, .shared = shared }, stream, &a);
 }
 
 /// latent.sparse_attention: rows with counts > 0 over their selected tokens (i32 [rows][w]); others left alone.
