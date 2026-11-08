@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- `TF_GLM_REQUEST_STARTS=1` (opt-in, off by default) lets GLM on CUDA cut prompt passes at a request's message starts, so a chat's next turn resumes at its previous turn's history instead of the last 2,048-row point. GLM refuses it at startup with `TF_KV_SHARE` above 0 or with `--learn-conversations`. On two GB10 at TP=2 (EXL3 TR3, DFlash2), a 58,738-token chat's later turns resumed at 58,735 instead of 57,344, with replies identical to `--prompt-cache-gib 0` and to the switch off (#2404, part of #2396). Thanks to @laidick.
+
 ## 1.2.5
 
 - Tests: the Metal kernel contract's limits pass checks LFM3's launches again; a rebase had dropped their five entries, so the pass stopped at the first LFM3 record with `UnknownLaunch` and left every later launch unchecked (#2565).
