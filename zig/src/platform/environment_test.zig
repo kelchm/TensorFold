@@ -3,7 +3,7 @@ const std = @import("std");
 const e = @import("environment.zig");
 const t = std.testing;
 const a = t.allocator;
-const all: e.Flags = .{ .cuda = true, .metal = true, .xpu = true, .slide = true, .hooks = true, .dsv41 = true };
+const all: e.Flags = .{ .cuda = true, .metal = true, .xpu = true, .slide = true, .hooks = true, .dsv41 = true, .glm = true };
 const Env = struct {
     name: []const u8,
     raw: ?[]const u8,
@@ -45,6 +45,7 @@ const valid = [_]Case{
     .{ .name = "TENSORFOLD_RESTORE_PREFETCH_GIB", .raw = "16777217", .n = 16777217 },
     .{ .name = "TENSORFOLD_RESTORE_PREFETCH_MS", .raw = "1099511627777", .n = 1099511627777 },
     .{ .name = "TF_CUDA_DEVICE", .raw = " 3 ", .n = 3 },
+    .{ .name = "TF_GLM_ABSORB_MMA", .raw = "1", .n = 1 },
     .{ .name = "TF_CUDA_DEVICE", .raw = "4294967295", .n = std.math.maxInt(u32) },
     .{ .name = "TF_CUDA_SEGMENTS", .raw = " 1 ", .n = 1 },
     .{ .name = "TF_CUDA_SEGMENTS", .raw = "4", .n = 4 },
@@ -238,4 +239,12 @@ test "environment: a legacy alias is checked only while its canonical name is un
     try t.expectEqualStrings("TF_DSV41_TOOL_GRAMMAR=\"bad\": expected 0 or 1 (ignored while TENSORFOLD_TOOL_GRAMMAR is set)", why);
     for ([_][]const u8{ "", "0", "1" }) |canonical| try t.expect((try e.refusal(a, Alias{ .canonical = canonical }, .{ .dsv41 = true })) == null);
     try t.expect((try e.refusal(a, Alias{ .canonical = null }, .{})) == null);
+}
+
+test "environment: malformed GLM opt-in affects only GLM startup" {
+    const env: Env = .{ .name = "TF_GLM_ABSORB_MMA", .raw = "on" };
+    try t.expect((try e.refusal(a, env, .{ .cuda = true })) == null);
+    const why = (try e.refusal(a, env, .{ .glm = true })).?;
+    defer a.free(why);
+    try t.expectEqualStrings("TF_GLM_ABSORB_MMA=\"on\": expected 0 or 1", why);
 }

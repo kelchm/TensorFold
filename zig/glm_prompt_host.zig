@@ -19,6 +19,7 @@ const fw = struct {
     pub const Rank = struct { w: *u8, st: *State, b: *Buffers, segs: []const Seg = &.{} };
     pub var observed_ring = false;
     pub var observed_taps = false;
+    pub var observed_absorb_mma = false;
     pub const Forward = struct {
         d: u8,
         m: *u8,
@@ -28,10 +29,12 @@ const fw = struct {
         pieces: ?*u8,
         split: bool,
         kda_wide: bool,
+        absorb_mma: bool = false,
         ring: bool = false,
         taps: ?Taps = null,
         pub fn run(f: *Forward, ids: []const i32) !void {
             observed_ring = f.ring;
+            observed_absorb_mma = f.absorb_mma;
             observed_taps = f.taps != null;
             if (f.taps) |taps| if (taps.out != 0) {
                 for (ids, 0..) |id, i| {
@@ -69,7 +72,7 @@ const engine = struct {
         seqs: [32]Seq = @splat(.{}),
         bp: fw.Buffers,
         share: struct { vocab: Vocab = .{} } = .{},
-        settings: struct { split: bool = true, ring: bool = true, kda_wide: bool = true } = .{},
+        settings: struct { split: bool = true, ring: bool = true, kda_wide: bool = true, numerics: glm.ranks.Numerics = .{} } = .{},
         d: u8 = 0,
         m: u8 = 0,
         stream: u8 = 0,
@@ -284,4 +287,15 @@ test "GLM structured: prompt rows survive without an MTP head" {
     try pass(&e, &.{.{ .slot = 13, .ids = &.{ 81, 82 } }});
     try t.expectEqual(@as(u16, 32), held(&e, 4));
     try t.expectEqual(@as(u16, 63), held(&e, 9));
+}
+
+test "GLM prompt workflow: a batched prompt carries the arithmetic opt-in into its forward" {
+    var b: Box = .{};
+    var e = b.make();
+    e.settings.numerics.absorb_mma = true;
+    try pass(&e, &.{.{ .slot = 4, .ids = &.{ 31, 32 } }});
+    try t.expect(fw.observed_absorb_mma);
+    e.settings.numerics.absorb_mma = false;
+    try pass(&e, &.{.{ .slot = 9, .ids = &.{ 61, 62 } }});
+    try t.expect(!fw.observed_absorb_mma);
 }

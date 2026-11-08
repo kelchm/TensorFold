@@ -69,3 +69,10 @@ The profile registry reports selected arithmetic/experimental overrides; it does
 See [profiles](profiles.md) for classes, scopes and grouped slide-learning names.
 `capabilities --json` no longer advertises `TENSORFOLD_NO_UPDATE_CHECK` or `HF_HUB_OFFLINE`: the native binary reads neither.
 The command-line `--no-update-check` remains an accepted no-op.
+
+## GLM CUDA prompt arithmetic
+
+`TF_GLM_ABSORB_MMA` accepts `0` or `1`; unset or blank keeps it off. GLM checks it
+before rank placement, NCCL or weights; other CUDA families do not check this GLM-only scope.
+`1` selects arithmetic-changing prompt absorb/expand GEMMs, registered as arithmetic in the
+profile and agreed in every rank's fingerprint. See the [experiment and pending gates](recipes/glm-prompt-mla.md).

@@ -157,7 +157,6 @@ pub const window_rows: u32 = fw.window_rows;
 
 const snapshots = @import("cuda_snapshots.zig");
 const disk_ranks = @import("cuda_disk_ranks.zig");
-
 const Owned = struct {
     gpa: std.mem.Allocator,
     benchmark_group: ?[]const u8,
@@ -182,8 +181,8 @@ pub fn roceBytes(text: ?[]const u8) !usize {
 
 const startup = @import("cuda_start.zig");
 const paging = startup.paging;
-
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
+    try @import("cuda_env.zig").startup();
     _ = kernels; // our own kernels: a captured set is not used
     try requestStartsAlone(o.learn_conversations); // before any rank opens
     const p = try place();
