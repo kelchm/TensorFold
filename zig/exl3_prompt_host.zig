@@ -16,7 +16,7 @@ const Capture = struct {
             const sizes: []const u8 = switch (@intFromPtr(f)) {
                 11 => &.{ 8, 4, 8, 8, 4 },
                 12 => &.{ 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4, 4 },
-                else => &.{ 8, 8, 8, 8, 8, 8, 8, 4, 4, 4 },
+                else => &.{ 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4 },
             };
             for (sizes, 0..) |size, i| {
                 const bytes: [*]const u8 = @ptrCast(args.?[i].?);
@@ -55,7 +55,7 @@ fn run(rows: usize, prompt: bool, shared: bool) !void {
     d.api.cuMemcpy2DAsync_v2 = Capture.copy;
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     var k: ex.Experts = .{ .mod = undefined, .group = function(&d, 1), .rot_in = function(&d, 2), .grouped = @splat(function(&d, 3)), .gateup = function(&d, 4), .down_combine = function(&d, 5) };
-    if (comptime @hasField(ex.Experts, "prompt")) k.prompt = .{ .rotate = function(&d, 11), .gateup = function(&d, 12), .down = function(&d, 13) };
+    if (comptime @hasField(ex.Experts, "prompt")) k.prompt = .{ .rotate = function(&d, 11), .gateup = function(&d, 12), .down = function(&d, 13), .down_slots = function(&d, 13) };
     const ek: glm.experts.Kernels = .{ .nvfp4 = undefined, .b32 = null, .router = .{ .plan_small = function(&d, 20), .plan_rank = function(&d, 21), .plan_offsets = function(&d, 22), .plan_scatter = function(&d, 23), .plan_rows = function(&d, 24), .plan_rank_rows = function(&d, 25), .plan_scatter_rows = function(&d, 26) } };
     const w: glm.exl3.Experts = .{ .gt = 100, .ut = 200, .dt = 300, .k2 = 400, .suh_g = 500, .suh_u = 600, .svh_g = 700, .svh_u = 800, .suh_d = 900, .svh_d = 1000, .shx = shared };
     const sc: glm.exl3.Scratch = .{ .picks = 0x100000000, .xg = 0, .xu = 0, .z = 0 };
@@ -77,10 +77,11 @@ test "exl3 prompt: dispatch rotates once per row only with verified shared scale
         try std.testing.expectEqual(@as(u32, 14), Capture.by(12)[0].grid[1]);
         try std.testing.expectEqual(@as(u64, if (shared) 8 else 1), Capture.by(12)[0].args[13]);
         try std.testing.expectEqual(@as(u64, 8), Capture.by(13)[0].args[9]);
-        try std.testing.expectEqual(@as(usize, 2), Capture.copied);
+        try std.testing.expectEqual(@as(usize, 1), Capture.copied);
+        try std.testing.expectEqual(@as(u64, 9), Capture.by(13)[0].args[10]);
+        try std.testing.expectEqual(@as(u64, 0x400000000), Capture.by(13)[0].args[6]);
         try std.testing.expectEqual(@as(usize, 8 * 4), Capture.copies[0].width);
         try std.testing.expectEqual(@as(usize, 9 * 4), Capture.copies[0].src_pitch);
-        try std.testing.expectEqual(@as(usize, 9 * 512 * 4), Capture.copies[1].dst_pitch);
     }
 }
 
@@ -95,29 +96,49 @@ test "exl3 prompt: scratch omits global split partials and shared rotation stora
         const sc = try ex.prompt.scratch(0x1000, l, 1024, 8);
         try std.testing.expectEqual(@as(u64, sc.xg), sc.xu);
         try std.testing.expectEqual(@as(u64, 0x1000 + bytes), sc.y + 1024 * 8 * 512 * 4);
+        const direct = try ex.prompt.scratchFor(0x1000, l, 1024, 8, false);
+        const direct_bytes = try ex.prompt.bytesFor(l, 1024, 8, false);
+        try std.testing.expectEqual(@as(u64, 0), direct.y);
+        try std.testing.expectEqual(bytes - 1024 * 8 * 512 * 4, direct_bytes);
+        try std.testing.expectEqual(sc.y, 0x1000 + direct_bytes);
+        try std.testing.expectEqual(glm.exl3.scratchBytes(1024, 512, 256, true, true)[0], direct_bytes + 1024 * 8 * 4);
         try std.testing.expectError(error.Exl3Shape, ex.prompt.bytes(l, std.math.maxInt(usize), 8));
     } else try std.testing.expect(false);
 }
 
-test "exl3 prompt: 1024-row calls keep row and pick offsets on both sides of the boundary" {
-    try run(1030, true, true);
-    try std.testing.expectEqual(@as(usize, 4), Capture.copied);
-    try std.testing.expectEqual(@as(usize, 1024), Capture.copies[0].height);
-    try std.testing.expectEqual(@as(usize, 6), Capture.copies[2].height);
-    try std.testing.expectEqual(@as(u64, 0x300000000 + 1024 * 9 * 4), Capture.copies[2].src);
-    try std.testing.expectEqual(@as(u64, 0x400000000 + 1024 * 9 * 512 * 4), Capture.copies[3].dst);
-    var rotations: usize = 0;
-    for (Capture.calls[0..Capture.count]) |call| if (call.id == 11) {
-        const at: u64 = if (rotations == 0) 0 else 1024;
-        try std.testing.expectEqual(@as(u64, 0x200000000 + at * 520 * 2), call.args[0]);
-        rotations += 1;
-    };
-    try std.testing.expectEqual(@as(usize, 2), rotations);
+test "exl3 prompt: whole passes and the next chunk keep input, pick and direct-slot offsets" {
+    const cap = glm.exl3.chunk_rows;
+    for ([_]usize{ 1030, cap, cap + 6 }) |rows| {
+        try run(rows, true, true);
+        const chunks: usize = if (rows > cap) 2 else 1;
+        try std.testing.expectEqual(chunks, Capture.copied);
+        try std.testing.expectEqual(@min(rows, cap), Capture.copies[0].height);
+        if (rows > cap) {
+            try std.testing.expectEqual(@as(usize, 6), Capture.copies[1].height);
+            try std.testing.expectEqual(@as(u64, 0x300000000 + cap * 9 * 4), Capture.copies[1].src);
+        }
+        var rotations: usize = 0;
+        var downs: usize = 0;
+        for (Capture.calls[0..Capture.count]) |call| {
+            if (call.id == 11) {
+                try std.testing.expectEqual(@as(u64, 0x200000000 + rotations * cap * 520 * 2), call.args[0]);
+                rotations += 1;
+            }
+            if (call.id == 13) {
+                try std.testing.expectEqual(@as(u64, 0x400000000 + downs * cap * 9 * 512 * 4), call.args[6]);
+                downs += 1;
+            }
+        }
+        try std.testing.expectEqual(chunks, rotations);
+        try std.testing.expectEqual(chunks, downs);
+    }
 }
 
 test "exl3 prompt: decode retains the existing split-K launches" {
     try run(4, false, true);
     try std.testing.expectEqual(@as(usize, 0), Capture.by(12).len);
+    try std.testing.expectEqual(@as(usize, 2), Capture.copied);
+    try std.testing.expectEqual(@as(usize, 9 * 512 * 4), Capture.copies[1].dst_pitch);
     try std.testing.expect(Capture.by(1).len > 0 and Capture.by(2).len > 0 and Capture.by(3).len > 0);
 }
 
