@@ -4,10 +4,10 @@ const cuda = @import("cuda");
 const check = @import("check.zig");
 const timing = @import("roofline_time.zig");
 const lt = cuda.cublaslt;
-const workspace_bytes = 64 << 20;
+pub const workspace_bytes = 64 << 20;
 
-const Job = struct {
-    plan: *const lt.Gemm,
+pub const Job = struct {
+    plan: *lt.Gemm,
     stream: cuda.Stream,
     x: u64,
     w: u64,
@@ -67,8 +67,23 @@ fn bench(gpu: check.Gpu, library: *const lt.Library, handle: lt.Handle, stream: 
     var plan = try init(library, handle, shape, fp8);
     defer plan.deinit();
     var job: Job = .{ .plan = &plan, .stream = stream, .x = x.ptr, .w = w.ptr, .out = out.ptr, .ws = ws.ptr };
+    const selection = try tune(gpu, &job);
+    const stats = try timing.measure(gpu, stream, seconds, &job);
+    try validate(out, shape);
+    var buf: [256]u8 = undefined;
+    const details = try std.fmt.bufPrint(&buf, "M={d} N={d} K={d} output=bf16 accumulate=fp32 scales=1 workspace={d} heuristic={d}/{d} warm_buffers=1", .{ m, n, k, plan.workspace_need, selection.index, selection.count });
+    report.add(if (fp8) "gemm-fp8-e4m3" else "gemm-bf16", "TFLOPS", @as(f64, @floatFromInt(2 * m * n * k)) / 1e9, stats, details);
+}
+
+pub const Selection = struct { index: usize, count: usize };
+
+/// Time the roofline's 32 heuristic candidates before graph capture; retain the fastest supported algorithm.
+pub fn tune(gpu: check.Gpu, job: *Job) !Selection {
+    const plan = job.plan;
+    const library = plan.lt;
+    const stream = job.stream;
     var candidates: [32]lt.Heuristic = undefined;
-    const count = try algorithms(library, plan, &candidates);
+    const count = try algorithms(library, plan.*, &candidates);
     var start = try cuda.Event.init(gpu.d, true);
     defer start.deinit();
     var end = try cuda.Event.init(gpu.d, true);
@@ -103,15 +118,16 @@ fn bench(gpu: check.Gpu, library: *const lt.Library, handle: lt.Handle, stream: 
     const chosen = selected orelse return error.NoAlgorithm;
     plan.algo = chosen.algo;
     plan.workspace_need = chosen.workspace_size;
-    const stats = try timing.measure(gpu, stream, seconds, &job);
-    try validate(out, shape);
-    var buf: [256]u8 = undefined;
-    const details = try std.fmt.bufPrint(&buf, "M={d} N={d} K={d} output=bf16 accumulate=fp32 scales=1 workspace={d} heuristic={d}/{d} warm_buffers=1", .{ m, n, k, chosen.workspace_size, selected_index, count });
-    report.add(if (fp8) "gemm-fp8-e4m3" else "gemm-bf16", "TFLOPS", @as(f64, @floatFromInt(2 * m * n * k)) / 1e9, stats, details);
+    return .{ .index = selected_index, .count = count };
 }
 
 /// TN column-major view D^T[n,m] = W[n,k] . X^T[k,m], with default tensorwide scales of one.
 fn init(library: *const lt.Library, handle: lt.Handle, shape: [3]u64, fp8: bool) !lt.Gemm {
+    return initLinear(library, handle, shape, fp8, shape[2], false);
+}
+
+/// The same TN product with a served activation stride and BF16 or FP32 output; inputs remain BF16 or E4M3.
+pub fn initLinear(library: *const lt.Library, handle: lt.Handle, shape: [3]u64, fp8: bool, stride: u64, wide: bool) !lt.Gemm {
     const api = library.api;
     var g: lt.Gemm = undefined;
     g.lt = library;
@@ -129,9 +145,9 @@ fn init(library: *const lt.Library, handle: lt.Handle, shape: [3]u64, fp8: bool)
     const k = shape[2];
     try supported(library, layout(&g.a, dtype, k, n, @intCast(k)));
     errdefer _ = api.cublasLtMatrixLayoutDestroy(g.a);
-    try supported(library, layout(&g.b, dtype, k, m, @intCast(k)));
+    try supported(library, layout(&g.b, dtype, k, m, @intCast(stride)));
     errdefer _ = api.cublasLtMatrixLayoutDestroy(g.b);
-    try library.check(api.cublasLtMatrixLayoutCreate(&g.c, .bf16, n, m, @intCast(n)), "roofline output layout");
+    try library.check(api.cublasLtMatrixLayoutCreate(&g.c, if (wide) .f32 else .bf16, n, m, @intCast(n)), "roofline output layout");
     g.workspace_need = 0;
     return g;
 }
