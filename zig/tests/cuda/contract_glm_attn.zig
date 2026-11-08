@@ -173,7 +173,7 @@ pub const Chunks = struct {
         var a: cuda.Args = .{};
         inline for (.{ self.in[0], self.in[1], self.pos, self.in[2], self.in[3], self.parts[0], self.parts[1], self.parts[2], rows, @as(i64, heads), w, @as(f32, @floatCast(scale)), @as(c_int, @intFromBool(self.form.sparse)), self.pt, @as(i64, pages.page_bytes) }) |v| a.add(v);
         const shared = if (self.form.hb == 32) glm.glue.chunksSmem(32) else glm.glue.chunksSmem(16);
-        try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast(self.shape.rows), .y = (heads + self.form.hb - 1) / self.form.hb, .z = @intCast(self.nch) }, .block = .{ .x = 256 }, .shared = shared }, self.rig.s, &a);
+        try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast(self.shape.rows), .y = (heads + self.form.hb - 1) / self.form.hb, .z = @intCast(self.nch) }, .block = .{ .x = glm.latent.chunk_threads }, .shared = shared }, self.rig.s, &a);
         var m: cuda.Args = .{};
         inline for (.{ self.parts[0], self.parts[1], self.parts[2], self.out, self.in[3], rows, @as(i64, heads), @as(c_int, @intCast(self.nch)), @as(c_int, @intFromBool(self.form.sparse)) }) |v| m.add(v);
         try cuda.launch.launch(self.merge, .{ .grid = .{ .x = @intCast(self.shape.rows), .y = heads }, .block = .{ .x = 128 } }, self.rig.s, &m);

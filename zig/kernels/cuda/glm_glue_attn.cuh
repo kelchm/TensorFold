@@ -7,6 +7,9 @@
 namespace glm_attn {
 
 constexpr int LW = 512, KT = 32, CH = 512, KPAD = LW + 8;
+// The eight-warp split and FP8 tile ownership require cuda_latent.chunk_threads exactly.
+constexpr int CHUNK_THREADS = 256;
+static_assert(KT * (LW / 8) % CHUNK_THREADS == 0, "FP8 units must split evenly over the chunk block");
 
 // p fp32 summed as Triton's tile does: a thread's two columns, the quad (xor 2, 1), then warps (w0 + w2) + (w1 + w3).
 __device__ __forceinline__ float quad_sum(float v) {
@@ -53,6 +56,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   __nv_bfloat16* ps = kvs + 2 * KT * LW;
   float* red = reinterpret_cast<float*>(ps + HB * KT);
   float* stat = red + HB * 4;
+  if (blockDim.x != CHUNK_THREADS) __trap();
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, q = lane & 3;
   const int kg = warp & 3, hh = warp >> 2;
   const int64_t r = blockIdx.x, h0 = (int64_t)blockIdx.y * HB, c = blockIdx.z;
@@ -61,7 +65,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   // a dense chunk's 512 keys are one page, its rows from that page's; a sparse key's row comes as the token list has it
   const __nv_bfloat16* keys_at = !FP8 && pt && !sparse && live ? lc + ((int64_t)pt[c] * (pstep / 2) - start * LW) : lc;
   // Fetch tile + 2 as 8-code units before this tile's math; convert afterwards with the original BF16 rounding.
-  constexpr int UPT = KT * (LW / 8) / 256;  // units a thread moves a tile: the launches' 256 threads (cuda_latent)
+  constexpr int UPT = KT * (LW / 8) / CHUNK_THREADS;
   uint2 raw[FP8 ? UPT : 1];
   float rsc[FP8 ? UPT : 1];
   auto fetch8 = [&](int tile) {
@@ -69,7 +73,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
     const int64_t first = start + tile * KT;
 #pragma unroll
     for (int i = 0; i < UPT; ++i) {
-      const int idx = t + i * 256, key = idx / (LW / 8), u = idx % (LW / 8);
+      const int idx = t + i * CHUNK_THREADS, key = idx / (LW / 8), u = idx % (LW / 8);
       const int64_t ki = first + key;
       const bool ok = sparse ? ki < n : ki <= limit;
       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
@@ -81,7 +85,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
     __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
 #pragma unroll
     for (int i = 0; i < UPT; ++i) {
-      const int idx = t + i * 256, key = idx / (LW / 8), u = idx % (LW / 8);
+      const int idx = t + i * CHUNK_THREADS, key = idx / (LW / 8), u = idx % (LW / 8);
       const uint32_t wv[2] = {raw[i].x, raw[i].y};
 #pragma unroll
       for (int j = 0; j < 8; j += 2) {
@@ -243,14 +247,14 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
 }  // namespace glm_attn
 
 // The 16-head form (decode windows) and 32-head form (prompt chunks), each in glm_attn::wide_smem<HB>() bytes of smem.
-extern "C" __global__ void __launch_bounds__(256)
+extern "C" __global__ void __launch_bounds__(glm_attn::CHUNK_THREADS)
     tf_glm_chunks_16(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
                      float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse,
                      const int* pt, int64_t pstep) {
   glm_attn::chunks_wide<16>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, pt, pstep);
 }
 
-extern "C" __global__ void __launch_bounds__(256)
+extern "C" __global__ void __launch_bounds__(glm_attn::CHUNK_THREADS)
     tf_glm_chunks_32(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
                      float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse,
                      const int* pt, int64_t pstep) {
@@ -258,14 +262,14 @@ extern "C" __global__ void __launch_bounds__(256)
 }
 
 // E4M3 cache variants reconstruct the existing BF16 shared tile before the unchanged attention math.
-extern "C" __global__ void __launch_bounds__(256)
+extern "C" __global__ void __launch_bounds__(glm_attn::CHUNK_THREADS)
     tf_glm_chunks_16_fp8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
                          const int* tok, const int* cnt, float* po, float* pm, float* pl,
                          int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
   glm_attn::chunks_wide<16, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
                                  po, pm, pl, rows, heads, w, scale, sparse, nullptr, 0, scales);
 }
-extern "C" __global__ void __launch_bounds__(256)
+extern "C" __global__ void __launch_bounds__(glm_attn::CHUNK_THREADS)
     tf_glm_chunks_32_fp8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
                          const int* tok, const int* cnt, float* po, float* pm, float* pl,
                          int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {

@@ -9,4 +9,13 @@ pub const records = blk: {
         }
     }
     break :blk out;
+} ++ chunks;
+
+const chunks = blk: {
+    var out: [2]registry.CudaRecord = undefined;
+    for ([_]u32{ 16, 32 }, 0..) |hb, i| {
+        const symbol = @import("std").fmt.comptimePrint("tf_glm_chunks_{d}", .{hb});
+        out[i] = .{ .launch = .{ .name = "glm_glue " ++ symbol, .symbol = symbol, .image = "glm_glue", .threads = 256, .dynamic = if (hb == 32) 101120 else 83328, .opt_in = true, .min_sm = 80 }, .usage = registry.none };
+    }
+    break :blk out;
 };
