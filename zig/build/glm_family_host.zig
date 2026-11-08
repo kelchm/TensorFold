@@ -92,4 +92,8 @@ pub fn compile(b: *std.Build, target: std.Build.ResolvedTarget, cuda: *std.Build
     const prompt_gate_compile = b.addObject(.{ .name = "glm-prompt-gate-compile", .root_module = b.createModule(.{ .root_source_file = b.path("zig/glm_prompt_gate_compile.zig"), .target = target, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "gate", .module = prompt_gate }} }) });
     _ = prompt_gate_compile.getEmittedBin();
     b.step("compile-glm-prompt-gate-host", "Compile the actual device prompt comparison gate with inert images").dependOn(&prompt_gate_compile.step);
+    const mm_contract = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_glm_mm.zig"), .target = target, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm_cuda", .module = prompt_gate.import_table.get("glm_cuda").? }, .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } });
+    const mm_compile = b.addObject(.{ .name = "glm-mm-contract-compile", .root_module = b.createModule(.{ .root_source_file = b.path("zig/glm_mm_contract_compile.zig"), .target = target, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "gate", .module = mm_contract }, .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } }) });
+    _ = mm_compile.getEmittedBin();
+    b.top_level_steps.get("compile-glm-prompt-gate-host").?.step.dependOn(&mm_compile.step);
 }
