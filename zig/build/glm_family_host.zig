@@ -44,6 +44,10 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
     const page_contract_run = b.addRunArtifact(b.addTest(.{ .root_module = page_contract, .filters = &.{"GLM page contract:"} }));
     b.step("test-glm-page-contract-host", "GLM paged contract case and planted-control inventory without devices").dependOn(&page_contract_run.step);
     step.dependOn(&page_contract_run.step);
+    const mm_contract = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_glm_mm.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm_cuda", .module = glm }, .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } });
+    const mm_contract_run = b.addRunArtifact(b.addTest(.{ .root_module = mm_contract, .filters = &.{"GLM prompt contract:"} }));
+    b.step("test-glm-mm-contract-host", "Packed prompt replacement stress without devices").dependOn(&mm_contract_run.step);
+    step.dependOn(&mm_contract_run.step);
     const admission = b.createModule(.{ .root_source_file = b.path("zig/glm_admission_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm", .module = glm }, .{ .name = "lanes", .module = mods.lanes }, .{ .name = "engine_api", .module = api } } });
     const admission_run = b.addRunArtifact(b.addTest(.{ .root_module = admission, .filters = &.{"GLM CUDA admission:"} }));
     b.step("test-glm-admission-host", "Real GLM admission capabilities through the lane worker without GPU work").dependOn(&admission_run.step);
