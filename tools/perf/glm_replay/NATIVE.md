@@ -25,6 +25,9 @@ The CPU identity producer uses the production full checkpoint identity/cache alg
 prints local target/drafter digests with revision qualification explicitly unverified.
 Directory names do not establish revisions; obtain both ranks' pins from frozen local stores
 and qualify their source revisions separately before any device run.
+The host replay suite also invokes `python3` to validate actual native formatter output and
+retained anchors with the common validator. That test uses explicitly synthetic fixtures,
+invented counters and no driver; it is a format check, not passing device evidence.
 
 ## Coordinated device commands, unrun in host implementation
 

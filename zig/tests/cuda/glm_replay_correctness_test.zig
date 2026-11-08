@@ -159,6 +159,7 @@ test "replay typed logical preload refuses schedule or identity drift before dev
 
 test {
     _ = @import("glm_replay_provenance_test.zig");
+    _ = @import("glm_replay_interop_test.zig");
     _ = replay;
 }
 

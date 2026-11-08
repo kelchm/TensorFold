@@ -148,6 +148,20 @@ their sample coverage and bindings outside the block; neither runner scrapes tel
 
 ## Adapter imports and remaining gates
 
+The original diagnostic bundle's page-aligned prompts do not exercise committed page crossing.
+Derive three separate qualification controls without repeating tokenization:
+
+```sh
+python3 -m tools.perf.glm_replay.boundaries ORIGINAL_BUNDLE QUALIFICATION_BUNDLE
+```
+
+The derived bundle retains every original file byte, records the parent manifest hash, and adds
+one partial-commit page-crossing history per family. It shortens the used prompt prefix by two
+tokens, keeps the full retained encoding and tape, and reseals the explicit positions/schedule.
+Entries marked `qualification_only` support the Python suite's coverage gate. They do not expand
+the proposed performance matrix or authorize a campaign. Validate every derived fixture with
+both host validators and check the actual suite coverage before device qualification.
+
 ```python
 from tools.perf.glm_replay import load_fixture, offered_tokens, next_anchor
 fixture = load_fixture("campaign-prose-8k.json", expected={"vocab_size": 154880})
