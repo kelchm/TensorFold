@@ -39,10 +39,13 @@ pub const Marks = struct {
 const ranks = @import("cuda_ranks.zig");
 const images_mod = @import("cuda_images.zig");
 
+pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
+
 pub const Options = struct {
     capacity: usize, // tokens a sequence holds
     mtp: bool, // load the MTP head (drafts)
     settings: ranks.Settings,
     vision: ?images_mod.Limits = null, // --vision's limits (null: off): every rank must hold the rows rank 0 sends
     drafter: bool = false, // DFlash2 loads after rank agreement
+    room: ?Room = null, // remaining allocation budget, including the OS reserve and process limit
 };

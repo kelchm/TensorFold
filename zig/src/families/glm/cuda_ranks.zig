@@ -17,7 +17,7 @@ pub const Settings = struct {
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE: 1 (decode windows on KDA's three-kernel chain) or 0
     kda_pad: bool = false, // TF_GLM_KDA_PAD: 1 (the fused KDA input padded to eight columns at load, for glm_mm) or 0
     pieces: u32 = 3, // TF_GLM_OVERLAP_PIECES: a prompt chunk's exchanges in this many row pieces (1: whole); unset, 8 under solo on the wire.
-    solo: bool = false, // TF_GLM_CHUNK_SOLO: 4096 (prompt buffers for two chunks a pass, while no stream decodes) or 2048
+    solo: u32 = 2048, // TF_GLM_CHUNK_SOLO: 2048, 4096 or 8192 rows while no other stream decodes
     pair: bool = true, // TF_GLM_PROMPT_PAIR: 1 (while no stream decodes, a prompt step takes two chunks, each one's exchanges under the other's sites) or 0
     index_split: u32 = 2048, // TF_GLM_INDEX_SPLIT: from this position on, rank 0 splits a prompt chunk's indexer rows (0: never)
     heat: ?heat.Bands = null, // TF_HEAT_HIGH and TF_HEAT_LOW (upstream's names): a prompt chunk waits on every rank's hottest zone
@@ -80,8 +80,8 @@ pub const Settings = struct {
             }
         }
         if (get("TF_GLM_CHUNK_SOLO")) |v| {
-            if (std.mem.eql(u8, v, "4096")) s.solo = true else if (std.mem.eql(u8, v, "2048")) s.solo = false else {
-                problem.* = "TF_GLM_CHUNK_SOLO: 2048 or 4096";
+            if (std.mem.eql(u8, v, "8192")) s.solo = 8192 else if (std.mem.eql(u8, v, "4096")) s.solo = 4096 else if (std.mem.eql(u8, v, "2048")) s.solo = 2048 else {
+                problem.* = "TF_GLM_CHUNK_SOLO: 2048, 4096 or 8192";
                 return error.BadSetting;
             }
         }
@@ -98,8 +98,8 @@ pub const Settings = struct {
                 problem.* = "TF_GLM_OVERLAP_PIECES: 1 to 8";
                 return error.BadSetting;
             }
-        } else if (s.solo and s.roce_multi and wireOpens(get)) {
-            s.pieces = 8; // TF_GLM_CHUNK_SOLO=4096 with TF_GLM_ROCE_MULTI=1: solo's doubled passes on the wire
+        } else if (s.solo > 2048 and s.roce_multi and wireOpens(get)) {
+            s.pieces = 8; // solo passes on TF_GLM_ROCE_MULTI's wire
         }
         if (get("TF_GLM_INDEX_SPLIT")) |v| {
             s.index_split = std.fmt.parseInt(u32, v, 10) catch {
@@ -197,7 +197,7 @@ fn wireOpens(get: *const fn ([:0]const u8) ?[]const u8) bool {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 20, // prompt arithmetic is part of the ranks' agreement
+    layout: u32 = 21, // solo is a row count, including the index ring's width
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -218,7 +218,7 @@ pub const Fingerprint = extern struct {
     max_frames: u32 = 0,
     roce_multi: u32 = 0, // TF_GLM_ROCE_MULTI: every rank opens the borrowed wire or none does (a lone rank would wait on it)
     kv_host: u32 = 0, // TF_GLM_KV_HOST(_SHARED): every rank sizes the pool alike and maps the shared file, or none does
-    solo: u32 = 0, // TF_GLM_CHUNK_SOLO: rank 0's solo passes need the wider prompt buffers on every rank
+    solo: u32 = 2048, // TF_GLM_CHUNK_SOLO: rank 0's pass and ring width, agreed before loading
     l2pf: [4]u32 = @splat(0), // TF_GLM_L2PF's words: every rank prefetches alike, so none waits on a slower one's windows
     bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
     numerics: u32 = 0,
@@ -292,7 +292,7 @@ pub const Fingerprint = extern struct {
             .roce_multi = @intFromBool(s.roce_multi),
             .kv_host = s.kv_host,
             .kv_host_gib = s.kv_host_gib,
-            .solo = @intFromBool(s.solo),
+            .solo = s.solo,
             .l2pf = s.l2pf.words(),
             .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
             .numerics = s.numerics.bits(),

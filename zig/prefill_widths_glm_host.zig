@@ -46,20 +46,20 @@ const Backend = struct {
 };
 test "CUDA prefill widths: GLM stepped cold, solo, one-pass and resumed real cuts" {
     const cap = glm.engine.prompt_rows;
-    const ids = try t.allocator.alloc(u32, 2 * cap + 17);
+    const ids = try t.allocator.alloc(u32, 4 * cap + 17);
     defer t.allocator.free(ids);
     @memset(ids, 1);
-    for ([_]usize{ 0, cap, 0, 0 }, 0..) |from, case| {
+    for ([_]usize{ 0, cap, 0, 0, 0 }, 0..) |from, case| {
         var d = Driver.init();
-        var s = try lanes.Stream.init(t.allocator, .{ .id = "glm", .prompt = if (case == 2) ids[0..7] else ids, .max_new = 1 });
+        var s = try lanes.Stream.init(t.allocator, .{ .id = "glm", .prompt = if (case == 2) ids[0..7] else if (case == 4) ids else ids[0 .. 2 * cap + 17], .max_new = 1 });
         defer s.deinit(t.allocator);
         s.settle_step = true;
         var e: Engine = .{ .stream = .{ .d = &d, .handle = null } };
-        var b: Backend = .{ .x = .{ .e = &e, .rows = if (case == 3) glm.engine.solo_rows else cap }, .from = from };
+        var b: Backend = .{ .x = .{ .e = &e, .rows = if (case == 4) 4 * cap else if (case == 3) 2 * cap else cap }, .from = from };
         defer b.lanes.deinit(t.allocator);
         try b.lanes.put(t.allocator, &s, .{});
         while (!try glm.lanes.Lanes.prefillStep(&b, &s)) {}
-        const expected: []const u32 = if (case == 2) &.{7} else if (case == 3) &.{ glm.engine.solo_rows, 17 } else if (from == 0) &.{ cap, cap, 17 } else &.{ cap, 17 };
+        const expected: []const u32 = if (case == 2) &.{7} else if (case == 4) &.{ 4 * cap, 17 } else if (case == 3) &.{ 2 * cap, 17 } else if (from == 0) &.{ cap, cap, 17 } else &.{ cap, 17 };
         try t.expectEqualSlices(u32, expected, s.prefill_widths.items);
         try t.expectEqual(expected.len, Driver.calls);
         try t.expectEqual(@as(?u64, 1), b.lanes.get(&s).?.first);

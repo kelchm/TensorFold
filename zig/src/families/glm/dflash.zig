@@ -34,7 +34,7 @@ pub const TAP_ROW: usize = taps_mod.layers.len * D * 2; // bytes of one row's ta
 /// Device bytes a stream's context ring takes (K and V of every layer).
 pub const ring_bytes: u64 = LAYERS * 2 * @as(u64, @intCast(WIN)) * KVW * 2;
 
-/// taps_prefill's rows: a prompt pass's taps whole (TF_GLM_CHUNK_SOLO: two chunks); an ingest keeps its window's.
+/// taps_prefill holds a whole solo pass; an ingest keeps only its final window.
 pub fn tapRows(prompt_rows: usize) usize {
     return @max(MAX_CTX, prompt_rows);
 }

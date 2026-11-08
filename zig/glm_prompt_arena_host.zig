@@ -55,3 +55,24 @@ test "GLM prompt arena: two actual sequence allocations own disjoint, charged pr
     a = try glm.forward.State.init(std.testing.allocator, &d, &w, 32);
     for (y[0..32]) |byte| try std.testing.expectEqual(@as(u8, 93), byte);
 }
+
+test "GLM prompt arena: selected solo width sizes actual sequence rings and startup charges" {
+    var d: cuda.Driver = undefined;
+    d.api.cuMemAlloc_v2 = alloc;
+    d.api.cuMemFree_v2 = free;
+    d.api.cuMemsetD8_v2 = fill;
+    var w: glm.weights.Weights = .{ .gpa = std.testing.allocator, .config = .{ .hidden = 16 }, .share = undefined };
+    w.share = try glm.shard.Share.of(&w.config, 0, 1);
+    const State = glm.forward.State;
+    for ([_]usize{ 2048, 4096, 8192 }) |width| {
+        var st = try State.initSized(std.testing.allocator, &d, &w, 16384, true, null, width);
+        defer st.deinit();
+        try std.testing.expectEqual(@max(@as(usize, 4096), width), st.ring_rows);
+        try std.testing.expectEqual(try State.bytesFor(std.testing.allocator, &w, 16384, true, null, width), st.arena.buf.len);
+        try std.testing.expectEqual(st.rings[0] + st.ring_rows * 256, st.rings[1]);
+        try std.testing.expect(st.rings[1] + st.ring_rows * 256 <= st.arena.buf.ptr + st.arena.buf.len);
+        const stream: cuda.Stream = .{ .d = &d, .handle = null };
+        try std.testing.expectError(error.IndexRingTooSmall, st.ready(stream, st.ring_rows + 1));
+        try std.testing.expectError(error.IndexRingTooSmall, st.readyMtp(stream, st.ring_rows + 1));
+    }
+}

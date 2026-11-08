@@ -31,9 +31,9 @@ pub fn soloCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
         std.debug.print("REFUSE {s}\n", .{problem});
         return err;
     };
-    try check.expect(set.solo, "glm-solo-check needs TF_GLM_CHUNK_SOLO=4096", .{});
+    try check.expect(set.solo > 2048, "glm-solo-check needs TF_GLM_CHUNK_SOLO=4096 or 8192", .{});
     const C = glm.engine.prompt_rows;
-    const capacity = @max(dc.capacity, 6 * C);
+    const capacity = @max(dc.capacity, 5 * set.solo + C);
     const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = capacity, .mtp = true, .settings = set });
     defer e.deinit();
     var link = try glm.follow.Link.init(gpu.gpa, gpu.d, &lib, comm, e.stream, capacity);
@@ -55,6 +55,8 @@ pub fn soloCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
         .{ .len = 2 * C }, // a solo pass to the end
         .{ .len = C }, // one chunk
         .{ .len = 5 * C + 7 }, // solo passes past a rebase
+        .{ .len = 4 * set.solo + 7 }, // several full solo passes and ring rebases
+        .{ .len = 4 * set.solo, .marks = &.{ 2 * C, 3 * C, 5 * C } }, // marks inside the wider pass
         .{ .len = 4 * C, .marks = &.{C} }, // a mark at chunk 1: 0 and 1 alone, then a solo pass
     };
     const Kept = struct {
@@ -96,9 +98,9 @@ pub fn soloCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
         var base: usize = 0;
         var at: usize = 0;
         while (at < len) {
-            const reach = @min(len - at, 2 * C);
-            const two = glm.prompt_solo.takesTwo(at, len, case.marks) and glm.prompt_solo.ringsAgree(base, st.ring_rows, at, reach);
-            const rows = @min(len - at, @as(usize, if (two) 2 * C else C));
+            const reach = @min(len - at, @as(usize, set.solo));
+            const two = glm.prompt_solo.takesChunks(at, len, set.solo, case.marks) and glm.prompt_solo.ringsAgree(base, st.ring_rows, at, reach);
+            const rows = @min(len - at, @as(usize, if (two) set.solo else C));
             if (at + rows > base + st.ring_rows) base = at; // State.ready rebases at the step's start, a whole pool
             want += @intFromBool(two);
             at += rows;

@@ -45,11 +45,11 @@ pub fn set(gpa: std.mem.Allocator, list: *std.ArrayList(u32), cuts: []const u32)
 }
 
 /// A prompt step's rows from `start` with `part_len` ids: to the next cut, or a solo pass's when `part_len` holds more.
-pub fn stepRows(len: usize, cuts: []const u32, start: usize, part_len: usize) !usize {
+pub fn stepRows(len: usize, cuts: []const u32, start: usize, part_len: usize, wide_rows: usize) !usize {
     if (start >= len or !coldCut(len, cuts, start)) return error.BadChunk;
     if (part_len <= prefill_rows + 1) return nextCut(len, cuts, start) - start;
     if (cuts.len > 0) return error.BadChunk; // a solo pass would step over a request start
-    return @min(len - start, state.solo_rows);
+    return @min(len - start, wide_rows);
 }
 
 test "glm request starts: with no cuts a pass cuts every prefill_rows rows from 0, as before" {
@@ -90,13 +90,13 @@ test "glm request starts: a short chunk ends at a start inside the first grid st
 
 test "glm request starts: a step runs to the next cut, a solo step only without cuts, and only from a cold cut" {
     const m = prefill_rows;
-    try std.testing.expectEqual(@as(usize, m), try stepRows(3 * m, &.{}, 0, m + 1));
-    try std.testing.expectEqual(@as(usize, state.solo_rows), try stepRows(3 * m, &.{}, 0, state.solo_rows + 1));
-    try std.testing.expectEqual(@as(usize, 500), try stepRows(3 * m, &.{500}, 0, 501));
-    try std.testing.expectEqual(@as(usize, m), try stepRows(3 * m, &.{500}, 500, m + 1));
-    try std.testing.expectError(error.BadChunk, stepRows(3 * m, &.{500}, 0, state.solo_rows + 1));
-    try std.testing.expectError(error.BadChunk, stepRows(3 * m, &.{500}, m, m + 1)); // the old grid point, not a cut here
-    try std.testing.expectError(error.BadChunk, stepRows(3 * m, &.{}, 3 * m, 1));
+    try std.testing.expectEqual(@as(usize, m), try stepRows(3 * m, &.{}, 0, m + 1, 2 * m));
+    try std.testing.expectEqual(@as(usize, 2 * m), try stepRows(3 * m, &.{}, 0, 2 * m + 1, 2 * m));
+    try std.testing.expectEqual(@as(usize, 500), try stepRows(3 * m, &.{500}, 0, 501, 2 * m));
+    try std.testing.expectEqual(@as(usize, m), try stepRows(3 * m, &.{500}, 500, m + 1, 2 * m));
+    try std.testing.expectError(error.BadChunk, stepRows(3 * m, &.{500}, 0, 2 * m + 1, 2 * m));
+    try std.testing.expectError(error.BadChunk, stepRows(3 * m, &.{500}, m, m + 1, 2 * m)); // the old grid point, not a cut here
+    try std.testing.expectError(error.BadChunk, stepRows(3 * m, &.{}, 3 * m, 1, 2 * m));
 }
 
 test "glm request starts: starts 1 and 2 rows apart each end a chunk, and a step from each runs to the next" {
@@ -108,11 +108,11 @@ test "glm request starts: starts 1 and 2 rows apart each end a chunk, and a step
     for (ends) |end| {
         try std.testing.expectEqual(end, nextCut(len, &cuts, at));
         try std.testing.expect(coldCut(len, &cuts, at));
-        try std.testing.expectEqual(end - at, try stepRows(len, &cuts, at, end - at + 1));
+        try std.testing.expectEqual(end - at, try stepRows(len, &cuts, at, end - at + 1, 2 * m));
         at = end;
     }
     try std.testing.expect(!coldCut(len, &cuts, 1002));
-    try std.testing.expectError(error.BadChunk, stepRows(len, &cuts, 1002, 2));
+    try std.testing.expectError(error.BadChunk, stepRows(len, &cuts, 1002, 2, 2 * m));
 }
 
 /// The prompts and starts the tests here cut: the grid alone, starts off and on it, past the prompt, and close starts.

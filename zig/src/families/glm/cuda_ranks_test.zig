@@ -296,26 +296,31 @@ test "ranks disagree on tensor bytes under identical headers, and agree on a cop
     try std.testing.expect(mismatch(&all) == null);
 }
 
-test "TF_GLM_CHUNK_SOLO: off by default, 2048 or 4096, and every rank must agree (the others take rank 0's solo passes)" {
+test "TF_GLM_CHUNK_SOLO: default grid, all widths and rank agreement" {
     const Reader = struct {
-        fn absent(_: [:0]const u8) ?[]const u8 {
-            return null;
-        }
-        fn on(key: [:0]const u8) ?[]const u8 {
-            return if (std.mem.eql(u8, key, "TF_GLM_CHUNK_SOLO")) "4096" else null;
-        }
-        fn bad(key: [:0]const u8) ?[]const u8 {
-            return if (std.mem.eql(u8, key, "TF_GLM_CHUNK_SOLO")) "1" else null;
+        var value: ?[]const u8 = null;
+        fn get(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_CHUNK_SOLO")) value else null;
         }
     };
     var problem: []const u8 = "";
-    try std.testing.expect(!(try Settings.read(Reader.absent, &problem)).solo);
-    const on = try Settings.read(Reader.on, &problem);
-    try std.testing.expect(on.solo);
-    try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
-    try std.testing.expectEqualStrings("TF_GLM_CHUNK_SOLO: 2048 or 4096", problem);
-    const all = [_]Fingerprint{ Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), @splat(0)), Fingerprint.of(2, 1, on, 8192, true, @splat(0), @splat(0), @splat(0)) };
-    try std.testing.expectEqual(Mismatch{ .field = .solo, .rank = 1 }, mismatch(&all).?);
+    try std.testing.expectEqual(@as(u32, 2048), (try Settings.read(Reader.get, &problem)).solo);
+    for ([_][]const u8{ "2048", "4096", "8192" }, [_]u32{ 2048, 4096, 8192 }) |value, width| {
+        Reader.value = value;
+        const on = try Settings.read(Reader.get, &problem);
+        try std.testing.expectEqual(width, on.solo);
+        var all = [_]Fingerprint{ Fingerprint.of(2, 0, on, 16384, true, @splat(0), @splat(0), @splat(0)), Fingerprint.of(2, 1, on, 16384, true, @splat(0), @splat(0), @splat(0)) };
+        try std.testing.expect(mismatch(&all) == null);
+        for ([_]u32{ 2048, 4096, 8192 }) |other| {
+            all[1].solo = other;
+            if (other != width) try std.testing.expectEqual(Mismatch{ .field = .solo, .rank = 1 }, mismatch(&all).?);
+        }
+    }
+    for ([_][]const u8{ "1", "0", "6144", "16384", "8192 ", "", "-8192" }) |invalid| {
+        Reader.value = invalid;
+        try std.testing.expectError(error.BadSetting, Settings.read(Reader.get, &problem));
+        try std.testing.expectEqualStrings("TF_GLM_CHUNK_SOLO: 2048, 4096 or 8192", problem);
+    }
 }
 
 test "TF_GLM_OVERLAP_PIECES: unset, 8 under TF_GLM_CHUNK_SOLO=4096 with TF_GLM_ROCE_MULTI=1 where the wire opens, else 3; a set value wins" {
