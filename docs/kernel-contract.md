@@ -496,3 +496,11 @@ Only unsplit prompt calls select K32; fused slices retain the parent K64 tile.
 Each new control launches K32 for its output type at small and production row counts.
 `qmmf-prompt-bench` times the 64-row lane, prompt16, the parent K64 tile and K32 on each Flash Next BF16 shape.
 Measured nvcc 13.0 resources cover both K32 entries on sm_120 and sm_121; later compiler receipts remain pending.
+
+GLM's EXL3 prompt replacements (`tf_exl3_prompt_gu_glm`, `tf_exl3_prompt_down_glm` and
+`tf_exl3_prompt_down_slots`) register byte replacements against the retained common prompt kernels.
+The down baseline is scattered into nine-slot rows on the host, including untouched shared slots.
+Cases cover every item size from 1 through 64, multiple items, shared and separate rotations, both activation modes,
+nonfinite inputs and guarded repeats. Constant-weight FP64 stress proves fp16 overflow; BF16 epilogue rounding can
+hide a balanced reduced-precision sum, so that limitation is explicit. Two controls drop the last member or use
+compact output strides. New symbols' compile usage remains pending; see the [port receipt](receipts/glm-exl3-prompt-port.md).
