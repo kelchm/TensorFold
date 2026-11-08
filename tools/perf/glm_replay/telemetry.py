@@ -1,5 +1,7 @@
 """Driver-free post-block window requests and strictly bound sampled telemetry receipts."""
 import hashlib
+import os
+import secrets
 import time
 from pathlib import Path, PurePosixPath
 
@@ -128,8 +130,14 @@ def write_request(spec, root, window):
     validate_window(window)
     path = request_path(spec, root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("xb") as stream:
-        stream.write(canonical_bytes(window) + b"\n")
+    temporary = path.with_name(".glm-window-" + secrets.token_hex(16))
+    stream = temporary.open("xb")
+    try:
+        with stream:
+            stream.write(canonical_bytes(window) + b"\n")
+        os.link(temporary, path, follow_symlinks=False)
+    finally:
+        temporary.unlink(missing_ok=True)
     return path
 
 

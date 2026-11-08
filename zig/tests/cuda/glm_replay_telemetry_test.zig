@@ -103,6 +103,7 @@ test "native post-block delivery writes window once and hashes the bytes actuall
     const parsed = try std.json.parseFromSliceLeaky(t.Window, a, request, .{});
     try t.checkWindow(parsed);
     try std.testing.expectError(error.PathAlreadyExists, t.receive(a, io, ref, w, devices, 0));
+    try std.testing.expectEqualStrings(request, try tmp.dir.readFileAlloc(io, "block.json.window.json", a, .limited(1 << 20)));
     const absent: t.Ref = .{ .path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/missing.json", .{tmp.sub_path}) };
     try std.testing.expectError(error.TelemetryUnavailable, t.receive(a, io, absent, w, devices, 0));
 }

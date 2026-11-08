@@ -56,6 +56,7 @@ pub fn correctness(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Modul
     });
     const run = b.addRunArtifact(b.addTest(.{ .root_module = root }));
     const native = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"replay "} }));
+    run.has_side_effects = true;
     const step = b.step("test-glm-replay-correctness-host", "Adversarial lookahead, full-block evidence and light capture controls without devices");
     step.dependOn(&run.step);
     step.dependOn(&native.step);

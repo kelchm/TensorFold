@@ -154,9 +154,10 @@ pub fn receive(a: std.mem.Allocator, io: std.Io, ref: Ref, window: Window, devic
     try safePath(io, request);
     if (std.fs.path.dirname(request)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
     const raw = try std.json.Stringify.valueAlloc(a, window, .{});
-    const file = try std.Io.Dir.cwd().createFile(io, request, .{ .exclusive = true });
-    defer file.close(io);
-    try file.writeStreamingAll(io, raw);
+    var file = try std.Io.Dir.cwd().createFileAtomic(io, request, .{ .replace = false });
+    defer file.deinit(io);
+    try file.file.writeStreamingAll(io, raw);
+    try file.link(io);
     const start = std.Io.Clock.awake.now(io).toNanoseconds();
     while (true) {
         try safePath(io, ref.path);

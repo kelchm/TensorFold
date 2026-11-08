@@ -1,10 +1,12 @@
 """Actual offline telemetry parser/request tests with planted window, hash and sample failures."""
 import copy
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from tools.perf.glm_replay.common import ReplayError, digest, file_digest, write_json
+from tools.perf.glm_replay.common import ReplayError, canonical_bytes, digest, file_digest, write_json
 from tools.perf.glm_replay.python_provenance import gate_binding, metadata_check
 from tools.perf.glm_replay.telemetry import (
     TELEMETRY_SCHEMA, block_window, reference, validate_telemetry, wait_telemetry, write_request,
@@ -30,6 +32,36 @@ def window_and_samples():
 
 
 class TelemetryTests(unittest.TestCase):
+    def test_window_is_complete_before_atomic_publication_and_temporary_is_removed(self):
+        window, _ = window_and_samples()
+        with tempfile.TemporaryDirectory() as directory:
+            spec = {"path": "blocks/future.json"}
+            expected = canonical_bytes(window) + b"\n"
+            link = os.link
+            def publish(source, destination, **kwargs):
+                self.assertFalse(destination.exists())
+                self.assertEqual(source.read_bytes(), expected)
+                return link(source, destination, **kwargs)
+            with patch("tools.perf.glm_replay.telemetry.os.link", side_effect=publish):
+                request = write_request(spec, directory, window)
+            self.assertEqual(request.read_bytes(), expected)
+            self.assertEqual(list(request.parent.iterdir()), [request])
+
+    def test_atomic_window_publication_preserves_a_racing_writer_and_cleans_temporary(self):
+        window, _ = window_and_samples()
+        with tempfile.TemporaryDirectory() as directory:
+            spec = {"path": "blocks/future.json"}
+            link = os.link
+            def publish(source, destination, **kwargs):
+                destination.write_bytes(b"preserve concurrent writer")
+                return link(source, destination, **kwargs)
+            with patch("tools.perf.glm_replay.telemetry.os.link", side_effect=publish):
+                with self.assertRaises(FileExistsError):
+                    write_request(spec, directory, window)
+            request = Path(directory) / "blocks/future.json.window.json"
+            self.assertEqual(request.read_bytes(), b"preserve concurrent writer")
+            self.assertEqual(list(request.parent.iterdir()), [request])
+
     def test_post_block_request_is_exclusive_and_actual_receipt_hash_is_computed_later(self):
         window, telemetry = window_and_samples()
         with tempfile.TemporaryDirectory() as directory:

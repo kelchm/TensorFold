@@ -74,6 +74,9 @@ before startup; a predeclared telemetry hash is refused. Old metadata v1 is refu
 Explicit checkpoint pins require all four 64-lowercase-hex digests. They are schema-checked
 and bound in preflight before CUDA opens, then compared with actual gathered identities
 on both ranks before inference. Replay alone adds CPU drafter-directory hashing; serving is unchanged.
+On first use this reads the full drafter contents and may add entries to the production digest
+cache in the serving user's home directory on both hosts. Include that untimed IO and those cache
+writes in the coordinator's startup plan. It does not modify the checkpoint or sealed rerun evidence.
 
 Gate schema `glm-replay-native-gate-v1` requires `schema`, `gate`, `status`, `fixture_sha256`,
 `config_sha256`, `binary_sha256`, `completed_ranks`, `comparisons`, `kv_shard`, `runtime_sha256`,
@@ -102,7 +105,8 @@ with inert images supplies no qualified GPU binary or fatbin identity.
 
 Start a separately coordinated telemetry collector before replay. After the observer-off block
 completes and correctness readbacks finish, the runner exclusively writes
-`telemetry.path + ".window.json"`. It then waits at most 30 seconds for the controller's receipt.
+`telemetry.path + ".window.json"`. A complete temporary file is published atomically without
+replacing an existing request. It then waits at most 30 seconds for the controller's receipt.
 The window follows `glm-replay-block-window-v1` in [telemetry.py](telemetry.py): fixture/config/
 schedule/token hashes, arm, canonical source hash, source-inventory file hash, runtime,
 canonical native checkpoint-object hash, IDs, nonce, ordered campaign hash and each actual
@@ -119,6 +123,11 @@ old sessions and reused or colliding paths fail. Paths must be canonical relativ
 with no symlink components. Result and request destinations must be distinct across cases.
 No telemetry scrape or file operation runs inside the timed block. The collector and real
 telemetry remain unrun; host negative controls use explicitly invented samples.
+Retain the source inventory, window request and telemetry alongside JSONL and anchors: the
+source-inventory hash is linked through the window/telemetry and ordered campaign hash rather
+than copied into the JSONL. Offline rank agreement requires the same telemetry hash on both lines;
+the common result validator still does not reopen telemetry files. Native-only logical snapshots
+retain internal byte-digest representations; a future non-native consumer must normalize them first.
 
 ## Measurement boundary
 

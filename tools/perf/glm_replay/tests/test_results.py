@@ -170,6 +170,11 @@ class ResultTests(unittest.TestCase):
         with self.assertRaisesRegex(ReplayError, "runtime_sha256"):
             self.validate()
 
+    def test_both_ranks_must_name_the_same_actual_telemetry_receipt(self):
+        self.records[0]["telemetry_sha256"] = "a" * 64
+        with self.assertRaisesRegex(ReplayError, "rank disagreement: telemetry_sha256"):
+            self.validate()
+
     def test_start_identity_and_counterbalanced_orders(self):
         self.records[2]["start_id"] = self.records[0]["start_id"]
         self.records[3]["start_id"] = self.records[0]["start_id"]

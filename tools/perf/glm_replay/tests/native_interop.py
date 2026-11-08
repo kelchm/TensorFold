@@ -34,13 +34,16 @@ def check(fixture_path, outputs):
     for record in value[2:]:
         record["session_nonce"] = value[0]["session_nonce"]
     negatives.append(value)
+    value = copy.deepcopy(records)
+    value[0]["telemetry_sha256"] = "1" * 64
+    negatives.append(value)
     for value in negatives:
         try:
             validate(value)
         except ReplayError:
             continue
         raise ReplayError("actual formatter negative control was accepted")
-    print("PASS synthetic actual Zig writer/common validator: four records, four rejection controls; device UNRUN")
+    print("PASS synthetic actual Zig writer/common validator: four records, five rejection controls; device UNRUN")
 
 
 if __name__ == "__main__":

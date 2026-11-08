@@ -107,6 +107,8 @@ Both runners require measured sample coverage of actual rank-local realtime wind
 source/runtime/work/session/checkpoint/ID bindings and actual GPU UUIDs; prehashed future
 metadata and stubs fail. See telemetry.py and NATIVE.md for the controller contract.
 The offline common result validator authenticates anchors; it does not reopen telemetry files.
+Both rank records must name the same telemetry_sha256. Retain the source inventory, window and
+telemetry files with the result/anchor artifacts to preserve the complete source-binding chain.
 forwards = [{forward_id,round_id,parts,phases_ns,owner,graph_replays,eager_fallbacks,
 target_commits,context_commits,ingest_calls,proposer_calls,lost}].
 parts EXACTLY equals fixture timed parts, no reorder. target_commits=context_commits=sum(kept),

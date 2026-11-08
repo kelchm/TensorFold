@@ -190,14 +190,14 @@ Future telemetry references contain **only** `{"path":"blocks/cell-block.json"}`
 canonical POSIX paths relative to `--receipts-root`; absolute, escaped, symlinked, reused and
 pre-existing measurement destinations are refused. No future telemetry SHA is predeclared.
 Both rank realtime start/end timestamps are read outside the timed headline; after completion
-the ranks exchange their windows. Rank 0 writes an exclusive `<path>.window.json` request for
+the ranks exchange their windows. Rank 0 atomically publishes an exclusive `<path>.window.json` request for
 a future external controller. Only then does each rank wait (30 seconds, at most 60 via API),
 read actual telemetry, compute its file-byte SHA and agree that SHA across ranks.
 
 `telemetry.py` is a pure host parser with no device imports. Its API is:
 
 - `block_window(bindings, ids, ranks, session_nonce, campaign_sha256, checkpoints)` validates a request.
-- `reference(spec, root)` validates a path-only future reference; `write_request(spec, root, window)` writes exclusively.
+- `reference(spec, root)` validates a future path; `write_request(spec, root, window)` atomically publishes without replacement.
 - `validate_telemetry(value, window)` rechecks the typed payload and coverage.
 - `wait_telemetry(spec, root, window, timeout_s=30, expected_sha256=None)` returns `(value, computed_file_sha256)`;
   an optional known SHA is checked only for later offline authentication.

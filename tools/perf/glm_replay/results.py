@@ -209,7 +209,7 @@ def _rank_agreement(group):
     left, right = sorted(group, key=lambda r: r["rank"])
     keys = ("fixture_sha256 schedule_sha256 tokens_sha256 config_sha256 run_id pair_id start_id start_order "
             "block_id cell_id arm status exclusion_reason source effective_config effective_config_sha256 checks timing_source "
-            "session_nonce campaign_sha256 checkpoints")
+            "session_nonce campaign_sha256 checkpoints telemetry_sha256")
     for key in keys.split():
         require(digest(left[key]) == digest(right[key]), f"rank disagreement: {key}")
     require(len(left["forwards"]) == len(right["forwards"]), "rank schedule completion disagreement")
