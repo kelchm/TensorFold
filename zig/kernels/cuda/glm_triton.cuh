@@ -4,6 +4,8 @@
 #include <cuda_bf16.h>
 #include <stdint.h>
 
+#include "common/qmm_frag.cuh"
+
 namespace glm_triton {
 
 __device__ __forceinline__ float bf(__nv_bfloat16 v) { return __bfloat162float(v); }
@@ -56,5 +58,10 @@ __device__ __forceinline__ float block_sum(float acc, float* smem) {
   __syncthreads();
   return r;
 }
+
+// Dependent launch (sm_90 on): every thread waits before it touches another grid's data or exits; earlier grids done.
+__device__ __forceinline__ void pdl_wait() { qmm_frag::grid_wait(); }
+// The next grid may launch now; it too waits before it touches anything of ours.
+__device__ __forceinline__ void pdl_trigger() { qmm_frag::grid_launch(); }
 
 }  // namespace glm_triton

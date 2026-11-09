@@ -71,6 +71,9 @@ extern "C" __global__ void __launch_bounds__(32)
     tf_glm_topk(const float* logits, const float* bias, int* pick, float* wts, float scale, int ne, int top_k,
                 int norm) {
   constexpr int MAXE = 16;  // 512 experts a row
+  // Dependent launch (decode windows): the logits are an earlier grid's, so the wait comes first.
+  pdl_wait();
+  pdl_trigger();
   const int64_t r = blockIdx.x;
   const int lane = threadIdx.x;
   float score[MAXE], choice[MAXE];

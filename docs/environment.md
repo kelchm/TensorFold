@@ -82,3 +82,8 @@ profile and agreed in every rank's fingerprint. See the [experiment and pending 
 
 `TF_GLM_HC_FUSE` accepts `0` or `1` with the same checks and scope; unset or blank keeps it off.
 `1` has a prompt call's `hc_post` (64 rows or more) also compute the next site's `hc_pre` partials from the streams it just wrote (`tf_glm_hc_post_partial`), so those streams are not read back: 128 MiB less traffic a site at 4,096 rows. The last layer's `hc_post` and decode windows are unchanged. Every byte stays the same, so it is registered as identical and the ranks need not agree; device qualification is pending.
+## GLM CUDA decode launches
+
+These switches change only how a decode window's kernels are scheduled; every output keeps its bytes. GLM checks each before rank placement, NCCL or weights, and other CUDA families do not check this scope. They stay out of the ranks' fingerprint: each rank's own launches, no collective among them.
+
+`TF_GLM_PDL_CHAIN` launches more kernels as programmatic dependents beside glm_mm's own matmuls (`TF_GLM_PDL`). Unset, blank or `1` takes all three parts; `0` none; otherwise name the parts in this order, comma-separated: `reduce` (glm_mm's K-slice reduce after its matmul), `hc` (a decode window's `tf_glm_hc_post`, `tf_glm_hc_partial8` and `tf_glm_hc_finish`), `moe` (a decode window's router slice sums and top-k pick, which `tf_glm_router_tile` lets launch early). Each such kernel loads only immutable weights before `griddepcontrol.wait` and touches another grid's data only after it, so overlap never changes a value. `TF_GLM_PDL=0` turns these off with glm_mm's own.

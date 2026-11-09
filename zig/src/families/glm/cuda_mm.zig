@@ -36,6 +36,32 @@ pub const Packed = struct {
     }
 };
 
+/// TF_GLM_PDL_CHAIN: dependent launches past glm_mm's own; each waits before it touches another grid's data or exits.
+pub const Chain = struct {
+    reduce: bool = false, // glm_mm_reduce launches as its matmul's dependent
+    hc: bool = false, // a decode window's hc_post, hc_partial8 and hc_finish (cuda_glue)
+    moe: bool = false, // a decode window's router sums and top-k pick; tf_glm_router_tile lets them launch (cuda_glue)
+
+    pub const all: Chain = .{ .reduce = true, .hc = true, .moe = true };
+    /// What TF_GLM_PDL_CHAIN takes (environment.zig's words): word i below 8 names the parts of bit mask i, then "1".
+    pub const words = [_][]const u8{ "0", "reduce", "hc", "reduce,hc", "moe", "reduce,moe", "hc,moe", "reduce,hc,moe", "1" };
+
+    /// The chain words[i] names.
+    pub fn of(i: usize) Chain {
+        return if (i >= 8) all else .{ .reduce = i & 1 != 0, .hc = i & 2 != 0, .moe = i & 4 != 0 };
+    }
+
+    pub fn parse(v: []const u8) ?Chain {
+        for (words, 0..) |w, i| if (std.mem.eql(u8, v, w)) return of(i);
+        return null;
+    }
+
+    /// The process's chain: unset or blank all; a value startup refuses (a direct caller's) none.
+    pub fn read() Chain {
+        return of(@import("sys").environment.read(usize, "TF_GLM_PDL_CHAIN", 8) catch return .{});
+    }
+};
+
 /// glm_mm's bf16 kernels by row bucket, the K-slice reduce and the tiling.
 pub const Kernels = struct {
     by_rows: [4]cuda.Function, // bf16: 16, 32, 64, 128 rows a block
@@ -47,6 +73,7 @@ pub const Kernels = struct {
     tile_packed: [3]cuda.Function, // glm_mm_tile4/6/8: packed rows and their scales into the tiles
     prompt_fixed_k: bool = false, // opt-in prompt experiment; never selected from the number of batched rows
     pdl: bool, // dependent launches: a matmul's weights stream in while the kernel before it finishes
+    chain: Chain = .{}, // TF_GLM_PDL_CHAIN: the dependent launches past glm_mm's own (none unless load reads them)
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = .{ .by_rows = undefined, .packed_rows = undefined, .packed_prompt = undefined, .tile_packed = undefined, .prompt = try m.function("glm_mm16_rows"), .reduce = try m.function("glm_mm_reduce"), .tile = try m.function("glm_mm_tile16"), .pdl = true };
@@ -65,6 +92,7 @@ pub const Kernels = struct {
         }
         try k.prompt.allowDynamicShared(smem(128));
         if (std.c.getenv("TF_GLM_PDL")) |v| k.pdl = !std.mem.eql(u8, std.mem.span(v), "0");
+        k.chain = if (k.pdl) Chain.read() else .{}; // TF_GLM_PDL=0: none past glm_mm's either
         return k;
     }
 };
@@ -146,7 +174,8 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
             r.add(@as(c_longlong, @intCast(total)));
             r.add(@as(c_int, @intCast(sk)));
             r.add(@as(c_int, @intFromBool(wide)));
-            try cuda.launch.launch(k.reduce, .{ .grid = .{ .x = @intCast((total + 255) / 256) }, .block = .{ .x = 256 } }, s, &r);
+            // with chain.reduce it may start while the matmul runs: it waits for it before it reads `part`
+            try cuda.launch.launch(k.reduce, .{ .grid = .{ .x = @intCast((total + 255) / 256) }, .block = .{ .x = 256 }, .pdl = k.chain.reduce }, s, &r);
         }
         done += rows;
     }
