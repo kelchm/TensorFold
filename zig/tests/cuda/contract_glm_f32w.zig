@@ -79,6 +79,8 @@ pub const F32w = struct {
     ptrs: [9]u64 = @splat(0), // norm: x, gamma, y, xs; hc: x, part, base, scale, gamma, y, xs, post, comb
     width: usize = d,
     baseline: ?cuda.Function = null,
+    bf16: bool = false, // the kernel reads a bf16 norm weight (the BF16 entries and the bf16 split)
+    split: bool = false, // tf_glm_hc_finish(_f32w)_split against the one-warp kernel it replaces
     baseline_ptrs: [9]u64 = @splat(0),
     baseline_output: u64 = 0,
     bf16_gamma: bool = false, // gate 3's control: the weight uploaded as bf16 values, as a bf16-weight kernel reads it
@@ -95,7 +97,10 @@ pub const F32w = struct {
 
     pub fn kernel(self: *F32w) g.Kernel {
         var declared = specWidth(self.which, self.width);
-        if (self.baseline != null) {
+        if (self.split) {
+            declared.name = splitName(self.which, self.bf16);
+            declared.replaces = if (self.bf16) "tf_glm_hc_finish" else "tf_glm_hc_finish_f32w";
+        } else if (self.baseline != null) {
             declared.name = bf16Name(self.which, self.width);
             declared.replaces = "main 958efa3bf GLM BF16 norm, frozen in the contract controls";
         }
@@ -122,7 +127,7 @@ pub const F32w = struct {
         const exact = self.which == .norm_sums or self.which == .hc_sums;
         var in = try ref.fillWidth(self.arena.allocator(), self.hc(), self.width, shape.rows, fill, seed, exact);
         if (self.bf16_gamma) ref.narrowControl(&in);
-        if (self.baseline != null) {
+        if (self.bf16) {
             for (in.gamma) |*v| v.* = @floatCast(ref.bf(v.*));
         }
         self.in = in;
@@ -132,7 +137,7 @@ pub const F32w = struct {
         const xs = if (exact) try r.output(n * (self.width / 64) * 4) else if (self.hc()) try r.scratch(n * (self.width / 64) * 4) else 0;
         const x = try r.input(std.mem.sliceAsBytes(in.x));
         const gamma = if (self.bf16_gamma) try narrowed(self.arena.allocator(), in.gamma) else in.gamma;
-        const gm = if (self.baseline != null) blk: {
+        const gm = if (self.bf16) blk: {
             const bits = try self.arena.allocator().alloc(u16, gamma.len);
             for (bits, gamma) |*v, xw| v.* = c.toBf16(xw);
             break :blk try r.input(std.mem.sliceAsBytes(bits));
@@ -229,6 +234,41 @@ pub const F32w = struct {
         return self.outputs(.{ .acc = acc, .order = order }, out, mag);
     }
 };
+
+/// The split finishes (bf16 and float32 weights), each output against the one-warp kernel's bytes on the same inputs.
+pub const Splits = struct {
+    items: [8]F32w,
+
+    pub fn init(rig: rig_.Rig, m: cuda.Module) !Splits {
+        var out: Splits = undefined;
+        for (0..2) |w| for ([_]Which{ .hc_y, .hc_sums, .hc_post, .hc_comb }, 0..) |which, i| {
+            const bf16 = w == 0;
+            var x: F32w = .init(rig, which, try m.function(if (bf16) "tf_glm_hc_finish_split" else "tf_glm_hc_finish_f32w_split"));
+            x.baseline = try m.function(if (bf16) "tf_glm_hc_finish" else "tf_glm_hc_finish_f32w");
+            x.bf16 = bf16;
+            x.split = true;
+            out.items[w * 4 + i] = x;
+        };
+        return out;
+    }
+
+    pub fn append(self: *Splits, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel)) !void {
+        for (&self.items) |*x| try list.append(a, x.kernel());
+    }
+
+    pub fn deinit(self: *Splits) void {
+        for (&self.items) |*x| x.deinit();
+    }
+};
+
+fn splitName(w: Which, bf16: bool) []const u8 {
+    return switch (w) {
+        .hc_y => if (bf16) "cuda glm hc_finish_split normed rows" else "cuda glm hc_finish_f32w_split normed rows",
+        .hc_sums => if (bf16) "cuda glm hc_finish_split 64-sums" else "cuda glm hc_finish_f32w_split 64-sums",
+        .hc_post => if (bf16) "cuda glm hc_finish_split post" else "cuda glm hc_finish_f32w_split post",
+        else => if (bf16) "cuda glm hc_finish_split comb" else "cuda glm hc_finish_f32w_split comb",
+    };
+}
 
 /// BF16 kernels changed only by the template refactor: each output is compared with the frozen old entrypoint.
 pub const Bf16Entry = struct { which: Which, width: usize, symbol: [:0]const u8, old: [:0]const u8 };

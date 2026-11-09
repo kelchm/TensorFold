@@ -151,7 +151,9 @@ test "GLM FP8 KV: an FP8 cache takes no page table, so its writes and reads refu
     var d: cuda.Driver = undefined;
     d.api.cuLaunchKernel = Launch.run;
     var ks: glue.Kernels = undefined;
-    inline for (@typeInfo(glue.Kernels).@"struct".field_names) |name| @field(ks, name) = .{ .d = &d, .handle = @ptrFromInt(10) };
+    inline for (@typeInfo(glue.Kernels).@"struct".field_names) |name| if (@FieldType(glue.Kernels, name) == cuda.Function) {
+        @field(ks, name) = .{ .d = &d, .handle = @ptrFromInt(10) };
+    };
     const set: glue.Set = .{ .glue = &ks };
     const stream: cuda.Stream = .{ .d = &d, .handle = null };
     const paged: latent.Table = .{ .pt = 900, .ps = 6_684_672, .page_rows = 6_528 };
@@ -190,7 +192,9 @@ test "GLM FP8 KV: actual DSA dense and sparse passes retain the sequence-owned s
     d.api.cuLaunchKernel = Launch.run;
     d.api.cuModuleGetFunction = Ops.function;
     var ks: glue.Kernels = undefined;
-    inline for (@typeInfo(glue.Kernels).@"struct".field_names) |name| @field(ks, name) = .{ .d = &d, .handle = @ptrFromInt(10) };
+    inline for (@typeInfo(glue.Kernels).@"struct".field_names) |name| if (@FieldType(glue.Kernels, name) == cuda.Function) {
+        @field(ks, name) = .{ .d = &d, .handle = @ptrFromInt(10) };
+    };
     ks.lat_write_fp8.handle = @ptrFromInt(2);
     ks.chunks_16_fp8.handle = @ptrFromInt(4);
     ks.merge.handle = @ptrFromInt(7);
@@ -236,7 +240,9 @@ test "GLM KV host: a prompt MTP chunk's pooled keys take their own page stride, 
     d.api.cuLaunchKernel = Launch.run;
     d.api.cuModuleGetFunction = Ops.function;
     var ks: glue.Kernels = undefined;
-    inline for (@typeInfo(glue.Kernels).@"struct".field_names) |name| @field(ks, name) = .{ .d = &d, .handle = @ptrFromInt(10) };
+    inline for (@typeInfo(glue.Kernels).@"struct".field_names) |name| if (@FieldType(glue.Kernels, name) == cuda.Function) {
+        @field(ks, name) = .{ .d = &d, .handle = @ptrFromInt(10) };
+    };
     ks.lat_write.handle = @ptrFromInt(1);
     ks.pool_keys.handle = @ptrFromInt(8);
     ks.scores.handle = @ptrFromInt(9);

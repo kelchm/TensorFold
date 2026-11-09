@@ -20,8 +20,9 @@ fn registered(fault: bool) !void {
     var d: cuda.Driver = undefined;
     var ctx: cuda.Context = undefined;
     var functions: glm.glue.Kernels = undefined;
-    inline for (@typeInfo(glm.glue.Kernels).@"struct".field_names) |name|
+    inline for (@typeInfo(glm.glue.Kernels).@"struct".field_names) |name| if (@FieldType(glm.glue.Kernels, name) == cuda.Function) {
         @field(functions, name) = .{ .d = &d, .handle = null };
+    };
     const gpu: check.Gpu = .{ .d = &d, .ctx = &ctx, .gpa = t.allocator, .io = t.io };
     const stream: cuda.Stream = .{ .d = &d, .handle = null };
     var controls = Controls.init(gpu, stream, functions, .{ .d = &d, .handle = null }, null);

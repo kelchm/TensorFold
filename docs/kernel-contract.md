@@ -289,6 +289,8 @@ reduce-scatter's `tf_rank_sum`, GLM-5.3-Flash's float32 norm weight forms `tf_gl
 64-sums) and `tf_glm_hc_finish_f32w` (its normed rows, 64-sums, post and Sinkhorn comb), and the activation rows in
 MLX's bf16 steps (GeGLU, and SwiGLU as DFlash drafters round it; twelve controls, each dropping one rounding point;
 their 64-value sums bit-equal to the fp32 tree).
+CUDA also checks GLM-5.3-Flash's split hc_pre finish (`tf_glm_hc_finish_split`, `_f32w_split`): each of the four outputs
+bit-equal to `tf_glm_hc_finish` and `_f32w` on the same inputs; compile receipts pending.
 CUDA also checks the MLX affine token rows (4 bits, and 2 to 6 or 8 bits times a bf16 scale, each
 output bit-equal to float64 at its rounding points; two controls, one dropping the rounding point, one folding the scale
 into the group's scale and bias).
