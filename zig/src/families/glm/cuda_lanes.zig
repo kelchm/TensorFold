@@ -31,7 +31,7 @@ const Lane = struct {
 pub const Lanes = struct {
     x: follow.Leader,
     whole: bool = false, // prompt passes run whole (TF_GLM_PROMPT_STEPS=0): no other stream's round between chunks
-    alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
+    alone: bool = false, budgets: bool = true, // TF_GLM_SHARED=0: windows alone; TF_GLM_SHARED_BUDGETS=0: grant + slack
     mtp_confidence: ?f64 = null, // --mtp-confidence: the MTP head's chains stop where their chance falls under it
     copy_confidence: bool = false, // copy mode keeps head confidence in probabilities so target copies stay priced
     shared: u64 = 0, // forwards that held several streams' windows (checks read it)
@@ -98,7 +98,7 @@ pub const Lanes = struct {
         const block = self.x.e.drafter != null;
         const sharing = drafting and !self.alone;
         return .{
-            .allocate_shared_drafts = drafting,
+            .allocate_shared_drafts = drafting and self.budgets,
             .exact_width = if (drafting) max_rows else 1,
             .first_copy_rows = mtp_rows, // a first copy as wide as a head round; it grows as its tokens land
             .gpu_tokens = false,
