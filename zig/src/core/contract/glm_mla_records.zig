@@ -9,7 +9,7 @@ pub const records = blk: {
         }
     }
     break :blk out;
-} ++ chunks ++ mma;
+} ++ chunks ++ fused ++ mma;
 
 const mma = blk: {
     var out: [4]registry.CudaRecord = undefined;
@@ -29,6 +29,17 @@ const chunks = blk: {
     for ([_]u32{ 16, 32 }, 0..) |hb, i| {
         const symbol = @import("std").fmt.comptimePrint("tf_glm_chunks_{d}", .{hb});
         out[i] = .{ .launch = .{ .name = "glm_glue " ++ symbol, .symbol = symbol, .image = "glm_glue", .threads = 256, .dynamic = if (hb == 32) 101120 else 83328, .opt_in = true, .min_sm = 80 }, .usage = registry.none };
+    }
+    break :blk out;
+};
+
+const fused = blk: {
+    var out: [4]registry.CudaRecord = undefined;
+    for ([_]u32{ 16, 32 }, 0..) |hb, i| {
+        for ([_][]const u8{ "", "_fp8" }, 0..) |form, j| {
+            const symbol = @import("std").fmt.comptimePrint("tf_glm_chunks_{d}{s}_fused", .{ hb, form });
+            out[i * 2 + j] = .{ .launch = .{ .name = "glm_glue " ++ symbol, .symbol = symbol, .image = "glm_glue", .threads = 256, .dynamic = if (hb == 32) 101120 else 83328, .opt_in = true, .min_sm = 80 }, .usage = registry.none };
+        }
     }
     break :blk out;
 };

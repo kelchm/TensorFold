@@ -1,6 +1,6 @@
 # GLM CUDA prompt MLA experiment
 
-This branch adapts MiaAI-Lab's engine patches 0005, 0011 and 0041 from
+This branch adapts MiaAI-Lab's engine patches 0005, 0011, 0041 and 0068 from
 `GLM-5.3-Flash-DGX-Sparks-1104@13f2464` to `e6f522d05`.
 The target is GLM-5.3-Flash on two GB10s (sm_121), TP=2, with FP8 KV.
 There is no local CUDA device or nvcc; device correctness, compiler resources,
@@ -11,6 +11,8 @@ with the current tile's math. Conversion, FP32 row scaling and BF16 rounding sta
 unchanged. This replacement is default-on whenever FP8 KV is selected.
 Both chunk widths require exactly 256 threads and trap on another block width.
 The BF16 attention arithmetic also stays unchanged.
+
+A sparse call whose chunk partials would not fit its buffers (`latent.fuses`) runs `tf_glm_chunks_{16,32}{,_fp8}_fused` instead of the chunk kernel and `tf_glm_merge`. Each block (row, head block) computes the row's chunks in order with the chunk kernel's own code (`chunk_softmax`), then folds each into its running o, m and l with `tf_glm_merge`'s operations in its order, so the output bytes are unchanged and no FP32 partials are written. Count-0 rows stay untouched, as with the merge. Prompt buffers now size their partials for dense calls only, so a sparse prompt call wider than they hold merges in the kernel; with 32 heads a rank and a context of at least 2,560, that frees 867.375 MiB of partials at 4,096 rows and 1,895.375 MiB at 8,192. Dense passes and decode windows keep the chunk kernels and the merge. This is default-on and needs no setting.
 
 `TF_GLM_ABSORB_MMA=1` selects the source patch's head-batched BF16 tensor-core
 GEMMs for a prompt's aligned absorb_q and expand_v calls at 64 or more rows.
@@ -35,6 +37,8 @@ exceptional inputs. Code-pair swap controls must fail the shapes gate.
 The softmax fixture does not prove accumulator precision; gate 4 states that
 limitation explicitly.
 
+The four fused kernels register as byte replacements of the sparse chunk kernel then `tf_glm_merge`, with BF16 and E4M3 rows at both head widths, an empty row and planted NaN and infinity inputs. Gate 4 replays their sums against the FP64 attention reference. Controls that leave out a row's last chunk must fail the shapes gate. `tf-cuda-test glm-ref` also compares fused and unfused calls byte for byte at 1, 16, 70 and 300 rows with counts from 0 to 2,051.
+
 Absorb and expand register separately against independent FP64 head projections,
 with SIMT entries on the same fixtures. The fixture distinguishes FP16/BF16 sums
 in all three reduction orders. Next-head weight controls must fail gate 3.
@@ -48,8 +52,8 @@ reused as evidence for the changed source.
    `-Dsm=80,86,89,120,121`, then rederive records with
    `tf-cuda-test kernel-contract-limits zig-out/fatbin`. Record the nvcc release,
    register usage, spills and shared-memory limits, including sm_121.
-2. Run the complete CUDA kernel contract, retaining its SUMMARY and planted-control
-   results. Check the frozen-reader byte replacements and both FP64 projection
+2. Run the complete CUDA kernel contract and `tf-cuda-test glm-ref`, retaining its SUMMARY and planted-control
+   results. Check the frozen-reader and fused-merge byte replacements and both FP64 projection
    classes. Compare MMA and SIMT RMS and worst per-column FP64 errors separately;
    require no worse native error before qualifying the arithmetic opt-in.
 3. At TP=2 with FP8 KV, compare unset and `=0` against the base for chunk partials,

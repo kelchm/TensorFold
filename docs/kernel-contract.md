@@ -368,7 +368,8 @@ CUDA also checks GLM-5.3-Flash's KV page kernels on a page table out of order: t
 sparse). Its prompt indexer (`tf_glm_index_scores`, `tf_glm_index_pools`) is bit-equal to `tf_glm_scores` and
 `tf_glm_select_rows`, and its decode select at a 1,024-thread block a row (`tf_glm_select_rows_wide`) to
 `tf_glm_select_rows`; both stated rules rank any NaN above +inf, as the GPU's `s + 0` makes every NaN one
-positive NaN.
+positive NaN. The sparse chunks with their merge in the kernel (`tf_glm_chunks_{16,32}{,_fp8}_fused`) are bit-equal
+to the chunk kernels then `tf_glm_merge`.
 CUDA also checks `TF_GLM_KV_HOST`'s gather (`tf_glm_kvh_*` in `glm_ops.cu`, launched by `cuda_kv_host.zig`): the
 marks (a slot for each distinct pick; past its slots, the call flagged and no row left marked), the picked rows into
 their slots from host pages or the layer's row cache, the token lists' slots, the marks cleared, the dense rows through
