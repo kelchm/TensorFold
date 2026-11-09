@@ -426,6 +426,21 @@ extern "C" __global__ void __launch_bounds__(256) tf_glm_kda_step(
     step_kernel_body<8, 16>(H, state_in, q_in, k_save, v_save, g_save, b_save, rows, y_out, state_out);
 }
 
+// The same step with 4 and 2 warps a block: each warp keeps its 4 value rows and arithmetic, so the same bits.
+extern "C" __global__ void __launch_bounds__(128) tf_glm_kda_step4(
+        int H, const float* __restrict__ state_in, const float* __restrict__ q_in, const float* __restrict__ k_save,
+        const __nv_bfloat16* __restrict__ v_save, const float* __restrict__ g_save, const float* __restrict__ b_save,
+        int rows, __nv_bfloat16* __restrict__ y_out, float* __restrict__ state_out) {
+    step_kernel_body<4, 16>(H, state_in, q_in, k_save, v_save, g_save, b_save, rows, y_out, state_out);
+}
+
+extern "C" __global__ void __launch_bounds__(64) tf_glm_kda_step2(
+        int H, const float* __restrict__ state_in, const float* __restrict__ q_in, const float* __restrict__ k_save,
+        const __nv_bfloat16* __restrict__ v_save, const float* __restrict__ g_save, const float* __restrict__ b_save,
+        int rows, __nv_bfloat16* __restrict__ y_out, float* __restrict__ state_out) {
+    step_kernel_body<2, 16>(H, state_in, q_in, k_save, v_save, g_save, b_save, rows, y_out, state_out);
+}
+
 extern "C" __global__ void __launch_bounds__(128) tf_glm_kda_out(
         int H, const __nv_bfloat16* __restrict__ y_in, const __nv_bfloat16* __restrict__ G, int g_stride,
         const __nv_bfloat16* __restrict__ norm_w, float eps, __nv_bfloat16* __restrict__ out) {

@@ -15,14 +15,28 @@ pub const Kernels = struct {
     replay_layers: cuda.Function,
     prep: cuda.Function,
     step: cuda.Function,
+    step4: cuda.Function, // the step with 4 and 2 warps a block: the same bits, more blocks for small windows
+    step2: cuda.Function,
     out: cuda.Function,
+    step_warps: u32 = 0, // TF_GLM_KDA_STEP_WARPS: 0 (auto) by rows (stepWarps); 8, 4 or 2 at every row count
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
-        inline for (.{ "chain", "replay", "replay_layers", "prep", "step", "out" }) |name| @field(k, name) = try m.function("tf_glm_kda_" ++ name);
+        inline for (.{ "chain", "replay", "replay_layers", "prep", "step", "step4", "step2", "out" }) |name| @field(k, name) = try m.function("tf_glm_kda_" ++ name);
+        k.step_warps = stepWarpsSetting(@import("sys").environment.read(usize, "TF_GLM_KDA_STEP_WARPS", 0) catch 0);
         return k;
     }
 };
+
+/// Warps a step block takes by the window's rows: 2 for one row, 4 to 8 rows, 8 past that and for prompt chunks.
+pub fn stepWarps(rows: usize) u32 {
+    return if (rows == 1) 2 else if (rows <= 8) 4 else 8;
+}
+
+/// TF_GLM_KDA_STEP_WARPS' word (auto, 8, 4, 2) as warps; 0 is auto. No bit depends on it.
+pub fn stepWarpsSetting(word: usize) u32 {
+    return ([_]u32{ 0, 8, 4, 2 })[@min(word, 3)];
+}
 
 /// One layer's chain inputs, `heads` heads: p rows [q|k|v|f_a|g_a|...] (beta at `b_off`), decay and gate rows, states.
 pub const Chain = struct {
@@ -50,7 +64,7 @@ pub const Saves = struct { out: u64, state_out: u64, k: u64, v: u64, g: u64, b: 
 /// The three-kernel chain's scratch: q fp32 and the read-out bf16, [rows][heads][128] each.
 pub const Wide = struct { q: u64, y: u64 };
 
-/// kda.chain: `rows` rows through the fused kernel, or with `wide` through prep, step and out (WARPS 8, TR 16).
+/// kda.chain: `rows` rows through the fused kernel, or with `wide` through prep, step (by stepWarps, TR 16) and out.
 pub fn chain(ks: *const Kernels, stream: cuda.Stream, c: Chain, rows: usize, s: Saves, wide: ?Wide) !void {
     const h: c_int = @intCast(c.heads);
     if (wide) |w| {
@@ -72,7 +86,13 @@ pub fn chain(ks: *const Kernels, stream: cuda.Stream, c: Chain, rows: usize, s: 
         b.add(@as(c_int, @intCast(rows)));
         b.add(w.y);
         b.add(s.state_out);
-        try cuda.launch.launch(ks.step, .{ .grid = .{ .x = @intCast(c.heads), .y = dv / 4 / 8 }, .block = .{ .x = 8 * 32 } }, stream, &b);
+        const wp: u32 = if (ks.step_warps != 0) ks.step_warps else stepWarps(rows);
+        const f = switch (wp) {
+            2 => ks.step2,
+            4 => ks.step4,
+            else => ks.step,
+        };
+        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(c.heads), .y = dv / 4 / wp }, .block = .{ .x = wp * 32 } }, stream, &b);
         var o: cuda.Args = .{};
         o.add(h);
         o.add(w.y);
@@ -112,4 +132,13 @@ pub fn replay(ks: *const Kernels, stream: cuda.Stream, state_in: u64, k: u64, v:
 
 test "the three-kernel chain's step grid is the Python family's" {
     try std.testing.expectEqual(@as(u32, 4), dv / 4 / 8); // DV / 4 / WARPS value rows a block, 8 warps of 4 rows
+}
+
+test "a step's warps by rows: 2 for one row, 4 to 8 rows, 8 past that; every grid covers the value rows" {
+    try std.testing.expectEqual(@as(u32, 2), stepWarps(1));
+    for ([_]usize{ 2, 3, 4, 8 }) |r| try std.testing.expectEqual(@as(u32, 4), stepWarps(r));
+    for ([_]usize{ 9, 16, 32, 64, 2048 }) |r| try std.testing.expectEqual(@as(u32, 8), stepWarps(r));
+    for ([_]u32{ 2, 4, 8 }) |wp| try std.testing.expectEqual(@as(u32, dv), dv / 4 / wp * wp * 4);
+    try std.testing.expectEqual([4]u32{ 0, 8, 4, 2 }, .{ stepWarpsSetting(0), stepWarpsSetting(1), stepWarpsSetting(2), stepWarpsSetting(3) });
+    try std.testing.expectEqualSlices([]const u8, &.{ "auto", "8", "4", "2" }, @import("sys").environment.rule("TF_GLM_KDA_STEP_WARPS").words);
 }

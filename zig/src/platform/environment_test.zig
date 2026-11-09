@@ -48,6 +48,8 @@ const valid = [_]Case{
     .{ .name = "TF_GLM_ABSORB_MMA", .raw = "1", .n = 1 },
     .{ .name = "TF_GLM_EXL3_BF16_SLOTS", .raw = "1", .n = 1 },
     .{ .name = "TF_GLM_HC_FUSE", .raw = "1", .n = 1 },
+    .{ .name = "TF_GLM_KDA_STEP_WARPS", .raw = "auto", .n = 0 },
+    .{ .name = "TF_GLM_KDA_STEP_WARPS", .raw = "2", .n = 3 },
     .{ .name = "TF_GLM_PDL_CHAIN", .raw = "1", .n = 8 },
     .{ .name = "TF_GLM_PDL_CHAIN", .raw = " reduce,moe ", .n = 5 },
     .{ .name = "TF_CUDA_DEVICE", .raw = "4294967295", .n = std.math.maxInt(u32) },
