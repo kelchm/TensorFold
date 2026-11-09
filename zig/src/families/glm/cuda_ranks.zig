@@ -30,6 +30,7 @@ pub const Settings = struct {
     kv_host: u8 = 0, // TF_GLM_KV_HOST=1: KV pages in host memory (1); with TF_GLM_KV_HOST_SHARED=1, one copy a host (2)
     kv_host_gib: f64 = 0, // TF_GLM_KV_HOST_GIB: the host pages' GiB (0: one full window)
     l2pf: l2pf.Options = .{}, // TF_GLM_L2PF and its knobs: a decode window's next weights read into L2 beside it
+    greedy_rows: bool = true, // TF_GLM_GREEDY_ROWS: 1 (a window's greedy rows in one launch and gather) or 0 (a row each)
 
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
@@ -137,6 +138,10 @@ pub const Settings = struct {
             problem.* = "TF_GLM_ABSORB_MMA: 0 or 1";
             return error.BadSetting;
         };
+        s.greedy_rows = @import("sys").environment.value(bool, "TF_GLM_GREEDY_ROWS", get("TF_GLM_GREEDY_ROWS"), true) catch {
+            problem.* = "TF_GLM_GREEDY_ROWS: 0 or 1";
+            return error.BadSetting;
+        };
         s.heat = heat.bandsFrom(get("TF_HEAT_HIGH"), get("TF_HEAT_LOW")) catch {
             problem.* = "TF_HEAT_HIGH and TF_HEAT_LOW: both or neither, in degrees, with low at or under high";
             return error.BadSetting;
@@ -207,7 +212,7 @@ fn wireOpens(get: *const fn ([:0]const u8) ?[]const u8) bool {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 21, // solo is a row count, including the index ring's width
+    layout: u32 = 22, // a window's greedy gathers (TF_GLM_GREEDY_ROWS) are part of the ranks' agreement
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -232,6 +237,7 @@ pub const Fingerprint = extern struct {
     l2pf: [4]u32 = @splat(0), // TF_GLM_L2PF's words: every rank prefetches alike, so none waits on a slower one's windows
     bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
     numerics: u32 = 0,
+    greedy_rows: u32 = 1, // TF_GLM_GREEDY_ROWS: every rank gathers a window's greedy picks at once, or a row at a time
     capacity: u64, // tokens a sequence holds
     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
     heat_low: f64,
@@ -266,6 +272,7 @@ pub const Fingerprint = extern struct {
         l2pf,
         bits,
         numerics,
+        greedy_rows,
         capacity,
         heat_high,
         heat_low,
@@ -306,6 +313,7 @@ pub const Fingerprint = extern struct {
             .l2pf = s.l2pf.words(),
             .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
             .numerics = s.numerics.bits(),
+            .greedy_rows = @intFromBool(s.greedy_rows),
             .capacity = capacity,
             .heat_high = if (s.heat) |b| b.high_c else 0,
             .heat_low = if (s.heat) |b| b.low_c else 0,
@@ -348,6 +356,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "l2pf",
             "bits",
             "numerics",
+            "greedy_rows",
             "capacity",
             "heat_high",
             "heat_low",
@@ -472,6 +481,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .l2pf => "TF_GLM_L2PF, _MB, _CTAS or _PACE_GBPS",
         .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
         .numerics => "TF_GLM_ABSORB_MMA",
+        .greedy_rows => "TF_GLM_GREEDY_ROWS",
         .capacity => "the sequence capacity (the context)",
         .heat_high => "TF_HEAT_HIGH",
         .heat_low => "TF_HEAT_LOW",

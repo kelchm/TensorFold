@@ -505,3 +505,5 @@ Cases cover every item size from 1 through 64, multiple items, shared and separa
 nonfinite inputs and guarded repeats. Constant-weight FP64 stress proves fp16 overflow; BF16 epilogue rounding can
 hide a balanced reduced-precision sum, so that limitation is explicit. Two controls drop the last member or use
 compact output strides. New symbols' compile usage remains pending; see the [port receipt](receipts/glm-exl3-prompt-port.md).
+
+GLM's `tf_glm_top1_rows` runs `tf_glm_top1`'s body once a block, a block a logits row, so a window's greedy rows take one launch. It registers as a byte replacement of `tf_glm_top1` launched a row at a time on the same logits: each row's value and id words must match, at 2 to 32 rows over every TP slice width, including the top-1 fixture's NaN and infinity rows, and each row's id must equal the host's scan. Its control `tf_ctl_glm_top1_rows_words` writes the rows' words 2 apart instead of 4 and must go red at the shapes gate. Compile usage for both symbols remains pending.

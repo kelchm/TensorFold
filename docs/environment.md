@@ -23,6 +23,7 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
 | `TF_MTP_DRAFTS` | Whole u32 count, clamped to 1 through the drafter's window less one; existing depth when unset |
 | `TF_DRAFT_NODES` | Whole native-size nonnegative count, capped by the drafter's window; zero disables trees |
 | `TF_QMMF_HALF_BELOW` | Whole native-size nonnegative block count; zero disables half tiles; default 96 |
+| `TF_GLM_GREEDY_ROWS` | Exactly `0` or `1`, checked when GLM starts; default `1`; every rank must set the same value ([below](#glm-cuda-greedy-draws)) |
 | `TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS` | Exactly `0` or `1`, checked when the CUDA backend starts; default off ([profiles](profiles.md)) |
 | `TF_HEAD_GEOMETRY` | Whole native-size nonnegative geometry count in the head benchmark |
 | `TF_ROCE_GID_INDEX` | Whole index 0 through 2147483647; unset searches for a RoCE v2 IPv4 GID |
@@ -76,3 +77,9 @@ The command-line `--no-update-check` remains an accepted no-op.
 before rank placement, NCCL or weights; other CUDA families do not check this GLM-only scope.
 `1` selects arithmetic-changing prompt absorb/expand GEMMs, registered as arithmetic in the
 profile and agreed in every rank's fingerprint. See the [experiment and pending gates](recipes/glm-prompt-mla.md).
+
+## GLM CUDA greedy draws
+
+`TF_GLM_GREEDY_ROWS` accepts `0` or `1`; unset or blank keeps it on. GLM checks it before rank placement, NCCL or weights.
+
+On, a greedy verify window's rows take one top-1 launch (`tf_glm_top1_rows`), one all-gather of every rank's words, one synchronize and one read instead of one of each a row. A shared window does the same for all its streams' rows when none of them samples and no grammar is on that step; otherwise each stream draws as before. A single row (a prompt's first token, an MTP draft) keeps `tf_glm_top1`. `0` restores a launch, gather, synchronize and read a row, for A/B comparison. Tokens are the same either way: each row's words are `tf_glm_top1`'s, picked by the same rule. The ranks agree on the value in their fingerprint, because it changes the gathers every rank joins.

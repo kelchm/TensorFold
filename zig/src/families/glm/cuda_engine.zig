@@ -20,6 +20,7 @@ const prof_mod = @import("cuda_prof.zig");
 const pages_mod = @import("cuda_pages.zig");
 const l2pf_mod = @import("cuda_l2pf.zig");
 const prompt_pair = @import("cuda_prompt_pair.zig");
+const pick = @import("cuda_engine_pick.zig");
 pub const Options = @import("cuda_engine_types.zig").Options;
 
 /// The most drafts a chain holds (decode.DepthPolicy's top depth).
@@ -201,9 +202,10 @@ pub const Engine = struct {
         errdefer e.bm.deinit();
         if (o.mtp) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
-        e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world);
+        const pick_bytes = pair_bytes * world * pick.pick_rows; // every rank's words of a window's greedy rows
+        e.pairs = try cuda.DeviceBuffer.alloc(d, pick_bytes);
         errdefer e.pairs.free();
-        try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, pair_bytes * world), "cuMemsetD8"); // each pair's padding stays zero
+        try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, pick_bytes), "cuMemsetD8"); // each pair's padding stays zero
         e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
         errdefer e.smp.deinit();
         errdefer e.freeProfs();
@@ -469,6 +471,7 @@ pub const Engine = struct {
         const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .taps = if (e.drafter) |dr| dr.taps(false) else null, .l2pf = if (e.l2pf) |*p| p else null };
         try f.run(@ptrCast(ids[0..rows]));
         if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
+        if (pick.oneDraw(e, parts)) return pick.drawShared(e, b, parts, segs[0..parts.len]); // every part greedy: one gather
         for (parts, segs[0..parts.len]) |p, g| {
             try e.bind(p.slot);
             e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;
@@ -534,15 +537,14 @@ pub const Engine = struct {
             try e.smp.draw(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, first, sampler.rule(s), out);
             return e.checkGathers(); // the draw read rows the forward's gathers made
         }
-        for (0..rows) |r| out[r] = try e.greedy(logits + r * e.share.vocab.len() * 2);
+        try pick.greedyRows(e, logits, rows, out);
     }
 
     pub const promptHead = @import("cuda_structured.zig").promptHead;
     pub const drawWhole = @import("cuda_structured.zig").drawWhole;
     pub const redrawFirst = @import("cuda_structured.zig").redrawFirst;
-    /// decode.sample_rows' greedy pick: per-rank top-1 (tf_glm_top1), all-gathered, largest value then lowest id.
-    const greedy = @import("cuda_engine_pick.zig").greedy;
-    const greedyChance = @import("cuda_engine_pick.zig").greedyChance;
+    /// decode.sample_rows' greedy pick with its chance: per-rank top-1, all-gathered, largest value then lowest id.
+    const greedyChance = pick.greedyChance;
 
     /// A failed RoCE gather (its rows hold nothing) or TF_GLM_KV_HOST gather past its slots, after a synchronize.
     pub fn checkGathers(e: *const Engine) !void {

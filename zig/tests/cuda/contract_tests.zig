@@ -547,7 +547,7 @@ fn registered(gpu: check.Gpu, only: []const []const u8, t0: *i96) !g.Tally {
     try glm_index.append(a, &kernels);
     const glm_fast = try @import("contract_glm_pools.zig").Fast.create(a, gpu, s, glm_fns, &kernels);
     defer glm_fast.destroy(a);
-    const glm_top1 = try @import("contract_glm_top1.zig").Top1.create(a, gpu, s, glm_fns, &kernels);
+    const glm_top1 = try @import("contract_glm_top1.zig").Top1.create(a, gpu, s, glm_fns, mods[5], &kernels);
     defer glm_top1.destroy(a);
     var glm_ops = try cuda.Module.load(gpu.d, kk.glm_ops);
     defer glm_ops.unload();

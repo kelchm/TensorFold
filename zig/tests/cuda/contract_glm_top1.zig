@@ -1,4 +1,4 @@
-//! GLM's greedy pick under the contract on CUDA: tf_glm_top1_sums, its pick as tf_glm_top1's, its sum against float64.
+//! GLM's greedy pick under the contract on CUDA: tf_glm_top1_sums and tf_glm_top1_rows as tf_glm_top1, sums in float64.
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
@@ -271,21 +271,116 @@ pub const Sum = struct {
     }
 };
 
-/// The pick and the sum on the heap, so the kernels' contexts keep their address; registered into `kernels`.
+/// A window's rows as cuda_engine_pick.greedyRows launches them: two to a shared window's 32, the same slices.
+const rows_served = [_]c.Shape{ .{ .rows = 2, .n = 1, .k = 77440 }, .{ .rows = 8, .n = 1, .k = 51648 }, .{ .rows = 16, .n = 1, .k = 51584 }, .{ .rows = 32, .n = 1, .k = 38720 }, .{ .rows = 32, .n = 1, .k = 77440 } };
+
+pub fn rowsSpec(bad: bool) c.Spec {
+    const name = if (bad) "control: cuda glm tf_glm_top1_rows words 2 apart" else "cuda glm tf_glm_top1_rows (tf_glm_top1's words a row)";
+    return .{ .name = name, .accum = .none, .depth = noSums, .out = .raw, .replaces = "tf_glm_top1 a row", .nan = .{ .stated = rule }, .tiles = tiles, .served = &rows_served };
+}
+
+/// tf_glm_top1_rows, a block a row in one launch: each row's (value, id) words equal tf_glm_top1's on that row.
+pub const Rows = struct {
+    rig: rig_.Rig,
+    f: cuda.Function,
+    plain: cuda.Function,
+    bad: bool = false, // the planted control (words 2 apart): red at the shapes gate
+    logits: Logits = .{},
+    in: u64 = 0,
+    out: u64 = 0,
+    base: u64 = 0,
+    got: std.ArrayList(u8) = .empty,
+    want: std.ArrayList(u8) = .empty,
+    msg: [160]u8 = undefined,
+
+    const vt = withOutput(Rows);
+
+    pub fn deinit(self: *Rows) void {
+        const a = self.rig.gpu.gpa;
+        self.logits.deinit(a);
+        self.got.deinit(a);
+        self.want.deinit(a);
+        self.rig.deinit();
+    }
+
+    pub fn kernel(self: *Rows) g.Kernel {
+        return .{ .spec = rowsSpec(self.bad), .ctx = self, .vt = &vt, .control = if (self.bad) .shapes else null };
+    }
+
+    pub fn prepare(self: *Rows, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
+        if (shape.k == 0 or shape.rows == 0) return false;
+        self.rig.reset();
+        try self.logits.fill(self.rig.gpu.gpa, shape, fill, seed);
+        self.in = try self.rig.input(std.mem.sliceAsBytes(self.logits.host));
+        self.out = try self.rig.output(shape.rows * 16);
+        self.base = try self.rig.scratch(shape.rows * 16);
+        return true;
+    }
+
+    /// One launch of a block a row, as greedyRows makes it: rows k logits apart, words 4 apart.
+    pub fn run(self: *Rows) !void {
+        const s = self.logits.shape;
+        var a: cuda.Args = .{};
+        inline for (.{ self.in, @as(i64, @intCast(s.k)), @as(u32, lo), self.out }) |v| a.add(v);
+        try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast(s.rows) }, .block = .{ .x = 1024 } }, self.rig.s, &a);
+        try self.rig.s.synchronize();
+    }
+
+    pub fn view(self: *Rows) ![]const u8 {
+        return words(&self.got, self.rig.gpu.gpa, try self.rig.outputBytes(), 0, 8);
+    }
+
+    pub fn count(self: *Rows) usize {
+        return self.logits.shape.rows * 8;
+    }
+
+    pub fn reference(_: *Rows, want: []f64, mag: []f64) !void {
+        @memset(want, 0);
+        @memset(mag, 0);
+    }
+
+    /// tf_glm_top1 a launch a row on the same logits: the words the engine gathered before.
+    pub fn replaced(self: *Rows) ![]const u8 {
+        try launch(&self.rig, self.plain, self.in, self.base, self.logits.shape);
+        return words(&self.want, self.rig.gpu.gpa, try self.rig.bytes(self.base, self.logits.shape.rows * 16), 0, 8);
+    }
+
+    /// Every row's words against tf_glm_top1's a row, then against the host's scan.
+    pub fn check(self: *Rows, _: g.Gate) !?[]const u8 {
+        const got = try self.view();
+        const want = try self.replaced();
+        if (std.mem.indexOfDiff(u8, got, want)) |at| return try std.fmt.bufPrint(&self.msg, "byte {d} of {d} differs from tf_glm_top1's a row", .{ at, got.len });
+        for (0..self.logits.shape.rows) |r| {
+            const t = self.logits.top(r);
+            const id = std.mem.readInt(u32, got[r * 8 + 4 ..][0..4], .little);
+            if (id != lo + @as(u32, @intCast(t.i orelse 0))) return try std.fmt.bufPrint(&self.msg, "row {d}: id {d}, the host's scan gives {d}", .{ r, id, lo + @as(u32, @intCast(t.i orelse 0)) });
+        }
+        return null;
+    }
+};
+
+/// The pick, the sum and the rows on the heap, so the kernels' contexts keep their address; registered into `kernels`.
 pub const Top1 = struct {
     pick: Pick,
     sum: Sum,
+    rows: [2]Rows, // tf_glm_top1_rows, then its planted control from contract_controls
 
-    pub fn create(a: std.mem.Allocator, gpu: @import("check.zig").Gpu, s: cuda.Stream, fns: glm.glue.Kernels, kernels: *std.ArrayList(g.Kernel)) !*Top1 {
+    pub fn create(a: std.mem.Allocator, gpu: @import("check.zig").Gpu, s: cuda.Stream, fns: glm.glue.Kernels, controls: cuda.Module, kernels: *std.ArrayList(g.Kernel)) !*Top1 {
         const self = try a.create(Top1);
         errdefer a.destroy(self);
-        self.* = .{ .pick = .{ .rig = .{ .gpu = gpu, .s = s }, .sums = fns.top1_sums, .plain = fns.top1 }, .sum = .{ .rig = .{ .gpu = gpu, .s = s }, .f = fns.top1_sums } };
+        const bad = try controls.function("tf_ctl_glm_top1_rows_words");
+        self.* = .{ .pick = .{ .rig = .{ .gpu = gpu, .s = s }, .sums = fns.top1_sums, .plain = fns.top1 }, .sum = .{ .rig = .{ .gpu = gpu, .s = s }, .f = fns.top1_sums }, .rows = .{
+            .{ .rig = .{ .gpu = gpu, .s = s }, .f = fns.top1_rows, .plain = fns.top1 },
+            .{ .rig = .{ .gpu = gpu, .s = s }, .f = bad, .plain = fns.top1, .bad = true },
+        } };
         try kernels.append(a, self.pick.kernel());
         try kernels.append(a, self.sum.kernel());
+        for (&self.rows) |*x| try kernels.append(a, x.kernel());
         return self;
     }
 
     pub fn destroy(self: *Top1, a: std.mem.Allocator) void {
+        for (&self.rows) |*x| x.deinit();
         self.sum.deinit();
         self.pick.deinit();
         a.destroy(self);

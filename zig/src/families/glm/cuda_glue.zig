@@ -25,6 +25,7 @@ pub const Kernels = struct {
     slice_sum: cuda.Function,
     top1: cuda.Function,
     top1_sums: cuda.Function,
+    top1_rows: cuda.Function, // a window's greedy picks, a block a row: tf_glm_top1's words for each
     put_words: cuda.Function,
     embed_b16: cuda.Function,
     conv_shift: cuda.Function,
