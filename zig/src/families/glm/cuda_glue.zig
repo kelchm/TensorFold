@@ -58,6 +58,10 @@ pub const Kernels = struct {
     chunks_32: cuda.Function,
     chunks_16_fp8: cuda.Function,
     chunks_32_fp8: cuda.Function,
+    chunks_16_fused: cuda.Function, // a sparse call past its partials: the chunks and their merge in one launch
+    chunks_32_fused: cuda.Function,
+    chunks_16_fp8_fused: cuda.Function,
+    chunks_32_fp8_fused: cuda.Function,
     merge: cuda.Function,
     scores: cuda.Function,
     latent_mma_kn: cuda.Function,
@@ -72,6 +76,10 @@ pub const Kernels = struct {
         try k.chunks_32.allowDynamicShared(chunksSmem(32));
         try k.chunks_16_fp8.allowDynamicShared(chunksSmem(16));
         try k.chunks_32_fp8.allowDynamicShared(chunksSmem(32));
+        try k.chunks_16_fused.allowDynamicShared(chunksSmem(16));
+        try k.chunks_32_fused.allowDynamicShared(chunksSmem(32));
+        try k.chunks_16_fp8_fused.allowDynamicShared(chunksSmem(16));
+        try k.chunks_32_fp8_fused.allowDynamicShared(chunksSmem(32));
         try k.latent_mma_kn.allowDynamicShared(latent_mma_smem[0]);
         try k.latent_mma_nk.allowDynamicShared(latent_mma_smem[1]);
         return k;

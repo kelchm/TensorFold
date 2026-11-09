@@ -246,7 +246,7 @@ pub const Buffers = struct {
                 .ol = p[28],
                 .vn = p[29],
                 .qi = p[30],
-                .partials = .{ .po = p[31], .pm = p[32], .pl = p[33] },
+                .partials = .{ .po = p[31], .pm = p[32], .pl = p[33], .rows = partialRows(rows, prefill, capacity, seg) },
                 .dummy = p[34],
                 .select = .{ .scores = p[35], .ls = p[36], .li = p[37], .pools = p[38], .at = p[39] },
                 .tokens = p[40],
@@ -284,6 +284,13 @@ pub const Buffers = struct {
         return @max(total, 256);
     }
 
+    /// The chunk partials' nch x rows: the dense calls, and a window's sparse call (a prompt's merges in the kernel).
+    fn partialRows(rows: usize, prefill: bool, capacity: usize, seg: usize) usize {
+        const part_rows = if (prefill) @min(rows, dsa_block.prompt_att_rows) else seg;
+        const dense = latent.chunksFor(@min(capacity, dense_reach) + seg) * part_rows;
+        return if (prefill) dense else @max(dense, latent.chunksFor(sparse.width) * seg);
+    }
+
     fn sizesFor(w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize) [twin_checked]usize {
         const c = &w.config;
         const s = &w.share;
@@ -300,9 +307,7 @@ pub const Buffers = struct {
         const pairs = rows * slots;
         const count: usize = c.experts;
         const lw: usize = c.kv_lora;
-        const part_rows = if (prefill) @min(rows, dsa_block.prompt_att_rows) else seg;
-        const nch = latent.chunksFor(@min(capacity, dense_reach) + seg);
-        const partial_rows = @max(nch * part_rows, latent.chunksFor(sparse.width) * seg); // dense calls, or one sparse
+        const partial_rows = partialRows(rows, prefill, capacity, seg);
         const np_max = capacity / sparse.pool;
         var mm: usize = 4;
         // windows under rows_from rows keep their K slices apart (a prompt's tail chunk on the prefill buffers too)
@@ -357,6 +362,15 @@ pub const Buffers = struct {
         b.* = undefined;
     }
 };
+
+test "GLM MLA: a prompt pass's partials hold its dense calls, and its wide sparse calls merge in the kernel" {
+    const chunks = latent.chunksFor(sparse.width);
+    const prompt = Buffers.partialRows(4096, true, 65536, 4096);
+    try std.testing.expectEqual(@as(usize, 13 * 512), prompt);
+    try std.testing.expect(latent.fuses(.{ .po = 1, .pm = 2, .pl = 3, .rows = prompt }, chunks, 4096));
+    const window = Buffers.partialRows(8, false, 65536, 8);
+    try std.testing.expect(!latent.fuses(.{ .po = 1, .pm = 2, .pl = 3, .rows = window }, chunks, 8));
+}
 
 /// A sequence's committed caches on a rank (the Python family's State): KDA conv and states, saved rows, DSA caches.
 pub const State = struct {

@@ -85,7 +85,7 @@ const Launch = struct {
         const id = @intFromPtr(f);
         ids[n] = id;
         blocks[n] = bx;
-        scales[n] = if (id == 2) @as(*const u64, @ptrCast(@alignCast(args.?[3].?))).* else if (id == 4 or id == 6)
+        scales[n] = if (id == 2) @as(*const u64, @ptrCast(@alignCast(args.?[3].?))).* else if (id == 4 or id == 6 or id == 11)
             @as(*const u64, @ptrCast(@alignCast(args.?[2].?))).*
         else
             0;
@@ -134,6 +134,15 @@ test "GLM FP8 KV: real launchers preserve BF16 ABI and pass FP8 scale pointers f
     try latent.sparseAttentionFormat(set, stream, 100, 200, 400, .{}, 500, 600, 2051, p, 700, 3, 32, 512, 0.125);
     try t.expectEqual(@as(usize, 4), Launch.ids[0]);
     try t.expectEqual(@as(u64, 400), Launch.scales[0]);
+    ks.chunks_16_fp8_fused = .{ .d = &d, .handle = @ptrFromInt(11) };
+    var past = p;
+    past.rows = 1; // a sparse call past its partials: the chunks and merge in one launch
+    Launch.n = 0;
+    try latent.sparseAttentionFormat(set, stream, 100, 200, 400, .{}, 500, 600, 2051, past, 700, 3, 32, 512, 0.125);
+    try t.expectEqual(@as(usize, 1), Launch.n);
+    try t.expectEqual(@as(usize, 11), Launch.ids[0]);
+    try t.expectEqual(@as(u32, 256), Launch.blocks[0]);
+    try t.expectEqual(@as(u64, 400), Launch.scales[0]);
 }
 
 test "GLM FP8 KV: an FP8 cache takes no page table, so its writes and reads refuse one before they launch" {
@@ -151,6 +160,8 @@ test "GLM FP8 KV: an FP8 cache takes no page table, so its writes and reads refu
     try t.expectError(error.Fp8OnPages, latent.latentWriteFormat(set, stream, 100, 512, 200, 400, paged, 300, 3, 512));
     try t.expectError(error.Fp8OnPages, latent.attentionFormat(set, stream, 100, 200, 400, paged, 300, p, 500, 600, 3, 32, 512, 1, 0.125, 16));
     try t.expectError(error.Fp8OnPages, latent.sparseAttentionFormat(set, stream, 100, 200, 400, paged, 500, 600, 2051, p, 700, 3, 32, 512, 0.125));
+    const past: latent.Partials = .{ .po = 1000, .pm = 2000, .pl = 3000, .rows = 1 };
+    try t.expectError(error.Fp8OnPages, latent.sparseAttentionFormat(set, stream, 100, 200, 400, paged, 500, 600, 2051, past, 700, 3, 32, 512, 0.125));
     try t.expectEqual(@as(usize, 0), Launch.n);
 }
 

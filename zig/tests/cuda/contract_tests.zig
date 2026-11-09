@@ -534,6 +534,8 @@ fn registered(gpu: check.Gpu, only: []const []const u8, t0: *i96) !g.Tally {
     defer glm_fp8_attn.destroy(a);
     const glm_mma = try @import("contract_glm_mma.zig").Group.create(a, gpu, s, &glm_fns, mods[5], &kernels);
     defer glm_mma.destroy(a);
+    const glm_fused = try @import("contract_glm_fused_attn.zig").Group.create(a, gpu, s, &glm_fns, &kernels);
+    defer glm_fused.destroy(a);
     var glm_lat = glm_pages_k.LatWrite{ .rig = .{ .gpu = gpu, .s = s }, .f = glm_fns.lat_write };
     defer glm_lat.deinit();
     try kernels.append(a, glm_lat.kernel());
