@@ -5,17 +5,18 @@ const glm = @import("glm");
 const lanes = @import("lanes");
 const ex = cuda.exl3_experts;
 const Capture = struct {
-    const Call = struct { id: usize, grid: [3]u32, block: u32, args: [20]u64 = @splat(0) };
+    const Call = struct { id: usize, grid: [3]u32, block: u32, shared: u32 = 0, args: [20]u64 = @splat(0) };
     var calls: [256]Call = undefined;
     var count: usize = 0;
     var copies: [16]cuda.abi.Memcpy2D = undefined;
     var copied: usize = 0;
-    fn launch(f: cuda.abi.Function, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
-        calls[count] = .{ .id = @intFromPtr(f), .grid = .{ gx, gy, gz }, .block = bx };
-        if (@intFromPtr(f) >= 11 and @intFromPtr(f) <= 14) {
+    fn launch(f: cuda.abi.Function, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, _: c_uint, _: c_uint, shared: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+        calls[count] = .{ .id = @intFromPtr(f), .grid = .{ gx, gy, gz }, .block = bx, .shared = shared };
+        if ((@intFromPtr(f) >= 11 and @intFromPtr(f) <= 17) or @intFromPtr(f) == 20) {
             const sizes: []const u8 = switch (@intFromPtr(f)) {
                 11 => &.{ 8, 4, 8, 8, 4 },
-                12 => &.{ 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4, 4 },
+                12, 15 => &.{ 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4, 4 },
+                20 => &.{ 8, 4, 4, 4, 8, 8, 8 }, // plan_small: picks, pairs, experts, tile, members, items, counts
                 else => &.{ 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4 },
             };
             for (sizes, 0..) |size, i| {
@@ -52,13 +53,16 @@ fn run(rows: usize, prompt: bool, shared: bool) !void {
     return runAs(rows, prompt, shared, false);
 }
 fn runAs(rows: usize, prompt: bool, shared: bool, b16: bool) !void {
+    return runTile(rows, prompt, shared, b16, ex.prompt.tile);
+}
+fn runTile(rows: usize, prompt: bool, shared: bool, b16: bool, tile: usize) !void {
     Capture.reset();
     var d: cuda.Driver = undefined;
     d.api.cuLaunchKernel = Capture.launch;
     d.api.cuMemcpy2DAsync_v2 = Capture.copy;
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     var k: ex.Experts = .{ .mod = undefined, .group = function(&d, 1), .rot_in = function(&d, 2), .grouped = @splat(function(&d, 3)), .gateup = function(&d, 4), .down_combine = function(&d, 5) };
-    if (comptime @hasField(ex.Experts, "prompt")) k.prompt = .{ .rotate = function(&d, 11), .gateup = function(&d, 12), .down = function(&d, 13), .down_slots = function(&d, 13), .gateup_glm = function(&d, 12), .down_glm = function(&d, 13), .down_glm_b16 = function(&d, 14) };
+    if (comptime @hasField(ex.Experts, "prompt")) k.prompt = .{ .rotate = function(&d, 11), .gateup = function(&d, 12), .down = function(&d, 13), .down_slots = function(&d, 13), .gateup_glm = function(&d, 12), .down_glm = function(&d, 13), .down_glm_b16 = function(&d, 14), .gateup_glm128 = function(&d, 15), .down_glm128 = function(&d, 16), .down_glm128_b16 = function(&d, 17), .tile = tile };
     const ek: glm.experts.Kernels = .{ .nvfp4 = undefined, .b32 = null, .router = .{ .plan_small = function(&d, 20), .plan_rank = function(&d, 21), .plan_offsets = function(&d, 22), .plan_scatter = function(&d, 23), .plan_rows = function(&d, 24), .plan_rank_rows = function(&d, 25), .plan_scatter_rows = function(&d, 26) } };
     const w: glm.exl3.Experts = .{ .gt = 100, .ut = 200, .dt = 300, .k2 = 400, .suh_g = 500, .suh_u = 600, .svh_g = 700, .svh_u = 800, .suh_d = 900, .svh_d = 1000, .shx = shared };
     const sc: glm.exl3.Scratch = .{ .picks = 0x100000000, .xg = 0, .xu = 0, .z = 0 };
@@ -138,6 +142,32 @@ test "exl3 prompt: whole passes and the next chunk keep input, pick and direct-s
         try std.testing.expectEqual(chunks, rotations);
         try std.testing.expectEqual(chunks, downs);
     };
+}
+
+test "exl3 prompt: TF_EXL3_PROMPT_TILE=128 plans 128-member items for the 512-thread kernels in opt-in shared bytes" {
+    const P = ex.prompt;
+    try std.testing.expectEqual(@as(u32, 73728), P.wide.shared); // tsmem_bytes<128, 8>(), static_assert in the kernel
+    try std.testing.expect(P.wide.shared + 128 * 4 + 1024 <= 99 * 1024); // with rows_sh and the reserved KiB, sm_86 to sm_121
+    for ([_]usize{ 1, 64, 65, 128, 129, 32768 }) |pairs| try std.testing.expect(cuda.grouped.maxItems(pairs, 288, 128) <= cuda.grouped.maxItems(pairs, 288, P.tile));
+    for ([_]bool{ false, true }) |b16| {
+        try runTile(40, true, true, b16, 128);
+        try std.testing.expectEqual(@as(usize, 0), Capture.by(12).len + Capture.by(13).len + Capture.by(14).len);
+        try std.testing.expectEqual(@as(usize, 0), Capture.by(if (b16) 16 else 17).len);
+        try std.testing.expectEqual(@as(u64, 128), Capture.by(20)[0].args[3]);
+        for ([_][]const Capture.Call{ Capture.by(15), Capture.by(if (b16) 17 else 16) }, [_]u32{ 256 / 128, 512 / 256 }) |calls, x| {
+            try std.testing.expectEqual(@as(usize, 1), calls.len);
+            try std.testing.expectEqual([3]u32{ x, @intCast(cuda.grouped.maxItems(320, 9, 128)), 1 }, calls[0].grid);
+            try std.testing.expectEqual(@as(u32, 512), calls[0].block);
+            try std.testing.expectEqual(P.wide.shared, calls[0].shared);
+        }
+    }
+    try run(40, true, true); // unset: the 64-member kernels in their static shared bytes
+    try std.testing.expectEqual(@as(u64, 64), Capture.by(20)[0].args[3]);
+    try std.testing.expectEqual(@as(u32, 0), Capture.by(12)[0].shared);
+    try std.testing.expectEqual(@as(usize, 0), Capture.by(15).len);
+    Capture.reset();
+    try std.testing.expectError(error.Exl3Shape, runTile(40, true, true, false, 96));
+    try std.testing.expectEqual(@as(usize, 0), Capture.count);
 }
 
 test "exl3 prompt: bf16 slot rows only from the fused prompt kernels, before any launch" {

@@ -248,6 +248,21 @@ pub fn run_(gpu: Gpu) !void {
             };
         }
     }
+    { // TF_EXL3_PROMPT_TILE=128: 128-member items give the 64-member items' bytes in every slot row, fp32 and bf16
+        var wide = k;
+        wide.prompt.tile = cuda.exl3_experts.prompt.wide.tile;
+        for ([_]bool{ true, false }) |one| {
+            const s = try weights(&r, one);
+            for ([_]usize{ 40, 200, 1000 }) |rows| for ([_]bool{ false, true }) |b16| {
+                const x = try r.bfs(rows * D, 1.0);
+                const pk = try picks(&r, rows);
+                const n = rows * slots * D * @as(usize, if (b16) 2 else 4);
+                const narrow = try r.back((try run(&r, &k, &ek, s, x, pk, rows, true, b16)).ey, n);
+                const got = try r.back((try run(&r, &wide, &ek, s, x, pk, rows, true, b16)).ey, n);
+                try check.expect(std.mem.eql(u8, narrow, got), "glm-exl3 128-member items: {d} rows, {s}, {s} slots are the 64-member bytes", .{ rows, if (one) "one rotation" else "a rotation an expert", if (b16) "bf16" else "fp32" });
+            };
+        }
+    }
     { // a NaN in one row's input: that row's routed slots NaN, every other row finite
         const s = try weights(&r, true);
         const rows = 4;
@@ -263,5 +278,5 @@ pub fn run_(gpu: Gpu) !void {
             };
         }
     }
-    check.pass("glm-exl3: decode and prompt slot rows within {d:.3} of their float64 tolerance, rows as alone, NaN kept to its row", .{r.worst});
+    check.pass("glm-exl3: decode and prompt slot rows within {d:.3} of their float64 tolerance, rows as alone, 128-member items' bytes, NaN kept to its row", .{r.worst});
 }

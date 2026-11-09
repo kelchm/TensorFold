@@ -179,6 +179,7 @@ pub const Engine = struct {
         if (o.settings.numerics.absorb_mma and rank == 0) std.log.warn("TF_GLM_ABSORB_MMA: prompt absorb/expand uses tensor cores with a different FP32 accumulation order", .{});
         if (o.settings.numerics.exl3_bf16_slots and rank == 0) std.log.warn("TF_GLM_EXL3_BF16_SLOTS: EXL3 prompt chunks round their MoE slot rows to bf16 before the combine", .{});
         e.m.mm.prompt_fixed_k = o.settings.prompt_fixed_k;
+        e.m.exl3.prompt.tile = o.settings.exl3_tile;
         e.m.tiled = o.settings.tiled;
         if (o.settings.tiled) e.m.packs = &e.packs;
         if (o.settings.l2pf.want(try ctx.capability(), world)) e.l2pf = try l2pf_mod.L2pf.init(gpa, d, &e.w, o.settings.l2pf);

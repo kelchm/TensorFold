@@ -82,3 +82,6 @@ profile and agreed in every rank's fingerprint. See the [experiment and pending 
 
 `TF_GLM_HC_FUSE` accepts `0` or `1` with the same checks and scope; unset or blank keeps it off.
 `1` has a prompt call's `hc_post` (64 rows or more) also compute the next site's `hc_pre` partials from the streams it just wrote (`tf_glm_hc_post_partial`), so those streams are not read back: 128 MiB less traffic a site at 4,096 rows. The last layer's `hc_post` and decode windows are unchanged. Every byte stays the same, so it is registered as identical and the ranks need not agree; device qualification is pending.
+
+`TF_EXL3_PROMPT_TILE` accepts `64` or `128` with the same checks and scope; unset or blank keeps `64`.
+`128` groups an EXL3 prompt call's routed pairs into items of up to 128 members, so each expert's weights stream once per 128 rows instead of 64, and runs them on 512-thread kernels whose warps decode one weight tile each for up to 16 MMAs (`tf_exl3_prompt_gu_glm128`, `tf_exl3_prompt_down_glm128` and its bf16-slot form). Each output keeps the 64-member kernels' fragments, ascending-K chain and epilogue, so every byte stays the same: it is registered as identical and the ranks need not agree; device qualification is pending.

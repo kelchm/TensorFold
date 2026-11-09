@@ -5,6 +5,10 @@ pub const records = [_]registry.CudaRecord{
     .{ .launch = .{ .name = "exl3_experts tf_exl3_prompt_gu_glm", .symbol = "tf_exl3_prompt_gu_glm", .image = "exl3_experts", .threads = 256 }, .usage = registry.none },
     .{ .launch = .{ .name = "exl3_experts tf_exl3_prompt_down_glm", .symbol = "tf_exl3_prompt_down_glm", .image = "exl3_experts", .threads = 256 }, .usage = registry.none },
     .{ .launch = .{ .name = "exl3_experts tf_exl3_prompt_down_glm_b16", .symbol = "tf_exl3_prompt_down_glm_b16", .image = "exl3_experts", .threads = 256 }, .usage = registry.none },
+    // TF_EXL3_PROMPT_TILE=128: 512 threads and tsmem_bytes<128, 8>() of opt-in dynamic shared (exl3_prompt.zig wide)
+    .{ .launch = .{ .name = "exl3_experts tf_exl3_prompt_gu_glm128", .symbol = "tf_exl3_prompt_gu_glm128", .image = "exl3_experts", .threads = 512, .dynamic = 73728, .opt_in = true }, .usage = registry.none },
+    .{ .launch = .{ .name = "exl3_experts tf_exl3_prompt_down_glm128", .symbol = "tf_exl3_prompt_down_glm128", .image = "exl3_experts", .threads = 512, .dynamic = 73728, .opt_in = true }, .usage = registry.none },
+    .{ .launch = .{ .name = "exl3_experts tf_exl3_prompt_down_glm128_b16", .symbol = "tf_exl3_prompt_down_glm128_b16", .image = "exl3_experts", .threads = 512, .dynamic = 73728, .opt_in = true }, .usage = registry.none },
 };
 
 test "GLM prompt port: source kit counts never stand in for missing compile receipts" {

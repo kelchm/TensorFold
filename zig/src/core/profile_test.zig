@@ -130,6 +130,16 @@ test "stable profile: GLM's fused hc glue registers as an identical exact-one sw
     try t.expectEqual(p.Switch.TF_GLM_HC_FUSE, p.registered("TF_GLM_HC_FUSE").?);
 }
 
+test "stable profile: EXL3 prompt items of 128 register as identical, only 128 reported, 64 unless set" {
+    const e = p.entry(.TF_EXL3_PROMPT_TILE);
+    try t.expectEqual(p.Class.identical, e.class);
+    try t.expect(e.applies("glm5_next", "cuda") and !e.applies("qwen3_5", "cuda") and !e.applies("glm5_next", "metal"));
+    try t.expect(p.resolve(.stable, .TF_EXL3_PROMPT_TILE, null) == null);
+    try t.expect(e.differs("128"));
+    for ([_][]const u8{ "64", "", " 128 " }) |raw| try t.expect(!e.differs(raw));
+    try t.expectEqual(p.Switch.TF_EXL3_PROMPT_TILE, p.registered("TF_EXL3_PROMPT_TILE").?);
+}
+
 test "stable profile: the keep-others rule registers as an identical exact-one CUDA switch, off unless set" {
     const e = p.entry(.TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS);
     try t.expectEqual(p.Class.identical, e.class);

@@ -48,6 +48,8 @@ const valid = [_]Case{
     .{ .name = "TF_GLM_ABSORB_MMA", .raw = "1", .n = 1 },
     .{ .name = "TF_GLM_EXL3_BF16_SLOTS", .raw = "1", .n = 1 },
     .{ .name = "TF_GLM_HC_FUSE", .raw = "1", .n = 1 },
+    .{ .name = "TF_EXL3_PROMPT_TILE", .raw = "128", .n = 128 },
+    .{ .name = "TF_EXL3_PROMPT_TILE", .raw = "64", .n = 64 },
     .{ .name = "TF_CUDA_DEVICE", .raw = "4294967295", .n = std.math.maxInt(u32) },
     .{ .name = "TF_CUDA_SEGMENTS", .raw = " 1 ", .n = 1 },
     .{ .name = "TF_CUDA_SEGMENTS", .raw = "4", .n = 4 },
@@ -259,4 +261,9 @@ test "environment: malformed GLM opt-in affects only GLM startup" {
     const fuse_why = (try e.refusal(a, fuse, .{ .glm = true })).?;
     defer a.free(fuse_why);
     try t.expectEqualStrings("TF_GLM_HC_FUSE=\"yes\": expected 0 or 1", fuse_why);
+    const tile: Env = .{ .name = "TF_EXL3_PROMPT_TILE", .raw = "96" };
+    try t.expect((try e.refusal(a, tile, .{ .cuda = true })) == null);
+    const tile_why = (try e.refusal(a, tile, .{ .glm = true })).?;
+    defer a.free(tile_why);
+    try t.expectEqualStrings("TF_EXL3_PROMPT_TILE=\"96\": expected 64 or 128", tile_why);
 }

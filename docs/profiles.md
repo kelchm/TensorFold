@@ -42,7 +42,7 @@ profile supplies no value. Registry metadata comes directly from the table. Regi
 Coverage includes:
 
 - Qwen3.5 dense/MoE on CUDA: `TF_QWEN_KV_PAGES`, `TF_QWEN_KV_PAGES_ALL`, `TF_QWEN_KV_SHARE`.
-- GLM on CUDA: `TF_KV_PAGES`, `TF_GLM_KV_HOST`, `TF_GLM_KV_HOST_SHARED`, `TF_GLM_PROMPT_TAIL`, `TF_GLM_HC_FUSE`.
+- GLM on CUDA: `TF_KV_PAGES`, `TF_GLM_KV_HOST`, `TF_GLM_KV_HOST_SHARED`, `TF_GLM_PROMPT_TAIL`, `TF_GLM_HC_FUSE`, `TF_EXL3_PROMPT_TILE`.
 - Nemotron and Nemotron Omni on CUDA: `TF_KV_PAGES`, with their existing default-on parser.
 - Gemma 4, Kolibri-1, Spark2.5 and GLM on the core CUDA page adapter: `TF_KV_SHARE`, where the adapter is served.
 - Every CUDA family whose host prompt cache the CUDA host builds (Nemotron, Nemotron Omni, GLM, MiniMax M3, Qwen3.5
@@ -65,6 +65,7 @@ this registry is unchanged. The two GLM host-memory switches carry
 `TF_GLM_PROMPT_TAIL` carries [#2226](https://github.com/ashhart/TensorFold/pull/2226)'s. `TF_GLM_KV_HOST_GIB` stays
 outside the registry: it sizes those pages rather than choosing a policy, and its reader keeps its own default.
 `TF_GLM_HC_FUSE` is identical by construction (a byte replacement under the kernel contract); its device receipts are pending.
+`TF_EXL3_PROMPT_TILE` is identical the same way; only `128` is reported, and its device receipts are pending.
 
 `TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS=1` ([#2346](https://github.com/ashhart/TensorFold/issues/2346)) changes which
 prompt states are kept, never a token. A new state may then evict only its own conversation's states: kept states

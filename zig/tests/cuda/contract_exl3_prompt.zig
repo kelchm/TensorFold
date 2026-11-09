@@ -1,4 +1,4 @@
-//! GLM prompt replacements: identical full-K sums, every 8-member specialization, untouched shared slots, bf16 slots.
+//! GLM prompt replacements, also on 128-member items: identical full-K sums, every 8-member block count, bf16 slots.
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
@@ -9,7 +9,7 @@ const c = core.contract.spec;
 const g = core.contract.gates;
 
 const Kind = enum { gu, slots, down, b16 }; // b16: the down kernel's slot rows rounded to bf16 (TF_GLM_EXL3_BF16_SLOTS)
-const Fault = enum { none, last_member, slot_stride };
+const Fault = enum { none, last_member, slot_stride, narrow_kernel }; // narrow_kernel: 128-member items, 64-member kernel
 
 fn depth(s: c.Shape) usize {
     return s.k / 16 + 16 + 14;
@@ -28,12 +28,30 @@ const shapes = blk: {
     break :blk out;
 };
 
+/// Every 128-member item size (1 to 16 blocks of 8), several items, and the served widths.
+const wide_shapes = blk: {
+    var out: [134]c.Shape = undefined;
+    for (out[0..128], 1..) |*s, r| s.* = .{ .rows = r, .n = 256, .k = 128 };
+    out[128..].* = .{
+        .{ .rows = 129, .n = 256, .k = 256 },
+        .{ .rows = 256, .n = 1024, .k = 4096 },
+        .{ .rows = 256, .n = 4096, .k = 1024 },
+        .{ .rows = 1000, .n = 256, .k = 128 },
+        .{ .rows = 2048, .n = 256, .k = 128 },
+        .{ .rows = 4096, .n = 256, .k = 128 },
+    };
+    break :blk out;
+};
+
 pub const Case = struct {
     rig: rig_.Rig,
     kind: Kind,
     shared: bool = false,
     act: i32 = 0,
     fault: Fault = .none,
+    tile: usize = 64, // the launch's item members; the retained kernel always runs 64-member items
+    threads: u32 = 256,
+    smem: u32 = 0,
     f: cuda.Function,
     old: cuda.Function,
     shape: c.Shape = undefined,
@@ -44,6 +62,8 @@ pub const Case = struct {
     items: u64 = 0,
     counts: u64 = 0,
     members: u64 = 0,
+    tiled: u64 = 0, // the items at `tile` members, and their count
+    tiled_counts: u64 = 0,
     bad_items: u64 = 0,
     out: u64 = 0,
     base: u64 = 0,
@@ -55,10 +75,17 @@ pub const Case = struct {
     }
 
     pub fn kernel(self: *Case) g.Kernel {
+        const wide = self.tile == 128;
         const name = switch (self.fault) {
-            .last_member => "control: GLM prompt last item member dropped",
+            .last_member => if (wide) "control: GLM prompt 128-member item's last member dropped" else "control: GLM prompt last item member dropped",
             .slot_stride => "control: GLM prompt compact stride posing as routed slots",
-            .none => switch (self.kind) {
+            .narrow_kernel => "control: GLM prompt 128-member items on the 64-member kernel",
+            .none => if (wide) switch (self.kind) {
+                .slots => unreachable,
+                .down => "cuda exl3 tf_exl3_prompt_down_glm128 128-member items",
+                .b16 => "cuda exl3 tf_exl3_prompt_down_glm128_b16 128-member items, bf16 slots",
+                .gu => if (self.shared) "cuda exl3 tf_exl3_prompt_gu_glm128 128-member items, shared rotation" else if (self.act == 0) "cuda exl3 tf_exl3_prompt_gu_glm128 128-member items, separate bf16" else "cuda exl3 tf_exl3_prompt_gu_glm128 128-member items, separate fp32",
+            } else switch (self.kind) {
                 .slots => "cuda exl3 tf_exl3_prompt_down_slots direct routed slots",
                 .down => "cuda exl3 tf_exl3_prompt_down_glm",
                 .b16 => "cuda exl3 tf_exl3_prompt_down_glm_b16 bf16 slots",
@@ -77,8 +104,8 @@ pub const Case = struct {
             .ops = 8,
             .replaces = if (self.kind == .b16) "retained common prompt kernel scattered into routed slots, then __float2bfloat16_rn" else "retained common prompt kernel, compact down output scattered into routed slots",
             .nan = .{ .stated = if (self.kind == .b16) "the retained kernel's bytes rounded to bf16 on identical plants, NaN as 0x7fff" else "the retained kernel's bytes on identical NaN and infinity plants" },
-            .served = &shapes,
-            .tiles = .{ .{ .size = 64 }, .{ .size = 256, .step = 256, .min = 256 }, .{ .size = 128, .step = 128, .min = 128 } },
+            .served = if (wide) &wide_shapes else &shapes,
+            .tiles = .{ .{ .size = self.tile }, .{ .size = 256, .step = 256, .min = 256 }, .{ .size = 128, .step = 128, .min = 128 } },
             .sums = .{ .exact = false, .bf16 = 0, .why = "balanced reduced-precision sums can retain constant terms; fp16 must overflow" },
         }, .ctx = self, .vt = &vt, .control = if (self.fault == .none) null else .shapes };
     }
@@ -123,19 +150,26 @@ pub const Case = struct {
         for (members, 0..) |*v, i| v.* = @intCast(i);
         rng.shuffle(i32, members);
         self.members = try self.rig.input(std.mem.sliceAsBytes(members));
-        const nitems = (sh.rows + 63) / 64;
-        const items = try a.alloc(i32, nitems * 3);
-        defer a.free(items);
-        for (0..nitems) |i| {
-            items[3 * i] = 0;
-            items[3 * i + 1] = @intCast(i * 64);
-            items[3 * i + 2] = @intCast(@min(64, sh.rows - i * 64));
+        for ([_]usize{ 64, self.tile }, 0..) |tile, at| {
+            const nitems = (sh.rows + tile - 1) / tile;
+            const items = try a.alloc(i32, nitems * 3);
+            defer a.free(items);
+            for (0..nitems) |i| {
+                items[3 * i] = 0;
+                items[3 * i + 1] = @intCast(i * tile);
+                items[3 * i + 2] = @intCast(@min(tile, sh.rows - i * tile));
+            }
+            const counts = [1]i32{@intCast(nitems)};
+            if (at == 0) {
+                self.items = try self.rig.input(std.mem.sliceAsBytes(items));
+                self.counts = try self.rig.input(std.mem.sliceAsBytes(&counts));
+                continue;
+            }
+            self.tiled = try self.rig.input(std.mem.sliceAsBytes(items));
+            self.tiled_counts = try self.rig.input(std.mem.sliceAsBytes(&counts));
+            items[items.len - 1] -= 1;
+            self.bad_items = try self.rig.input(std.mem.sliceAsBytes(items));
         }
-        self.items = try self.rig.input(std.mem.sliceAsBytes(items));
-        items[items.len - 1] -= 1;
-        self.bad_items = try self.rig.input(std.mem.sliceAsBytes(items));
-        const counts = [1]i32{@intCast(nitems)};
-        self.counts = try self.rig.input(std.mem.sliceAsBytes(&counts));
         self.out = try self.rig.output(self.count() * self.elemBytes());
         try self.rig.zero(self.out, self.count() * self.elemBytes());
         self.base = try self.rig.scratch(sh.rows * sh.n * self.baseBytes());
@@ -159,18 +193,21 @@ pub const Case = struct {
     fn launch(self: *Case, f: cuda.Function, dst: u64, baseline: bool) !void {
         const sh = self.shape;
         var args: cuda.Args = .{};
-        const item = if (!baseline and self.fault == .last_member) self.bad_items else self.items;
+        const item = if (baseline) self.items else if (self.fault == .last_member) self.bad_items else self.tiled;
+        const counts = if (baseline) self.counts else self.tiled_counts;
+        const tile: usize = if (baseline) 64 else self.tile;
         if (self.kind == .gu) {
-            inline for (.{ self.input[0], self.input[1], self.tp[0], self.tp[1], item, self.counts, self.members, self.sv, self.sv, self.su, dst }) |v| args.add(v);
+            inline for (.{ self.input[0], self.input[1], self.tp[0], self.tp[1], item, counts, self.members, self.sv, self.sv, self.su, dst }) |v| args.add(v);
             inline for (.{ sh.k, sh.n, if (self.shared) @as(usize, 8) else 1 }) |v| args.add(@as(i32, @intCast(v)));
             args.add(@as(f32, 0));
             args.add(self.act);
         } else {
-            inline for (.{ self.input[0], self.tp[0], item, self.counts, self.members, self.sv, dst }) |v| args.add(v);
+            inline for (.{ self.input[0], self.tp[0], item, counts, self.members, self.sv, dst }) |v| args.add(v);
             inline for (.{ sh.k, sh.n, @as(usize, 8) }) |v| args.add(@as(i32, @intCast(v)));
             if (!baseline) args.add(@as(i32, if (self.fault == .slot_stride) 8 else 9));
         }
-        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(sh.n / (if (self.kind == .gu) @as(usize, 128) else 256)), .y = @intCast((sh.rows + 63) / 64) }, .block = .{ .x = 256 } }, self.rig.s, &args);
+        const grid: cuda.launch.Dim3 = .{ .x = @intCast(sh.n / (if (self.kind == .gu) @as(usize, 128) else 256)), .y = @intCast((sh.rows + tile - 1) / tile) };
+        try cuda.launch.launch(f, .{ .grid = grid, .block = .{ .x = if (baseline) 256 else self.threads }, .shared = if (baseline) 0 else self.smem }, self.rig.s, &args);
     }
 
     pub fn run(self: *Case) !void {
@@ -227,7 +264,7 @@ pub const Case = struct {
 pub const Group = struct {
     a: std.mem.Allocator,
     mod: cuda.Module,
-    entries: [8]Case,
+    entries: [15]Case,
 
     pub fn create(a: std.mem.Allocator, gpu: check_.Gpu, s: cuda.Stream, kernels: *std.ArrayList(g.Kernel)) !*Group {
         const self = try a.create(Group);
@@ -236,7 +273,7 @@ pub const Group = struct {
         self.mod = try cuda.Module.load(gpu.d, cuda.kernels.exl3_experts);
         errdefer self.mod.unload();
         const p = try cuda.exl3_experts.prompt.Kernels.resolve(self.mod);
-        for (&self.entries, 0..) |*x, i| {
+        for (self.entries[0..8], 0..) |*x, i| {
             const gu = i < 3 or i == 5;
             x.* = .{
                 .rig = .{ .gpu = gpu, .s = s },
@@ -245,6 +282,23 @@ pub const Group = struct {
                 .act = if (i == 2) 1 else 0,
                 .fault = if (i == 5) .last_member else if (i == 6) .slot_stride else .none,
                 .f = if (gu) p.gateup_glm.? else if (i == 3) p.down_slots.? else if (i == 7) p.down_glm_b16.? else p.down_glm.?,
+                .old = if (gu) p.gateup else p.down,
+            };
+        }
+        // TF_EXL3_PROMPT_TILE=128: gate/up shared, bf16 and fp32; down; bf16 slots; then the two controls
+        const wide = cuda.exl3_experts.prompt.wide;
+        for (self.entries[8..], 0..) |*x, i| {
+            const gu = i < 3 or i == 5;
+            x.* = .{
+                .rig = .{ .gpu = gpu, .s = s },
+                .kind = if (gu) .gu else if (i == 4) .b16 else .down,
+                .shared = i == 0,
+                .act = if (i == 2) 1 else 0,
+                .fault = if (i == 5) .last_member else if (i == 6) .narrow_kernel else .none,
+                .tile = wide.tile,
+                .threads = if (i == 6) 256 else wide.threads,
+                .smem = if (i == 6) 0 else wide.shared,
+                .f = if (i == 6) p.down_glm.? else if (gu) p.gateup_glm128.? else if (i == 4) p.down_glm128_b16.? else p.down_glm128.?,
                 .old = if (gu) p.gateup else p.down,
             };
         }
@@ -271,4 +325,9 @@ test "GLM prompt contract: every hook compiles without embedded CUDA images" {
     const half = x.kernel();
     try std.testing.expectEqual(c.Elem.bf16, half.spec.out);
     try std.testing.expect(half.spec.replaces != null and half.vt.replaced != null);
+    x.tile = 128;
+    const wide = x.kernel();
+    try std.testing.expectEqual(@as(usize, 134), wide.spec.served.len);
+    for (wide_shapes[0..128], 1..) |sh, r| try std.testing.expectEqual(r, sh.rows);
+    try std.testing.expectEqualStrings("cuda exl3 tf_exl3_prompt_down_glm128_b16 128-member items, bf16 slots", wide.spec.name);
 }
