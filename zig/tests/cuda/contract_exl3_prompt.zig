@@ -80,8 +80,10 @@ pub const Case = struct {
             .served = &shapes,
             .tiles = .{ .{ .size = 64 }, .{ .size = 256, .step = 256, .min = 256 }, .{ .size = 128, .step = 128, .min = 128 } },
             .sums = .{ .exact = false, .bf16 = 0, .why = "balanced reduced-precision sums can retain constant terms; fp16 must overflow" },
-        }, .ctx = self, .vt = &g.hooks(Case), .control = if (self.fault == .none) null else .shapes };
+        }, .ctx = self, .vt = &vt, .control = if (self.fault == .none) null else .shapes };
     }
+
+    const vt = g.hooks(Case); // a container constant: &g.hooks(Case) in kernel() would point at its frame
 
     pub fn prepare(self: *Case, sh: c.Shape, fill: g.Fill, seed: u64) !bool {
         if (sh.rows == 0 or sh.n % 256 != 0 or sh.k % 128 != 0) return false;
