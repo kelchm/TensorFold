@@ -119,7 +119,9 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
     const int wm = warp / T::WN, wn = warp % T::WN;
     const int KG = K >> 6, per = KG / SK, N8 = N >> 3;
     int bx = blockIdx.x, by = blockIdx.y;
-    if constexpr (P2) {   // groups of 8 row blocks, rows fastest: a group's inputs stay in L2 and each weight tile is read once a group
+    // groups of 8 row blocks, rows fastest, when a projection's weights outgrow L2 (128 or more column blocks): a group's
+    // inputs stay in L2 and each weight tile is read once a group; narrower launches keep columns fastest
+    if (P2 && gridDim.x >= 128) {
         constexpr int G = 8;
         const int nx = gridDim.x, id = blockIdx.y * nx + blockIdx.x, first = id / (G * nx) * G;
         const int gm = min((int)gridDim.y - first, G), r = id - first * nx;
