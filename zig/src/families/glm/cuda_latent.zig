@@ -92,7 +92,12 @@ pub fn latentWrite(set: glue.Set, stream: cuda.Stream, lat: u64, lat_stride: usi
 }
 
 /// The chunk partials of one attention call: po fp32 [nch][rows][heads][lw], pm and pl fp32 [nch][rows][heads].
-pub const Partials = struct { po: u64, pm: u64, pl: u64 };
+pub const Partials = struct {
+    po: u64,
+    pm: u64,
+    pl: u64,
+    rows: usize = 0, // the nch x rows they hold (0: every call fits); a sparse call past them merges in the kernel
+};
 
 /// latent.attention: causal qa over the cache in `nch` 512-key chunks into out bf16; `dummy`: the merge's count i32.
 pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, t: Table, pos: u64, p: Partials, out: u64, dummy: u64, rows: usize, heads: usize, lw: usize, nch: usize, scale: f32, hb: usize) !void {
@@ -133,8 +138,32 @@ pub fn sparseAttention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, 
 
 pub fn sparseAttentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, tokens: u64, counts: u64, w: usize, p: Partials, out: u64, rows: usize, heads: usize, lw: usize, scale: f32) !void {
     const nch = chunksFor(w);
+    if (fuses(p, nch, rows)) return fused(set, stream, qa, cache, scales, t, tokens, counts, w, out, rows, heads, lw, nch, scale, headBlock(rows));
     try chunks(set, stream, qa, cache, scales, t, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, headBlock(rows), true);
     try merge(set, stream, p, out, counts, rows, heads, lw, nch, true);
+}
+
+/// Whether a sparse call of `rows` rows over `nch` chunks merges in its chunk kernel: its partials would not fit `p`.
+pub fn fuses(p: Partials, nch: usize, rows: usize) bool {
+    return p.rows != 0 and nch * rows > p.rows;
+}
+
+/// tf_glm_chunks_*_fused: block (row, hb heads) over the row's nch chunks, merged as tf_glm_merge merges them.
+fn fused(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, tokens: u64, counts: u64, w: usize, out: u64, rows: usize, heads: usize, lw: usize, nch: usize, scale: f32, hb: usize) !void {
+    if (lw != 512) return error.LatentShape;
+    if (scales != 0 and t.pt != 0) return error.Fp8OnPages;
+    const f = switch (hb) {
+        heads_tile => if (scales == 0) set.glue.chunks_16_fused else set.glue.chunks_16_fp8_fused,
+        heads_tile_wide => if (scales == 0) set.glue.chunks_32_fused else set.glue.chunks_32_fp8_fused,
+        else => return error.HeadBlock,
+    };
+    var a: cuda.Args = .{};
+    a.add(qa);
+    a.add(cache);
+    if (scales != 0) a.add(scales);
+    inline for (.{ tokens, counts, out, @as(i64, @intCast(heads)), @as(i64, @intCast(w)), scale, @as(c_int, @intCast(nch)) }) |v| a.add(v);
+    const shared = if (hb == heads_tile_wide) glue.chunksSmem(heads_tile_wide) else glue.chunksSmem(heads_tile);
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb) }, .block = .{ .x = chunk_threads }, .shared = shared }, stream, &a);
 }
 
 fn merge(set: glue.Set, stream: cuda.Stream, p: Partials, out: u64, counts: u64, rows: usize, heads: usize, lw: usize, nch: usize, sparse: bool) !void {
@@ -142,6 +171,14 @@ fn merge(set: glue.Set, stream: cuda.Stream, p: Partials, out: u64, counts: u64,
     var a: cuda.Args = .{};
     inline for (.{ p.po, p.pm, p.pl, out, counts, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(c_int, @intCast(nch)), @as(c_int, @intFromBool(sparse)) }) |v| a.add(v);
     try cuda.launch.launch(set.glue.merge, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(heads) }, .block = .{ .x = 128 } }, stream, &a);
+}
+
+test "GLM MLA: a sparse call merges in its chunk kernel only past its partials' rows" {
+    const p: Partials = .{ .po = 1, .pm = 2, .pl = 3, .rows = 13 * 512 }; // a 4,096-row prompt buffer's dense calls
+    try std.testing.expect(!fuses(p, chunksFor(2051), 1331));
+    try std.testing.expect(fuses(p, chunksFor(2051), 1332));
+    try std.testing.expect(fuses(p, chunksFor(2051), 4096));
+    try std.testing.expect(!fuses(.{ .po = 1, .pm = 2, .pl = 3 }, chunksFor(2051), 4096)); // rows 0: all fit
 }
 
 test "latent.py's tiling rules" {

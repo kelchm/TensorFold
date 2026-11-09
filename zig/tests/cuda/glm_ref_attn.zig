@@ -157,4 +157,51 @@ pub fn sparse(r: *Rig, set: glm.glue.Set) !void {
     try latent.sparseAttention(set, r.s, dq, c.dev, .{}, dtok, try r.dev(std.mem.asBytes(&none)), w, try partials(r, nch, 1), left, 1, heads, lw, scale);
     for (try r.back(left, heads * lw * 2)) |b| try check.expect(b == 0xff, "latent sparse attention: a row with count 0 is left alone", .{});
     check.pass("latent sparse attention over up to {d} tokens: within float64 tolerance, one-row windows equal, count 0 left alone", .{w});
+    try fusedSame(r, set);
+}
+
+/// The fused merge (latent.fuses) vs chunks + tf_glm_merge, byte for byte: BF16, E4M3, both head blocks, counts 0..w.
+fn fusedSame(r: *Rig, set: glm.glue.Set) !void {
+    const w = 2051;
+    const keys = 9000;
+    const nch = latent.chunksFor(w);
+    const scale: f32 = 0.0625;
+    const bfc = try r.dev(std.mem.sliceAsBytes(try r.bfs(keys * lw, 1.0)));
+    const codes = try r.a.alloc(u8, keys * lw + keys * 4); // E4M3 codes of either sign, never NaN, then each row's scale
+    for (codes[0 .. keys * lw]) |*b| {
+        const v = r.rng.int(u8);
+        b.* = if (v & 0x7F == 0x7F) v - 1 else v;
+    }
+    for (std.mem.bytesAsSlice(f32, codes[keys * lw ..])) |*v| v.* = 0.001 + r.rng.float(f32) * 0.01;
+    const f8c = try r.dev(codes);
+    var total: usize = 0;
+    for ([_]usize{ 1, 16, 70, 300 }) |rows| {
+        const dq = try r.dev(std.mem.sliceAsBytes(try r.bfs(rows * heads * lw, 1.0)));
+        const tok = try r.a.alloc(i32, rows * w);
+        @memset(tok, -1);
+        const cnt = try r.a.alloc(i32, rows);
+        for (cnt, 0..) |*n, row| {
+            const pick = [_]usize{ 0, 1, 511, 512, 513, 1537, 2051 };
+            n.* = @intCast(if (row < pick.len) pick[row] else r.rng.uintLessThan(usize, w + 1));
+            for (tok[row * w ..][0..@intCast(n.*)]) |*v| v.* = @intCast(r.rng.uintLessThan(usize, keys));
+        }
+        const dtok = try r.dev(std.mem.sliceAsBytes(tok));
+        const dcnt = try r.dev(std.mem.sliceAsBytes(cnt));
+        for ([_]struct { name: []const u8, cache: u64, scales: u64 }{ .{ .name = "BF16", .cache = bfc, .scales = 0 }, .{ .name = "E4M3", .cache = f8c, .scales = f8c + keys * lw } }) |form| {
+            const a = try r.zeros(rows * heads * lw * 2);
+            const b = try r.zeros(rows * heads * lw * 2);
+            var p = try partials(r, nch, rows);
+            p.rows = nch * rows; // fits: chunks + tf_glm_merge
+            try check.expect(!latent.fuses(p, nch, rows), "the reference call keeps its partials", .{});
+            try latent.sparseAttentionFormat(set, r.s, dq, form.cache, form.scales, .{}, dtok, dcnt, w, p, a, rows, heads, lw, scale);
+            p.rows = 1; // past them: the in-kernel merge
+            try check.expect(latent.fuses(p, nch, rows), "the fused call merges in the kernel", .{});
+            try latent.sparseAttentionFormat(set, r.s, dq, form.cache, form.scales, .{}, dtok, dcnt, w, p, b, rows, heads, lw, scale);
+            var name: [128]u8 = undefined;
+            const what = try std.fmt.bufPrint(&name, "latent sparse attention, {s}, {d} rows: the in-kernel merge equals chunks + merge", .{ form.name, rows });
+            try check.sameBytes(what, try r.back(b, rows * heads * lw * 2), try r.back(a, rows * heads * lw * 2));
+            total += 1;
+        }
+    }
+    check.pass("latent sparse attention: the in-kernel merge equals chunks + tf_glm_merge byte for byte in {d} calls", .{total});
 }
