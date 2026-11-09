@@ -298,3 +298,81 @@ test "GLM prompt workflow: a batched prompt carries the arithmetic opt-in into i
     try pass(&e, &.{.{ .slot = 9, .ids = &.{ 61, 62 } }});
     try t.expect(!fw.observed_absorb_mma);
 }
+
+/// Drafter.ingest over tagged rows: each run's rows into the context input (unless already there), then into the ring.
+const PairDrafter = struct {
+    const C = glm.dflash.MAX_CTX;
+    const R = glm.dflash.TAP_ROW;
+    const cin0: u64 = 1 << 40;
+    const taps0: u64 = 2 << 40;
+    cin: u64 = cin0,
+    taps_prefill: u64 = taps0,
+    tap_rows: usize = C,
+    input: [C]u32 = @splat(0),
+    tapped: [C]u32 = @splat(0),
+    ring: [4 * C]u32 = @splat(0), // by position, not wrapped: the window's rows stay comparable
+    s: struct { ring: ?struct { ptr: u64 } = .{ .ptr = 0 } } = .{},
+    copies: usize = 0,
+    fn row(d: *PairDrafter, ptr: u64) *u32 {
+        return if (ptr >= taps0) &d.tapped[(ptr - taps0) / R] else &d.input[(ptr - cin0) / R];
+    }
+    pub fn slot(d: *PairDrafter, _: u32) !*@TypeOf(d.s) {
+        return &d.s;
+    }
+    pub fn ingest(d: *PairDrafter, _: void, runs: []const glm.dflash.Run) !void {
+        var at: usize = 0;
+        for (runs) |r| {
+            const to = d.cin + at * R;
+            if (r.taps != to) {
+                d.copies += 1;
+                for (0..r.n) |j| d.row(to + j * R).* = d.row(r.taps + j * R).*;
+            }
+            for (0..r.n) |j| d.ring[@as(usize, @intCast(r.pos0)) + j] = d.row(to + j * R).*;
+            at += r.n;
+        }
+    }
+};
+
+test "GLM prompt workflow: a paired step feeds DFlash2 the rows and positions of two chunks one at a time" {
+    const df = glm.dflash;
+    const C = PairDrafter.C;
+    const W: usize = @intCast(df.WIN);
+    const Case = struct { start: usize, len: usize };
+    const cases = [_]Case{
+        .{ .start = 0, .len = C + glm.prompt_pair.min_rows }, // both tap: b's rows read in place after a's
+        .{ .start = 0, .len = 2 * C - 1 }, // a keeps one row
+        .{ .start = 0, .len = 2 * C }, // only b taps, into taps_prefill
+        .{ .start = 0, .len = 2 * C + 300 }, // b partly in the window
+        .{ .start = C, .len = 4 * C }, // neither taps
+        .{ .start = 2 * C, .len = 3 * C + 1000 }, // the third pair of a long prompt
+    };
+    for (cases) |c| {
+        const rb = @min(c.len - c.start - C, C);
+        const p = glm.prompt_pair.tapPlan(c.start, rb, c.len);
+        var one: PairDrafter = .{}; // a chunk a step: each into taps_prefill, then ingested
+        for ([_][2]usize{ .{ c.start, C }, .{ c.start + C, rb } }) |ch| {
+            for (0..ch[1]) |i| one.tapped[i] = @intCast(ch[0] + i + 1);
+            try df.ingestPrompt(&one, {}, 0, ch[0], ch[1], c.len, 0);
+        }
+        var two: PairDrafter = .{}; // the pass taps both chunks, then a ingests, then b
+        if (p.a_kept > 0) for (0..C) |i| {
+            two.tapped[i] = @intCast(c.start + i + 1);
+        };
+        if (p.b) for (0..rb) |i| {
+            (if (p.a_kept > 0) &two.input[p.a_kept + i] else &two.tapped[i]).* = @intCast(c.start + C + i + 1);
+        };
+        try df.ingestPrompt(&two, {}, 0, c.start, C, c.len, 0);
+        if (p.a_kept > 0) try df.ingestPromptIn(&two, {}, 0, c.start + C, rb, c.len, p.a_kept) else try df.ingestPrompt(&two, {}, 0, c.start + C, rb, c.len, 0);
+        try t.expectEqualSlices(u32, &one.ring, &two.ring);
+        try t.expectEqual(PairDrafter.cin0, two.cin); // the context input is the drafter's own again
+        if (p.a_kept > 0) try t.expectEqual(@as(usize, 1), two.copies); // only a's rows were copied in
+        var kept: usize = 0; // the pair's rows in the last window (none where neither chunk taps)
+        for (one.ring) |v| kept += @intFromBool(v != 0);
+        try t.expectEqual(c.start + C + rb -| @max(c.start, c.len -| W), kept);
+    }
+    var d: PairDrafter = .{};
+    // a chunk starting before the window has rows a copy would skip; past MAX_CTX the input has no room
+    try t.expectError(error.BadPromptContext, df.ingestPromptIn(&d, {}, 0, C, C, 2 * C + 1, 0));
+    try t.expectError(error.DrafterContextTooWide, df.ingestPromptIn(&d, {}, 0, 2 * C, C, 3 * C, 1));
+    try t.expectEqual(PairDrafter.cin0, d.cin);
+}
