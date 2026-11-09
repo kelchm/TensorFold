@@ -3,6 +3,8 @@ const registry = @import("registry.zig");
 pub const records = [_]registry.CudaRecord{
     .{ .launch = .{ .name = "exl3_experts tf_exl3_grouped_1_nt4", .symbol = "tf_exl3_grouped_1_nt4", .image = "exl3_experts", .threads = 128 }, .usage = registry.none },
     .{ .launch = .{ .name = "exl3_experts tf_exl3_grouped_1_k8r8", .symbol = "tf_exl3_grouped_1_k8r8", .image = "exl3_experts", .threads = 128 }, .usage = registry.none },
+    .{ .launch = .{ .name = "exl3_experts tf_exl3_grouped_1_k8r8s", .symbol = "tf_exl3_grouped_1_k8r8s", .image = "exl3_experts", .threads = 128 }, .usage = registry.none },
+    .{ .launch = .{ .name = "exl3_experts tf_exl3_grouped_1_k8r16s", .symbol = "tf_exl3_grouped_1_k8r16s", .image = "exl3_experts", .threads = 128 }, .usage = registry.none },
 };
 
 test "GLM decode port: source kit counts never stand in for missing compile receipts" {

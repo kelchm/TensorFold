@@ -105,7 +105,7 @@ pub fn scratch(base: u64, l: Layer, rows: usize, slots: usize) !Scratch {
 }
 
 /// Decode windows' grouped kernels: grouped[codebook] (every family), or GLM's opt-in forms with grouped_1's bits.
-pub const DecodeForm = enum { common, tiles };
+pub const DecodeForm = enum { common, tiles, read_once };
 
 /// A projection's grouped kernel and its 16-column tiles a block.
 pub const Tiles = struct { f: Function, nt: usize };
@@ -124,6 +124,7 @@ pub const Experts = struct {
     decode: DecodeForm = .common,
     nt4: Function = undefined, // tf_exl3_grouped_1_nt4: mcg at 4 tiles a block, any width
     k8r8: Function = undefined, // tf_exl3_grouped_1_k8r8: 4-bit mcg at 4 tiles a block, windows of at most 8 rows
+    read_once: [2]Function = undefined, // k8r8 reading each trellis word once: k8r8s (1-8 rows), k8r16s (9-32 rows)
 
     pub fn load(d: *const Driver) !Experts {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -162,6 +163,7 @@ pub const Experts = struct {
             e.nt4 = try e.mod.function("tf_exl3_grouped_1_nt4");
             e.k8r8 = try e.mod.function("tf_exl3_grouped_1_k8r8");
         }
+        if (form == .read_once) e.read_once = .{ try e.mod.function("tf_exl3_grouped_1_k8r8s"), try e.mod.function("tf_exl3_grouped_1_k8r16s") };
         e.decode = form;
     }
 
@@ -170,6 +172,7 @@ pub const Experts = struct {
         const common: Tiles = .{ .f = e.grouped[@backingInt(l.codebook)], .nt = 8 };
         const n = if (which == .gate_up) l.width else l.dims;
         if (e.decode == .common or l.codebook != .mcg or rows > 32 or n % 64 != 0) return common;
+        if (e.decode == .read_once and l.uniform_k2 == 8) return .{ .f = e.read_once[@intFromBool(rows > 8)], .nt = 4 };
         if (rows <= 8 and l.uniform_k2 == 8) return .{ .f = e.k8r8, .nt = 4 };
         const four = switch (which) {
             .gate_up => rows >= 3,

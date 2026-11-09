@@ -415,9 +415,12 @@ sm_121 load a warp's next k tile while the current one decodes: each bit-equal t
 EXL3 pack's widths (two controls: the next load reading tile i + 2, the last tile decoding the words before it).
 Older SMs build main's loop, and their records are main's.
 GLM's decode-window kernels (`tf_exl3_grouped_1_k8r8` at one 4-bit width for windows of up to 8 rows,
-`tf_exl3_grouped_1_nt4` at 4 tiles a block to 32 rows) register as byte replacements of the served
-`tf_exl3_grouped_1` at those windows, the one-width kernel on 4-bit experts (`contract_exl3_decode.zig`; one control:
-the 8-row kernel summing its warps last to first). Only GLM selects them; their compile receipts remain pending.
+`tf_exl3_grouped_1_nt4` at 4 tiles a block to 32 rows, and `_k8r8s` and `_k8r16s`, which on sm_120 and sm_121 read
+each trellis word once and shuffle it to the lanes that decode it) register as byte replacements of the served
+`tf_exl3_grouped_1` at those windows, the one-width kernels on 4-bit experts (`contract_exl3_decode.zig`; three
+controls: the 8-row kernel summing its warps last to first, and the read-once loop taking a last-tile word from the
+next lane or the last tile's A fragment from the tile before). Only GLM selects them (`TF_EXL3_SHFL=0` keeps the
+lane-window loads); their compile receipts remain pending.
 
 CUDA also checks MOSS-Image's glue (`moss_image.cu`: the norm, plain and modulated; q/k norm and rotary into packed
 rows; situ; the gated add), each output within float64's range at its torch bf16 points (five controls, each dropping

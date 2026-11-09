@@ -38,6 +38,21 @@ extern "C" __global__ void tf_exl3_grouped_1_k8r8(tf_exl3::GroupedArgs a) {  // 
     tf_exl3::grouped_body_one<1, 4, 4, GROUPED_LOAD, 8, 8>(a, blockIdx.x, blockIdx.y, blockIdx.z);
 }
 
+// The same with each 4-bit trellis word read once (warp_tiles_shfl) on sm_120 up; older SMs build k8r8's loop.
+#if __CUDA_ARCH__ >= 1200
+constexpr int GROUPED_SHFL = tf_exl3::SHFL;
+#else
+constexpr int GROUPED_SHFL = tf_exl3::PLAIN;
+#endif
+
+extern "C" __global__ void tf_exl3_grouped_1_k8r8s(tf_exl3::GroupedArgs a) {  // windows of at most 8 rows
+    tf_exl3::grouped_body_one<1, 4, 4, GROUPED_SHFL, 8, 8>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
+extern "C" __global__ void tf_exl3_grouped_1_k8r16s(tf_exl3::GroupedArgs a) {  // windows of 9 to 32 rows
+    tf_exl3::grouped_body_one<1, 4, 4, GROUPED_SHFL, 8, 16>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
 namespace tf_exl3 {
 
 // Grouping in one block: distinct experts (< E) in id order, members row * 32 + slot in row order, -1 after the last.

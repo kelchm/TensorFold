@@ -19,6 +19,10 @@ pub const cases = [_]Case{
     .{ .symbol = "tf_exl3_grouped_1_k8r8", .name = "cuda exl3 decode tf_exl3_grouped_1_k8r8 (4-bit mcg, 1-8 rows)" },
     .{ .symbol = "tf_exl3_grouped_1_nt4", .name = "cuda exl3 decode tf_exl3_grouped_1_nt4 (mcg, 4 tiles, 1-32 rows)", .four = false, .rows = 32 },
     .{ .symbol = "tf_ctl_exl3_decode_order", .name = "control: exl3 decode k8r8 sums its warps last to first", .control = true },
+    .{ .symbol = "tf_exl3_grouped_1_k8r8s", .name = "cuda exl3 decode tf_exl3_grouped_1_k8r8s (4-bit mcg read once, 1-8 rows)" },
+    .{ .symbol = "tf_exl3_grouped_1_k8r16s", .name = "cuda exl3 decode tf_exl3_grouped_1_k8r16s (4-bit mcg read once, 1-32 rows)", .rows = 32 },
+    .{ .symbol = "tf_ctl_exl3_decode_shfl_src", .name = "control: exl3 decode read-once takes a last-tile word from the next lane", .control = true },
+    .{ .symbol = "tf_ctl_exl3_decode_shfl_a", .name = "control: exl3 decode read-once gives the last tile the A fragment before", .control = true },
 };
 
 /// rows, n, k: 3, 2, 1 k tiles a warp; GLM-5.3-Flash's gate/up and down on two ranks and one, at decode windows

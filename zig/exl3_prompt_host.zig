@@ -48,14 +48,14 @@ const Capture = struct {
 fn function(d: *const cuda.Driver, id: usize) cuda.Function {
     return .{ .d = d, .handle = @ptrFromInt(id) };
 }
-var form: ex.DecodeForm = .tiles; // what GLM's loadKernels selects
+var form: ex.DecodeForm = .read_once; // what GLM's loadKernels selects (TF_EXL3_SHFL=0: tiles)
 fn run(rows: usize, prompt: bool, shared: bool) !void {
     Capture.reset();
     var d: cuda.Driver = undefined;
     d.api.cuLaunchKernel = Capture.launch;
     d.api.cuMemcpy2DAsync_v2 = Capture.copy;
     const s: cuda.Stream = .{ .d = &d, .handle = null };
-    var k: ex.Experts = .{ .mod = undefined, .group = function(&d, 1), .rot_in = function(&d, 2), .grouped = @splat(function(&d, 3)), .gateup = function(&d, 4), .down_combine = function(&d, 5), .decode = form, .nt4 = function(&d, 6), .k8r8 = function(&d, 7) };
+    var k: ex.Experts = .{ .mod = undefined, .group = function(&d, 1), .rot_in = function(&d, 2), .grouped = @splat(function(&d, 3)), .gateup = function(&d, 4), .down_combine = function(&d, 5), .decode = form, .nt4 = function(&d, 6), .k8r8 = function(&d, 7), .read_once = .{ function(&d, 8), function(&d, 9) } };
     if (comptime @hasField(ex.Experts, "prompt")) k.prompt = .{ .rotate = function(&d, 11), .gateup = function(&d, 12), .down = function(&d, 13), .down_slots = function(&d, 13), .gateup_glm = function(&d, 12), .down_glm = function(&d, 13) };
     const ek: glm.experts.Kernels = .{ .nvfp4 = undefined, .b32 = null, .router = .{ .plan_small = function(&d, 20), .plan_rank = function(&d, 21), .plan_offsets = function(&d, 22), .plan_scatter = function(&d, 23), .plan_rows = function(&d, 24), .plan_rank_rows = function(&d, 25), .plan_scatter_rows = function(&d, 26) } };
     const w: glm.exl3.Experts = .{ .gt = 100, .ut = 200, .dt = 300, .k2 = 400, .suh_g = 500, .suh_u = 600, .svh_g = 700, .svh_u = 800, .suh_d = 900, .svh_d = 1000, .shx = shared };
@@ -136,27 +136,35 @@ test "exl3 prompt: whole passes and the next chunk keep input, pick and direct-s
 }
 
 test "exl3 prompt: decode retains the existing split-K launches" {
-    for ([_]ex.DecodeForm{ .common, .tiles }) |f| {
+    for ([_]ex.DecodeForm{ .common, .tiles, .read_once }) |f| {
         form = f;
-        defer form = .tiles;
+        defer form = .read_once;
         try run(4, false, true);
         try std.testing.expectEqual(@as(usize, 0), Capture.by(12).len);
         try std.testing.expectEqual(@as(usize, 2), Capture.copied);
         try std.testing.expectEqual(@as(usize, 9 * 512 * 4), Capture.copies[1].dst_pitch);
-        try std.testing.expect(Capture.by(1).len > 0 and Capture.by(2).len > 0 and Capture.by(if (f == .common) 3 else 7).len > 0);
+        try std.testing.expect(Capture.by(1).len > 0 and Capture.by(2).len > 0 and Capture.by(switch (f) {
+            .common => 3,
+            .tiles => 7,
+            .read_once => 8,
+        }).len > 0);
     }
 }
 
 test "exl3 prompt: GLM decode windows take the one-width and 4-tile kernels to 32 rows, grouped_1 past them" {
-    for (1..41) |rows| {
+    defer form = .read_once;
+    for ([_]ex.DecodeForm{ .tiles, .read_once }) |f| for (1..41) |rows| {
+        form = f;
         try run(rows, false, true);
-        const want = [2]usize{ if (rows <= 8) 7 else if (rows <= 32 and rows >= 3) 6 else 3, if (rows <= 8) 7 else if (rows <= 32) 6 else 3 };
+        const tiles = [2]usize{ if (rows <= 8) 7 else if (rows <= 32 and rows >= 3) 6 else 3, if (rows <= 8) 7 else if (rows <= 32) 6 else 3 };
+        const once: usize = if (rows <= 8) 8 else if (rows <= 32) 9 else 3;
+        const want = if (f == .tiles) tiles else [2]usize{ once, once };
         for ([2]usize{ 2, 4 }, want, [2]u32{ 256, 512 }) |at, id, n| { // group, rot_in, gate/up, epilogue, down, combine
             try std.testing.expectEqual(id, Capture.calls[at].id);
             try std.testing.expectEqual(n / (if (id == 3) @as(u32, 128) else 64), Capture.calls[at].grid[1]);
             try std.testing.expectEqual(@as(u32, 128), Capture.calls[at].block);
         }
-    }
+    };
 }
 
 test "exl3 prompt: the common dispatch requires verified mcg4 geometry and keeps every fallback" {

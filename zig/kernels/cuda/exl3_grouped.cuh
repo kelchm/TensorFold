@@ -23,8 +23,8 @@ struct GroupedArgs {
     int k, n, p, sk, maxm, slots, nexp_max, mats, ns, standard, skip;
 };
 
-// How a warp reads its k tiles: main's loop, or a tile ahead (sm_120 up); SKIP and STALE are the contract's faults.
-enum Load : int { PLAIN = 0, AHEAD = 1, SKIP = 2, STALE = 3 };
+// How a warp reads its k tiles: main's loop, a tile ahead, or each word once (SHFL); the rest: the contract's faults.
+enum Load : int { PLAIN = 0, AHEAD = 1, SKIP = 2, STALE = 3, SHFL = 4, SHFL_SRC = 5, SHFL_A = 6 };
 
 // One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc: per-lane loads and the shared decode (same bits).
 template <int CB, int K2, int NT, int LOAD>
@@ -63,6 +63,90 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt
         for (int j = 0; j < NT; ++j) {
             uint32_t b0[2], b1[2];
             decode_lane<K2, CB>(w[j], lane, b0, b1);
+            mma16816(acc[j][0], a, b0);
+            mma16816(acc[j][1], a, b1);
+        }
+    }
+}
+
+// lane_states<8>'s values at 4 bits (fixed nibble offsets): V = w0:w1 (w0 high), s[j] = (V >> (28 - 4 j)) & 0xffff.
+__device__ __forceinline__ void lane_states8(uint32_t w0, uint32_t w1, uint32_t (&s)[8]) {
+    s[0] = __funnelshift_r(w1, w0, 28) & 0xffffu;
+    s[1] = __funnelshift_r(w1, w0, 24) & 0xffffu;
+    s[2] = __funnelshift_r(w1, w0, 20) & 0xffffu;
+    s[3] = w1 >> 16;
+    s[4] = (w1 >> 12) & 0xffffu;
+    s[5] = __byte_perm(w1, 0u, 0x4421);
+    s[6] = (w1 >> 4) & 0xffffu;
+    s[7] = w1 & 0xffffu;
+}
+
+// decode2<CB_MCG> with its AND mask in a register `m` (0x8FFF8FFF): the same operations on the same values.
+__device__ __forceinline__ uint32_t decode2_mcg(uint32_t s0, uint32_t s1, uint32_t m) {
+    uint32_t x0 = s0 * 0xCBAC1FEDu, x1 = s1 * 0xCBAC1FEDu;
+    x0 = (x0 & m) ^ 0x3B603B60u;
+    x1 = (x1 & m) ^ 0x3B603B60u;
+    const uint32_t lo = __byte_perm(x0, x1, 0x5410);
+    const uint32_t hi = __byte_perm(x0, x1, 0x7632);
+    const half2 r = __hadd2(*reinterpret_cast<const half2*>(&lo), *reinterpret_cast<const half2*>(&hi));
+    return *reinterpret_cast<const uint32_t*>(&r);
+}
+
+// warp_tiles reading each trellis word once (lane l loads word l, a tile ahead; lanes shuffle): the same bits.
+template <int CB, int K2, int NT, int LOAD>
+__device__ __forceinline__ void warp_tiles_shfl(const uint32_t* T, int ntiles, int kt0, int nkt, int nt0, const half* x0,
+                                                const half* x1, bool ok0, bool ok1, int lane, float (&acc)[NT][2][4],
+                                                int opq) {  // opq: any value below 256 (the call's matrices)
+    constexpr int TW = tile_words<K2>(), LW = lane_words<K2>();
+    static_assert(TW <= 32, "a word a lane");
+    const size_t kstride = (size_t)ntiles * TW;
+    const uint32_t* tb = T + (size_t)kt0 * kstride + (size_t)nt0 * TW;
+    int word, offset;
+    lane_start<K2>(lane, word, offset);
+    const bool own = TW == 32 || lane < TW;
+    const uint32_t mask = 0x8FFF8FFFu | ((uint32_t)opq >> 8);  // exactly 0x8FFF8FFF (opq < 256), held in a register
+    uint32_t nx[NT], na[4];  // the next tile's word `lane` of each n tile and its A fragment, in flight
+    auto load = [&](int i) {
+        const uint32_t* t0 = tb + (size_t)i * kstride;
+#pragma unroll
+        for (int j = 0; j < NT; ++j) nx[j] = own ? ldg_stream_u32(t0 + j * TW + lane) : 0u;
+        const int k = (kt0 + i) * 16;
+        na[0] = ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u;
+        na[1] = ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k) : 0u;
+        na[2] = ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k + 8) : 0u;
+        na[3] = ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k + 8) : 0u;
+    };
+    if (nkt > 0) load(0);
+    for (int i = 0; i < nkt; ++i) {
+        uint32_t cur[NT], a[4];
+#pragma unroll
+        for (int j = 0; j < NT; ++j) cur[j] = nx[j];
+#pragma unroll
+        for (int c = 0; c < 4; ++c) a[c] = na[c];
+        if (LOAD == SHFL_A && i == nkt - 1 && i > 0) {  // planted: the last tile keeps the tile before's A fragment
+            const int k = (kt0 + i - 1) * 16;
+            a[0] = ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u;
+            a[2] = ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k + 8) : 0u;
+        }
+        if (i + 1 < nkt) load(i + 1);
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            uint32_t w[LW];
+#pragma unroll
+            for (int l = 0; l < LW; ++l) {
+                const int src = (LOAD == SHFL_SRC && i == nkt - 1 && l == LW - 1 ? word + l + 1 : word + l) % TW;  // planted
+                w[l] = __shfl_sync(0xffffffffu, cur[j], src);
+            }
+            uint32_t b0[2], b1[2];
+            if constexpr (K2 == 8 && CB == CB_MCG) {
+                uint32_t st[8];
+                lane_states8(w[0], w[1], st);
+                b0[0] = decode2_mcg(st[0], st[1], mask);
+                b0[1] = decode2_mcg(st[2], st[3], mask);
+                b1[0] = decode2_mcg(st[4], st[5], mask);
+                b1[1] = decode2_mcg(st[6], st[7], mask);
+            } else
+                decode_lane<K2, CB>(w, lane, b0, b1);
             mma16816(acc[j][0], a, b0);
             mma16816(acc[j][1], a, b1);
         }
@@ -204,7 +288,10 @@ __device__ __forceinline__ void grouped_body_one(const GroupedArgs a, int u, int
             for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
 
     __shared__ __align__(16) float red[W][RR][NT * 16];
-    warp_tiles<CB, K2F, NT, LOAD>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);
+    if constexpr (LOAD >= SHFL)
+        warp_tiles_shfl<CB, K2F, NT, LOAD>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc, a.mats);
+    else
+        warp_tiles<CB, K2F, NT, LOAD>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);
 
 #pragma unroll
     for (int i = 0; i < NT; ++i)
