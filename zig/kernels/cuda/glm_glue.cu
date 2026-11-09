@@ -3,6 +3,7 @@
 #include "glm_glue_rows.cuh"
 #include "glm_glue_hc.cuh"
 #include "glm_glue_hcfuse.cuh"
+#include "glm_glue_hc_split.cuh"
 #include "glm_glue_moe.cuh"
 #include "glm_glue_router.cuh"
 #include "glm_glue_latent.cuh"

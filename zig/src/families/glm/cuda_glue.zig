@@ -48,8 +48,11 @@ pub const Kernels = struct {
     router_tile: cuda.Function,
     hc_partial: cuda.Function,
     hc_partial8: cuda.Function,
+    hc_partial8_o2: cuda.Function, // its bytes from 13 blocks of two dots a K block (hc_part)
     hc_finish: cuda.Function,
     hc_finish_f32w: cuda.Function,
+    hc_finish_split: cuda.Function, // the same bytes with warp 0's Sinkhorn beside the collapse (hc_split)
+    hc_finish_f32w_split: cuda.Function,
     absorb_q: cuda.Function,
     expand_v: cuda.Function,
     lat_write: cuda.Function,
@@ -78,10 +81,18 @@ pub const Kernels = struct {
     scores: cuda.Function,
     latent_mma_kn: cuda.Function,
     latent_mma_nk: cuda.Function,
+    hc_split: bool = true, // TF_GLM_HC_SPLIT: a decode window's hc_finish on the split schedule (the same bits)
+    hc_part: bool = true, // TF_GLM_HC_PART: a decode window to hc_part_rows rows takes tf_glm_hc_partial8_o2 (the same bits)
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
-        inline for (@typeInfo(Kernels).@"struct".field_names) |name| @field(k, name) = try m.function("tf_glm_" ++ name);
+        const info = @typeInfo(Kernels).@"struct";
+        inline for (info.field_names, info.field_types) |name, T| if (T == cuda.Function) {
+            @field(k, name) = try m.function("tf_glm_" ++ name);
+        };
+        const env = @import("sys").environment;
+        k.hc_split = env.read(bool, "TF_GLM_HC_SPLIT", true) catch true;
+        k.hc_part = env.read(bool, "TF_GLM_HC_PART", true) catch true;
         try k.bmm_tile.allowDynamicShared(bmm_tile_smem);
         try k.bmm_tile1.allowDynamicShared(bmm_tile1_smem[1]);
         try k.chunks_16.allowDynamicShared(chunksSmem(16));
@@ -219,6 +230,9 @@ pub fn combine(set: Set, stream: cuda.Stream, y: u64, y_f32: bool, wts: u64, out
 /// K blocks of the hyper-connection mixing dots (glue.HC_BLOCKS): fixed by the shape, like the router's slices.
 pub const hc_blocks = 16;
 
+/// The most rows tf_glm_hc_partial8_o2 takes; past them tf_glm_hc_partial8 is faster (source kit's measurement).
+pub const hc_part_rows = 16;
+
 /// The mixing kernels' scratch: rows x hc_blocks x 32 fp32 (24 dots and the sum of squares of each K block).
 pub fn hcPartBytes(rows: usize) usize {
     return rows * hc_blocks * 32 * 4;
@@ -233,7 +247,9 @@ pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale:
     var a: cuda.Args = .{};
     inline for (.{ x, fn_w, part, i64of(s * d), @as(c_int, hc_blocks) }) |v| a.add(v);
     // Decode windows (16 blocks a row) take each block's 8 steps at once (`pdl_hc`: dependents); prompt rows 4 a block.
-    if (rows < hc_prompt_rows) {
+    if (rows <= hc_part_rows and set.glue.hc_part) {
+        try cuda.launch.launch(set.glue.hc_partial8_o2, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks, .z = 24 / 2 + 1 }, .block = .{ .x = 256 }, .pdl = set.pdl_hc }, stream, &a);
+    } else if (rows < hc_prompt_rows) {
         try cuda.launch.launch(set.glue.hc_partial8, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks }, .block = .{ .x = 1024 }, .pdl = set.pdl_hc }, stream, &a);
     } else {
         a.add(i64of(rows));
@@ -244,13 +260,14 @@ pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale:
 
 /// hc_pre's second launch alone, on the K blocks' partials already in `part` (hcPre's first, or hcPostPartial).
 pub fn hcFinish(set: Set, stream: cuda.Stream, x: u64, base: u64, scale: u64, norm: Norm, out: u64, xs: u64, post: u64, comb: u64, part: u64, eps: f32, hc_eps: f32, iters: usize, rows: usize) !void {
+    const split = set.glue.hc_split and rows < hc_prompt_rows; // a decode window's latency; prompt rows keep the one-warp schedule
     const f, const w = switch (norm) {
-        .bf16 => |p| .{ set.glue.hc_finish, p },
-        .f32 => |p| .{ set.glue.hc_finish_f32w, p },
+        .bf16 => |p| .{ if (split) set.glue.hc_finish_split else set.glue.hc_finish, p },
+        .f32 => |p| .{ if (split) set.glue.hc_finish_f32w_split else set.glue.hc_finish_f32w, p },
     };
     var b: cuda.Args = .{};
     inline for (.{ x, part, base, scale, w, out, xs, post, comb, eps, hc_eps, @as(c_int, hc_blocks), cint(iters) }) |v| b.add(v);
-    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 }, .pdl = set.pdl_hc and rows < 64 }, stream, &b);
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 }, .pdl = set.pdl_hc and rows < hc_prompt_rows }, stream, &b);
 }
 
 /// TF_GLM_HC_FUSE: hcPost, then the next site's hc_partial (`fn_w`) into `part` for hcFinish; same bytes, x read once.

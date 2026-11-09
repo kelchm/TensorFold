@@ -39,6 +39,7 @@ pub const cuda_pending = @import("exl3_prompt_glm_records.zig").records ++
     @import("glm_hc_fuse_records.zig").records ++
     @import("qwen_whole_records.zig").records ++
     @import("glm_prompt_records.zig").records ++
+    @import("glm_hc_split_records.zig").records ++
     @import("cuda_lane_pending.zig").records ++
     @import("weight_only_records.zig").cuda ++
     @import("hc_activation_records.zig").cuda ++
