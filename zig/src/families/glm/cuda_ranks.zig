@@ -19,6 +19,7 @@ pub const Settings = struct {
     pieces: u32 = 3, // TF_GLM_OVERLAP_PIECES: a prompt chunk's exchanges in this many row pieces (1: whole); unset, 8 under solo on the wire.
     solo: u32 = 2048, // TF_GLM_CHUNK_SOLO: 2048, 4096 or 8192 rows while no other stream decodes
     pair: bool = true, // TF_GLM_PROMPT_PAIR: 1 (while no stream decodes, a prompt step takes two chunks, each one's exchanges under the other's sites) or 0
+    pair_solo: bool = false, // TF_GLM_PROMPT_PAIR=solo (with TF_GLM_CHUNK_SOLO=4096): a paired step's chunks are solo passes, the index rings both's width
     index_split: u32 = 2048, // TF_GLM_INDEX_SPLIT: from this position on, rank 0 splits a prompt chunk's indexer rows (0: never)
     heat: ?heat.Bands = null, // TF_HEAT_HIGH and TF_HEAT_LOW (upstream's names): a prompt chunk waits on every rank's hottest zone
     layers: u32 = 0, // TF_GLM_LAYERS: the first this many layers only, a thin model for one-GPU checks (0: all)
@@ -87,8 +88,12 @@ pub const Settings = struct {
         }
         s.l2pf = try l2pf.Options.read(get, problem);
         if (get("TF_GLM_PROMPT_PAIR")) |v| {
-            if (std.mem.eql(u8, v, "1")) s.pair = true else if (std.mem.eql(u8, v, "0")) s.pair = false else {
-                problem.* = "TF_GLM_PROMPT_PAIR: 0 or 1";
+            if (std.mem.eql(u8, v, "1")) s.pair = true else if (std.mem.eql(u8, v, "0")) s.pair = false else if (std.mem.eql(u8, v, "solo")) s.pair_solo = true else {
+                problem.* = "TF_GLM_PROMPT_PAIR: 0, 1 or solo";
+                return error.BadSetting;
+            }
+            if (s.pair_solo and s.solo != 4096) {
+                problem.* = "TF_GLM_PROMPT_PAIR=solo requires TF_GLM_CHUNK_SOLO=4096";
                 return error.BadSetting;
             }
         }
@@ -170,6 +175,11 @@ pub const Settings = struct {
         }
         return s;
     }
+
+    /// The index rings' width each sequence holds: a solo pass's, or with TF_GLM_PROMPT_PAIR=solo a paired step's two.
+    pub fn ringWidth(s: Settings) usize {
+        return if (s.pair_solo) 2 * @as(usize, s.solo) else s.solo;
+    }
 };
 
 /// Off-by-default prompt arithmetic, agreed by every rank before weights load.
@@ -208,7 +218,7 @@ pub const Fingerprint = extern struct {
     kda_wide: u32,
     kda_pad: u32 = 0, // TF_GLM_KDA_PAD: every rank's KDA input rows carry one width
     pieces: u32,
-    pair: u32, // TF_GLM_PROMPT_PAIR: rank 0's paired steps need the second chunk's buffers on every rank
+    pair: u32, // TF_GLM_PROMPT_PAIR (0, 1, 2 for solo): rank 0's paired steps need the second chunk's buffers on every rank
     layers: u32, // TF_GLM_LAYERS (0: all)
     mtp: u32, // 1: the MTP head loads and runs (drafts on); 2: and DFlash2 (--drafter), whose rounds gather
     vision: u32 = 0, // --vision's image tokens (0: off): rank 0 sends image rows every rank must hold
@@ -286,7 +296,7 @@ pub const Fingerprint = extern struct {
             .kda_wide = @intFromBool(s.kda_wide),
             .kda_pad = @intFromBool(s.kda_pad),
             .pieces = s.pieces,
-            .pair = @intFromBool(s.pair),
+            .pair = @as(u32, @intFromBool(s.pair)) + @intFromBool(s.pair_solo),
             .layers = s.layers,
             .mtp = @intFromBool(mtp),
             .roce_multi = @intFromBool(s.roce_multi),

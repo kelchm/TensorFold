@@ -55,13 +55,18 @@ pub fn allowed(e: *const Engine, start: usize, rows: usize) bool {
 
 /// decode._absorb_rows of a step, a chunk's rows at a time: the head's ring holds a window more than a pass.
 pub fn mtpRows(e: *Engine, f: *fw.Forward, ids: []const i32) !void {
+    return mtpRowsAt(e, f, ids, e.bp.fnormed);
+}
+
+/// mtpRows of a step whose final-norm rows are at `hidden` (a paired step's second chunk: the twin's).
+pub fn mtpRowsAt(e: *Engine, f: *fw.Forward, ids: []const i32, hidden: u64) !void {
     const mp = f.prof;
     defer f.prof = mp;
     f.prof = null; // the head's pass as one section
     var done: usize = 0;
     while (done + 1 < ids.len) {
         const nxt = ids[done + 1 .. @min(ids.len, done + 1 + fw.prefill_rows)];
-        try f.mtp(nxt, &.{e.bp.fnormed + done * e.c.hidden * 2});
+        try f.mtp(nxt, &.{hidden + done * e.c.hidden * 2});
         try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + nxt.len);
         done += nxt.len;
     }

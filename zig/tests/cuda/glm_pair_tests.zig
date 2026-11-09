@@ -21,10 +21,11 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
         std.debug.print("REFUSE {s}\n", .{problem});
         return err;
     };
-    try check.expect(set.pair, "glm-pair-check needs TF_GLM_PROMPT_PAIR on (unset or 1)", .{});
+    try check.expect(set.pair, "glm-pair-check needs TF_GLM_PROMPT_PAIR on (unset, 1 or solo)", .{});
     try check.expect(world > 1, "glm-pair-check needs other ranks: at TP=1 an engine makes no twin", .{});
     const C = glm.engine.prompt_rows;
-    const capacity = @max(dc.capacity, 5 * C);
+    const P: usize = if (set.pair_solo) set.solo else C; // a pair's chunk: the grid's, or TF_GLM_PROMPT_PAIR=solo's solo pass
+    const capacity = @max(dc.capacity, 5 * P);
     const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = capacity, .mtp = true, .settings = set });
     defer e.deinit();
     var link = try glm.follow.Link.init(gpu.gpa, gpu.d, &lib, comm, e.stream, capacity);
@@ -37,15 +38,16 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
     const x: glm.follow.Leader = .{ .e = e, .link = &link };
     defer x.end() catch {};
     const V = e.share.vocab.len();
-    const min = glm.prompt_pair.min_rows;
+    try check.expect(e.pair.?.rows == P, "glm-pair-check: the twin holds {d} rows, not {d}", .{ e.pair.?.rows, P });
+    const min = glm.prompt_pair.minRows(P);
     const Case = struct { len: usize, marks: []const u32 = &.{} };
     const cases = [_]Case{
-        .{ .len = 2 * C + 300 }, // a pair and a tail
-        .{ .len = C + min }, // the shortest second chunk
-        .{ .len = 3 * C }, // a pair and a chunk
-        .{ .len = 2 * C }, // a pair to the end
-        .{ .len = C + min - 1 }, // a tail too short to pair
-        .{ .len = 4 * C, .marks = &.{C} }, // a mark at chunk 1: 0 and 1 alone (a pair at 1 rebases apart), then a pair
+        .{ .len = 2 * P + 300 }, // a pair and a tail
+        .{ .len = P + min }, // the shortest second chunk
+        .{ .len = 3 * P }, // a pair and a chunk
+        .{ .len = 2 * P }, // a pair to the end
+        .{ .len = P + min - 1 }, // a tail too short to pair
+        .{ .len = 4 * P, .marks = &.{C} }, // a mark at chunk 1: 0 and 1 alone (a pair at 1 rebases apart), then a pair
     };
     const Kept = struct {
         fn call(_: *anyopaque, _: u32) void {} // the check keeps no state: its marks only shape the steps
@@ -61,7 +63,7 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
         var outs: [2][4]u32 = undefined;
         var logits: [2][]u16 = undefined;
         var paired: [2]u64 = undefined;
-        for (0..2) |twin| { // twin 0 a chunk a step, twin 1 paired where it can, both with the same marks
+        for (0..2) |twin| { // twin 0 a chunk (or solo pass) a step, twin 1 paired where it can, both with the same marks
             e.settings.pair = twin == 1;
             try x.bind(@intCast(2 * i + twin));
             try x.begin(null);
@@ -88,9 +90,11 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
         var want: u64 = 0; // the steps glm.prompt_pair.pairedAt pairs over this prompt, the rings' base followed here
         var base: usize = 0;
         var at: usize = 0;
+        const solo = glm.prompt_solo;
         while (at < len) {
-            const two = glm.prompt_pair.takesTwo(at, len, e.share.world, case.marks) and glm.prompt_pair.ringsAgree(base, st.ring_rows, at, @min(len - at - C, C));
-            const rows = @min(len - at, @as(usize, if (two) 2 * C else C));
+            const two = glm.prompt_pair.takesTwo(at, len, e.share.world, case.marks, P) and glm.prompt_pair.ringsAgree(base, st.ring_rows, at, P, @min(len - at - P, P));
+            const one = !two and e.bp.rows > C and solo.takesChunks(at, len, e.bp.rows, case.marks) and solo.ringsAgree(base, st.ring_rows, at, solo.rowsAt(at, len, e.bp.rows));
+            const rows = @min(len - at, if (two) 2 * P else if (one) e.bp.rows else C);
             if (at + rows > base + st.ring_rows) base = at; // State.ready rebases at the step's start, a whole pool
             want += @intFromBool(two);
             at += rows;

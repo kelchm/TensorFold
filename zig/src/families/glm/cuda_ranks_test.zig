@@ -410,8 +410,39 @@ test "TF_GLM_PROMPT_PAIR: on by default, 0 or 1, and every rank must agree (the 
     const off = try Settings.read(Reader.off, &problem);
     try std.testing.expect(!off.pair);
     try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
-    try std.testing.expectEqualStrings("TF_GLM_PROMPT_PAIR: 0 or 1", problem);
+    try std.testing.expectEqualStrings("TF_GLM_PROMPT_PAIR: 0, 1 or solo", problem);
     const all = [_]Fingerprint{ Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), @splat(0)), Fingerprint.of(2, 1, off, 8192, true, @splat(0), @splat(0), @splat(0)) };
+    try std.testing.expectEqual(Mismatch{ .field = .pair, .rank = 1 }, mismatch(&all).?);
+}
+
+test "TF_GLM_PROMPT_PAIR=solo pairs TF_GLM_CHUNK_SOLO=4096 passes only, rings of both, and every rank must agree" {
+    const Reader = struct {
+        var solo: ?[]const u8 = null;
+        var pair: ?[]const u8 = "solo";
+        fn get(key: [:0]const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "TF_GLM_CHUNK_SOLO")) return solo;
+            return if (std.mem.eql(u8, key, "TF_GLM_PROMPT_PAIR")) pair else null;
+        }
+    };
+    var problem: []const u8 = "";
+    for ([_]?[]const u8{ null, "2048", "8192" }) |width| {
+        Reader.solo = width;
+        try std.testing.expectError(error.BadSetting, Settings.read(Reader.get, &problem));
+        try std.testing.expectEqualStrings("TF_GLM_PROMPT_PAIR=solo requires TF_GLM_CHUNK_SOLO=4096", problem);
+    }
+    Reader.solo = "4096";
+    const on = try Settings.read(Reader.get, &problem);
+    try std.testing.expect(on.pair and on.pair_solo);
+    try std.testing.expectEqual(@as(usize, 8192), on.ringWidth());
+    Reader.pair = "1";
+    const unpaired = try Settings.read(Reader.get, &problem);
+    try std.testing.expect(unpaired.pair and !unpaired.pair_solo);
+    try std.testing.expectEqual(@as(usize, 4096), unpaired.ringWidth());
+    try std.testing.expectEqual(@as(usize, 2048), (Settings{}).ringWidth());
+    var all = [_]Fingerprint{ Fingerprint.of(2, 0, on, 8192, true, @splat(0), @splat(0), @splat(0)), Fingerprint.of(2, 1, on, 8192, true, @splat(0), @splat(0), @splat(0)) };
+    try std.testing.expectEqual(@as(?Mismatch, null), mismatch(&all));
+    try std.testing.expectEqual(@as(u32, 2), all[0].pair);
+    all[1] = Fingerprint.of(2, 1, unpaired, 8192, true, @splat(0), @splat(0), @splat(0));
     try std.testing.expectEqual(Mismatch{ .field = .pair, .rank = 1 }, mismatch(&all).?);
 }
 

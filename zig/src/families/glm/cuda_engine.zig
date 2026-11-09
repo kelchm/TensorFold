@@ -147,7 +147,7 @@ pub const Engine = struct {
         const block32 = !exl3.isExl3(gpa, text) and try @import("cuda_experts.zig").wantsBlock32(gpa, text);
         var m = try fw.Modules.load(d, ctx, block32);
         errdefer m.deinit();
-        const pair = prompt_pair.wanted(o.settings.pair, o.settings.solo > fw.prefill_rows, world);
+        const pair = prompt_pair.wanted(o.settings.pair, o.settings.solo > fw.prefill_rows, o.settings.pair_solo, world);
         var pieces = try fw.Pieces.init(d, o.settings.pieces, pair);
         errdefer pieces.deinit();
         if (o.settings.layers > c.layers) return error.BadLayers;
@@ -194,6 +194,7 @@ pub const Engine = struct {
         if (world > 1 and rank == 0) std.log.info("glm: a prompt chunk's exchanges in {d} row pieces", .{o.settings.pieces});
         if (pair) e.pair = try prompt_pair.Pair.init(d, &e.w, &e.bp, &e.pieces, o.capacity);
         errdefer if (e.pair) |*p| p.deinit();
+        if (pair and o.settings.pair_solo and rank == 0) std.log.info("glm: paired prompt steps of two {d}-row chunks: {d:.2} GiB for the second's buffers, index rings of {d} rows", .{ e.bp.rows, @as(f64, @floatFromInt(e.pair.?.bp.arena.buf.len)) / (1 << 30), e.cur.st.ring_rows });
         e.bd = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
         errdefer e.bd.deinit();
         e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
@@ -284,7 +285,7 @@ pub const Engine = struct {
         if (made) {
             const q = try e.gpa.create(Seq);
             errdefer e.gpa.destroy(q);
-            q.* = .{ .st = try fw.State.initSized(e.gpa, e.d, &e.w, e.capacity, e.settings.kv8, null, e.settings.solo) };
+            q.* = .{ .st = try fw.State.initSized(e.gpa, e.d, &e.w, e.capacity, e.settings.kv8, null, e.settings.ringWidth()) };
             e.seqs.items[slot] = q;
         }
         e.cur = e.seqs.items[slot].?;
@@ -360,8 +361,10 @@ pub const Engine = struct {
         const split = e.index_split; // this step's alone
         e.index_split = false;
         if ((from != null or start == 0) and try e.prefillStart(len, from) != start) return error.BadChunk;
-        const rows = try prompt_cuts.stepRows(len, e.cur.cuts.items, start, part.len, if (e.pair != null) 2 * fw.prefill_rows else e.bp.rows);
-        if (rows > fw.prefill_rows and e.pair != null) return prompt_pair.prefill(e, part, start, len, cancel, marks, split);
+        // a pair's part holds more than a chunk of its rows and the next id; a solo pass's, at most that
+        const paired = if (e.pair) |p| part.len > p.rows + 1 else false;
+        const rows = try prompt_cuts.stepRows(len, e.cur.cuts.items, start, part.len, if (paired) 2 * e.pair.?.rows else e.bp.rows);
+        if (paired) return prompt_pair.prefill(e, part, start, len, cancel, marks, split);
         if (part.len != @min(len - start, rows + 1)) return error.BadChunk;
         if (rows > fw.prefill_rows and !prompt_solo.allowed(e, start, rows)) return error.BadChunk;
         var one: [1]fw.Rank = undefined;

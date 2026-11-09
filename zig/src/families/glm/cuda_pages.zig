@@ -16,7 +16,7 @@ pub fn tableLen(capacity: usize) usize {
 
 /// What a stream of engine `e` holds: its fixed part and table (and `extra`, its other buffers), 13,056 bytes a token.
 pub fn layout(gpa: std.mem.Allocator, e: *const Engine, extra: u64) !kv.Layout {
-    const fixed = try state.State.pagedBytesFor(gpa, &e.w, e.capacity, tableLen(e.capacity), e.settings.solo);
+    const fixed = try state.State.pagedBytesFor(gpa, &e.w, e.capacity, tableLen(e.capacity), e.settings.ringWidth());
     // TF_GLM_KV_HOST: a page costs the device only its pooled keys (the pages themselves are in host memory)
     const page = if (kv_host.onHost()) state.pkPageBytes(&e.w) else state.pageBytes(&e.w);
     return .{ .fixed_bytes = fixed + extra, .token_bytes = page / state.page_rows, .page_tokens = state.page_rows, .snap_bytes = 0 };
@@ -38,7 +38,7 @@ pub fn ownSequence(e: *Engine) !void {
     if (e.seqs.items[0] != null) return error.SlotTaken;
     const q = try e.gpa.create(types.Seq);
     errdefer e.gpa.destroy(q);
-    q.* = .{ .st = try fw.State.initSized(e.gpa, e.d, &e.w, e.capacity, false, on(e, 0, state.pageBytes(&e.w)), e.settings.solo) };
+    q.* = .{ .st = try fw.State.initSized(e.gpa, e.d, &e.w, e.capacity, false, on(e, 0, state.pageBytes(&e.w)), e.settings.ringWidth()) };
     e.seqs.items[0] = q;
     e.cur = q;
     e.slot = 0;
@@ -117,7 +117,7 @@ pub const Pages = struct {
             if (q.* != null) return error.SlotTaken; // attach comes before any stream
             const s = try e.gpa.create(types.Seq);
             errdefer e.gpa.destroy(s);
-            s.* = .{ .st = try fw.State.initSized(e.gpa, e.d, &e.w, e.capacity, false, at, e.settings.solo) };
+            s.* = .{ .st = try fw.State.initSized(e.gpa, e.d, &e.w, e.capacity, false, at, e.settings.ringWidth()) };
             q.* = s;
             made += 1;
         }

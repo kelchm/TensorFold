@@ -115,7 +115,7 @@ comes sooner. `TF_GLM_CHUNK_SOLO=4096` lets a pass take two of those chunks when
 starts. With one decoding, or with `prompt_logprobs` or image rows, the pass takes 2,048. Beside `--drafter`, DFlash2
 reads a solo pass's taps whole and keeps the prompt's last 2,048 rows as before; its tap buffer holds 4,096 rows, 80 MiB
 more on each rank. Solo passes take the place of `TF_GLM_PROMPT_PAIR`'s paired steps, whose second set of buffers they
-do not hold.
+do not hold, unless `TF_GLM_PROMPT_PAIR=solo` pairs them (below).
 
 The grid does not move, so warm turns resume where they do unset, and streams decoding beside a prompt see the same
 passes. Replies are the same bytes either way. Two costs remain:
@@ -161,7 +161,7 @@ without solo at 3, with the same tokens; in another, 8 pieces without solo staye
 A pass cannot cross a kept-state mark or a ring boundary that separate chunks would rebase inside; those steps take
 one grid chunk until a whole solo pass is allowed. Prompt logprobs, image rows, request starts and prompt profiling
 retain the existing chunk path. An arriving stream waits for the in-flight solo pass; subsequent passes take 2,048
-while another stream decodes. The prompt-pair buffers stay off with either solo width.
+while another stream decodes. The prompt-pair buffers stay off at 8,192, and at 4,096 unless `TF_GLM_PROMPT_PAIR=solo`.
 
 Only the 8,192 option grows the index rings, from 4,096 to 8,192 rows in every sequence, including the MTP head.
 The prompt arena and EXL3 scratch hold 8,192 rows, so one EXL3 expert call covers a whole pass. DFlash2's tap buffer
@@ -184,6 +184,14 @@ geometry, marks, ring sizing, rank disagreement, startup refusals and DFlash2 ta
 is pending: compare logits, committed state and output tokens against 2,048/4,096 at the same checkpoint and settings,
 including cold prompts across ring rebases, kept-state resumes, MTP/DFlash2 and concurrent arrivals. Measure cold
 prefill and arrival latency with the actual GB10 memory reserve before relying on the wider pass.
+
+### Fork experiment: paired solo passes
+
+`TF_GLM_PROMPT_PAIR=solo` with `TF_GLM_CHUNK_SOLO=4096` on every rank (TP=2 or more, opt-in) runs a prompt step as two 4,096-row solo chunks in one pass, each chunk's exchanges under the other's sites, as the default pair does with two 2,048-row chunks. Any other `TF_GLM_CHUNK_SOLO` is refused at startup. Unset, `0` or `1`, nothing changes: 2,048-row pairs by default, and solo passes unpaired.
+
+A step pairs only while no other stream decodes, when the second chunk holds at least 1,024 rows, no kept-state mark falls on a 2,048-row grid point inside the pair, and the index rings would rebase at its start or not at all, as grid chunks one at a time do. Otherwise it takes one solo chunk, or one grid chunk, under the solo rules above. A paired step is built to give the same bytes as those chunks one at a time: DFlash2 is tapped and fed the same rows, the MTP head runs 2,048 rows at a time, and the rings rebase at the same positions. Prompt logprobs, image rows, request starts and prompt profiling keep the 2,048-row path.
+
+At TP=2 with EXL3 the second chunk's buffers take 0.42 GiB per rank (0.21 GiB more than the 2,048-row pair's), and the index rings grow from 4,096 to 8,192 rows: 24 MiB more for every sequence, and up to 24 MiB more for each kept state (all of it past 8,192 tokens). The server reads its room after these allocations, so the streams and prompt cache it admits already leave room for them. Startup checks the room for it, as for 8,192, and rank 0 logs the twin's size. `glm-pair-check` runs with the same two settings to compare paired steps against unpaired solo passes on the device; device results are pending.
 
 ## Long runs on GB10
 
