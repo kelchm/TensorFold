@@ -91,6 +91,8 @@ extern "C" __global__ void tf_glm_rank_sum(const float* own, const float* peers,
 // glue._hc_post: stream s = bf16(post[s] branch + sum_t comb[t][s] x[t]) in LLVM's fma order; x may be xout.
 extern "C" __global__ void tf_glm_hc_post(const __nv_bfloat16* x, __nv_bfloat16* xout, const float* g,
                                           const float* post, const float* comb, int64_t rs, int64_t d, int world) {
+  glm_triton::pdl_wait();  // dependent launch: every input is an earlier grid's; then hc_pre's partials may launch
+  glm_triton::pdl_trigger();
   const int64_t c = glm_glue::col8();
   if (c >= d) return;
   const int64_t r = blockIdx.x;
@@ -137,6 +139,9 @@ extern "C" __global__ void tf_glm_combine(
 
 // glue._router_sum and qmm._reduce: ks slices of `total` fp32 added in order (fp32 or bf16 out), 8 values a thread.
 extern "C" __global__ void tf_glm_slice_sum(const float* part, void* out, int64_t total, int ks, int f32) {
+  // Dependent launch (decode windows): the slices are an earlier grid's, so the wait comes first.
+  glm_triton::pdl_wait();
+  glm_triton::pdl_trigger();
   const int64_t i0 = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
   if (i0 >= total) return;
   const bool aligned = ((reinterpret_cast<uintptr_t>(out) | reinterpret_cast<uintptr_t>(part)) & 15) == 0;

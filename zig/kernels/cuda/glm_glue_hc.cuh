@@ -63,6 +63,12 @@ extern "C" __global__ void __launch_bounds__(1024)
   const int64_t r = blockIdx.x, b = blockIdx.y, kb = wide / nb;
   const int grp = threadIdx.x >> 7, t = threadIdx.x & 127, c = t & 15, m0 = (t >> 4) & 7;
   const int steps = static_cast<int>(kb / 128);
+  uint4 wu[3];  // dependent launch: the weights (immutable) load before the wait, x and part only after it
+  if (grp < steps)
+    for (int i = 0; i < 3; ++i)
+      wu[i] = __ldg(reinterpret_cast<const uint4*>(fn + (int64_t)(m0 + 8 * i) * wide + b * kb + grp * 128 + c * 8));
+  pdl_wait();
+  pdl_trigger();
   if (grp < steps) {
     const int64_t base = b * kb + grp * 128;
     float xv[8];
@@ -72,8 +78,7 @@ extern "C" __global__ void __launch_bounds__(1024)
       for (int j = 0; j < 8; ++j) xv[j] = bf(h[j]);
     }
     for (int i = 0; i < 3; ++i) {
-      const uint4 u = __ldg(reinterpret_cast<const uint4*>(fn + (int64_t)(m0 + 8 * i) * wide + base + c * 8));
-      const __nv_bfloat16* w = reinterpret_cast<const __nv_bfloat16*>(&u);
+      const __nv_bfloat16* w = reinterpret_cast<const __nv_bfloat16*>(&wu[i]);
       float d = __fmul_rn(xv[1], bf(w[1]));
       d = __fmaf_rn(xv[0], bf(w[0]), d);
       for (int j = 2; j < 8; ++j) d = __fmaf_rn(xv[j], bf(w[j]), d);
@@ -149,14 +154,22 @@ __device__ __forceinline__ void finish(const __nv_bfloat16* x, const float* part
   __shared__ float pre[4];
   const int64_t r = blockIdx.x;
   const int t = threadIdx.x, lane = t & 31;
+  // Dependent launch: the norm weight, base and scale (immutable) load before the wait; x and the partials after it.
+  Weights<W> wu;
+  for (int rep = 0; rep < 2; ++rep) wu.load(nw, rep, t);
+  const int k = lane & 3, idx = lane & 15;
+  float bpre = 0.0f, bpost = 0.0f, bcomb = 0.0f, s0 = 0.0f, s1 = 0.0f, s2 = 0.0f;
+  if (t < 32) {
+    bpre = base[k], bpost = base[4 + k], bcomb = base[8 + idx];
+    s0 = scale[0], s1 = scale[1], s2 = scale[2];
+  }
+  pdl_wait();
+  pdl_trigger();
   // A thread's 8 inputs of each half are contiguous: one 16-byte load per stream and half, issued before Sinkhorn.
   const __nv_bfloat16* row = x + r * S * D;
   uint4 xu[2][S];
-  Weights<W> wu;
-  for (int rep = 0; rep < 2; ++rep) {
+  for (int rep = 0; rep < 2; ++rep)
     for (int st = 0; st < S; ++st) xu[rep][st] = *reinterpret_cast<const uint4*>(row + st * D + rep * 2048 + t * 8);
-    wu.load(nw, rep, t);
-  }
   if (t < 32) {
     const float* p = part + r * nb * 32;
     float mix = 0.0f, ss = 0.0f;
@@ -166,13 +179,11 @@ __device__ __forceinline__ void finish(const __nv_bfloat16* x, const float* part
     }
     const float rinv = div_full(1.0f, sqrt_approx(eps + div_full(ss, (float)(S * D))));
     mix = __fmul_rn(mix, rinv);
-    const int k = lane & 3, idx = lane & 15;
-    const float bpre = base[k], bpost = base[4 + k], bcomb = base[8 + idx];
     const float mpre = __shfl_sync(0xffffffffu, mix, k), mpost = __shfl_sync(0xffffffffu, mix, 4 + k);
     const float mcomb = __shfl_sync(0xffffffffu, mix, 8 + idx);
-    const float pr = hc_eps + glm_hc::sigmoid(__fmaf_rn(mpre, scale[0], bpre));
-    const float sp = glm_hc::sigmoid(__fmaf_rn(mpost, scale[1], bpost));
-    const float cl = __fmaf_rn(mcomb, scale[2], bcomb);
+    const float pr = hc_eps + glm_hc::sigmoid(__fmaf_rn(mpre, s0, bpre));
+    const float sp = glm_hc::sigmoid(__fmaf_rn(mpost, s1, bpost));
+    const float cl = __fmaf_rn(mcomb, s2, bcomb);
     float cmax = fmaxf(cl, __shfl_xor_sync(0xffffffffu, cl, 2));
     cmax = fmaxf(cmax, __shfl_xor_sync(0xffffffffu, cmax, 1));
     const float ce = exp_approx(cl - cmax);

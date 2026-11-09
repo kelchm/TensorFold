@@ -79,3 +79,9 @@ profile and agreed in every rank's fingerprint. See the [experiment and pending 
 
 `TF_GLM_EXL3_BF16_SLOTS` accepts `0` or `1` with the same checks, scope and rank agreement; unset or blank keeps it off.
 `1` has an EXL3 checkpoint's prompt chunks write their MoE slot rows (the eight routed experts' and the shared expert's) as bf16, as NVFP4 prompt chunks already do, so the combine reads half the bytes. Each routed value is the fp32 kernel's rounded once to bf16 (`tf_exl3_prompt_down_glm_b16`); decode windows and NVFP4 checkpoints are unchanged. It can change tokens, so it is registered as arithmetic; device qualification is pending.
+
+## GLM CUDA decode launches
+
+These switches change only how a decode window's kernels are scheduled; every output keeps its bytes. GLM checks each before rank placement, NCCL or weights, and other CUDA families do not check this scope. They stay out of the ranks' fingerprint: each rank's own launches, no collective among them.
+
+`TF_GLM_PDL_CHAIN` launches more kernels as programmatic dependents beside glm_mm's own matmuls (`TF_GLM_PDL`). Unset, blank or `1` takes all three parts; `0` none; otherwise name the parts in this order, comma-separated: `reduce` (glm_mm's K-slice reduce after its matmul), `hc` (a decode window's `tf_glm_hc_post`, `tf_glm_hc_partial8` and `tf_glm_hc_finish`), `moe` (a decode window's router slice sums and top-k pick, which `tf_glm_router_tile` lets launch early). Each such kernel loads only immutable weights before `griddepcontrol.wait` and touches another grid's data only after it, so overlap never changes a value. `TF_GLM_PDL=0` turns these off with glm_mm's own.
