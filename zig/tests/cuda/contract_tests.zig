@@ -522,9 +522,13 @@ fn registered(gpu: check.Gpu, only: []const []const u8, t0: *i96) !g.Tally {
         x.* = .init(.{ .gpu = gpu, .s = s }, e.which, try glm_glue.function(e.symbol));
         x.width = e.width;
         x.baseline = try mods[5].function(e.old);
+        x.bf16 = true;
     }
     defer for (&bf16s) |*x| x.deinit();
     for (&bf16s) |*x| try kernels.append(a, x.kernel());
+    var hc_splits = try f32w_k.Splits.init(.{ .gpu = gpu, .s = s }, glm_glue);
+    defer hc_splits.deinit();
+    try hc_splits.append(a, &kernels);
     var f32w_control: f32w_k.F32w = .init(.{ .gpu = gpu, .s = s }, .norm_y, try glm_glue.function("tf_glm_rmsnorm_4096_f32w"));
     f32w_control.bf16_gamma = true;
     defer f32w_control.deinit();

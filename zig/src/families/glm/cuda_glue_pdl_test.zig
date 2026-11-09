@@ -26,7 +26,7 @@ pub const Record = struct {
         for (c.attrs.?[0..c.num_attrs]) |a| pdl = pdl or (a.id == .programmatic_stream_serialization and a.value.int == 1);
         return add(f, .{ c.grid_x, c.grid_y, c.grid_z }, c.block_x, pdl);
     }
-    /// A driver that records; `fns` gets every glue function as its field index + 1.
+    /// A driver that records; `fns` gets every glue function as its field index + 1, the split schedules off.
     pub fn driver(d: *cuda.Driver, fns: *glue.Kernels) void {
         d.api.cuLaunchKernel = plain;
         d.api.cuLaunchKernelEx = extended;
@@ -34,6 +34,8 @@ pub const Record = struct {
         inline for (info.field_names, info.field_types, 1..) |name, T, i| {
             if (T == cuda.Function) @field(fns, name) = .{ .d = d, .handle = @ptrFromInt(i) };
         }
+        fns.hc_split = false;
+        fns.hc_part = false;
         count = 0;
     }
 };
@@ -43,11 +45,12 @@ pub fn idOf(comptime name: []const u8) usize {
     unreachable;
 }
 
-const hc_args = .{ 1 << 20, 2 << 20, 3 << 20, 4 << 20, glue.Norm{ .bf16 = 5 << 20 }, 6 << 20, 7 << 20, 8 << 20, 9 << 20, 10 << 20, 1e-6, 1e-6, 20 };
-
 fn hcPre(set: glue.Set, s: cuda.Stream, rows: usize) !void {
-    const a = hc_args;
-    try glue.hcPre(set, s, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], rows, 4096, 4);
+    return hcPreBy(set, s, .{ .bf16 = 5 << 20 }, rows);
+}
+
+fn hcPreBy(set: glue.Set, s: cuda.Stream, norm: glue.Norm, rows: usize) !void {
+    try glue.hcPre(set, s, 1 << 20, 2 << 20, 3 << 20, 4 << 20, norm, 6 << 20, 7 << 20, 8 << 20, 9 << 20, 10 << 20, 1e-6, 1e-6, 20, rows, 4096, 4);
 }
 
 test "GLM decode glue: TF_GLM_PDL_CHAIN's words are the startup check's, each naming its parts" {
@@ -78,6 +81,26 @@ test "GLM decode glue: hc_pre and hc_post launch as dependents only with pdl_hc 
         Record.count = 0;
         try glue.hcPost(.{ .glue = &fns, .pdl_hc = on }, s, 1 << 20, 1 << 20, 2 << 20, 3 << 20, 4 << 20, rows, 4096, 4, 2);
         try t.expectEqual(Record{ .id = idOf("hc_post"), .grid = .{ @intCast(rows), 4, 1 }, .block = 128, .pdl = on }, Record.calls[0]);
+    };
+}
+
+test "GLM decode glue: TF_GLM_HC_PART and TF_GLM_HC_SPLIT pick decode windows' kernels, dependents as the plain ones" {
+    var d: cuda.Driver = undefined;
+    var fns: glue.Kernels = undefined;
+    Record.driver(&d, &fns);
+    const s: cuda.Stream = .{ .d = &d, .handle = null };
+    for ([_]bool{ false, true }) |part| for ([_]bool{ false, true }) |split| for ([_]bool{ false, true }) |f32w| for ([_]usize{ 1, 16, 17, 63, 64 }) |rows| {
+        fns.hc_part = part;
+        fns.hc_split = split;
+        Record.count = 0;
+        try hcPreBy(.{ .glue = &fns, .pdl_hc = true }, s, if (f32w) .{ .f32 = 5 << 20 } else .{ .bf16 = 5 << 20 }, rows);
+        const o2 = part and rows <= glue.hc_part_rows;
+        const p = Record.calls[0];
+        try t.expectEqual(if (o2) idOf("hc_partial8_o2") else if (rows < 64) idOf("hc_partial8") else idOf("hc_partial"), p.id);
+        if (o2) try t.expectEqual(Record{ .id = p.id, .grid = .{ @intCast(rows), glue.hc_blocks, 13 }, .block = 256, .pdl = true }, p);
+        const cut = split and rows < 64;
+        const want = if (f32w) (if (cut) idOf("hc_finish_f32w_split") else idOf("hc_finish_f32w")) else if (cut) idOf("hc_finish_split") else idOf("hc_finish");
+        try t.expectEqual(Record{ .id = want, .grid = .{ @intCast(rows), 1, 1 }, .block = 256, .pdl = rows < 64 }, Record.calls[1]);
     };
 }
 

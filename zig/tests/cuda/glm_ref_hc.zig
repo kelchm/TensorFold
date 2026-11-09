@@ -1,4 +1,4 @@
-//! GLM's hyper-connection dots (hcPre: 24 dots + squares a 1,024 block) vs float64; hc_partial8, _f32w: same bytes.
+//! GLM's hyper-connection dots (hcPre) vs float64; hc_partial8, _o2, the split finish and _f32w: the same bytes.
 const std = @import("std");
 const cuda = @import("cuda");
 const check = @import("check.zig");
@@ -99,10 +99,16 @@ pub fn mixing(r: *Rig, set: glue.Set) !void {
     const full = [5]u64{ all.out, all.xs, all.post, all.comb, all.part };
     const per = [5]usize{ d * 2, (d / 64) * 4, s * 4, s * s * 4, glue.hcPartBytes(1) };
     const what = [5][]const u8{ "normed rows", "group sums", "post", "comb", "partials" };
-    for ([_]usize{ 1, 5, 63 }) |m| {
-        const o = try pre(r, set, dx, w, norm, m);
+    for ([_]bool{ false, true }) |split| for ([_]bool{ false, true }) |part| for ([_]usize{ 1, 5, 16, 17, 63 }) |m| {
+        var k = set.glue.*; // TF_GLM_HC_SPLIT and TF_GLM_HC_PART: each decode kernel gives the prompt rows' bytes
+        k.hc_split = split;
+        k.hc_part = part;
+        var with = set;
+        with.glue = &k;
+        with.pdl_hc = true; // as decode windows launch them (TF_GLM_PDL_CHAIN's hc)
+        const o = try pre(r, with, dx, w, norm, m);
         for ([5]u64{ o.out, o.xs, o.post, o.comb, o.part }, full, per, what) |got, want, n, label|
-            try ref.sameRows(r, try std.fmt.bufPrint(&name, "hc pre: {d} rows' {s} equal the {d}-row call's", .{ m, label, rows }), want, got, m * n);
-    }
-    check.pass("hc mixing: dots and squares within float64 tolerance, decode windows' partials and outputs equal the prompt rows'", .{});
+            try ref.sameRows(r, try std.fmt.bufPrint(&name, "hc pre (split {}, part {}): {d} rows' {s} equal the {d}-row call's", .{ split, part, m, label, rows }), want, got, m * n);
+    };
+    check.pass("hc mixing: dots and squares within float64 tolerance, decode windows' partials and outputs (split and part on and off) equal the prompt rows'", .{});
 }
