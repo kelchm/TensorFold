@@ -232,6 +232,14 @@ pub const Drafter = struct {
     /// The same ordinary context ingest, with this prompt's rows at row0 in the batched tap buffer.
     pub const promptSegment = ingestPrompt;
 
+    /// A paired step's second chunk whose tap rows already sit in the context input from row `row0` on (pairTaps).
+    pub const promptIn = ingestPromptIn;
+
+    /// A paired step's second chunk's taps past the first's `first_rows` rows: the context input, idle in the pass.
+    pub fn pairTaps(dr: *const Drafter, first_rows: usize) taps_mod.Taps {
+        return .{ .f = dr.k.tap, .out = dr.cin + first_rows * TAP_ROW };
+    }
+
     /// The runs' rows through fc, the hidden norm and each layer's k, v into their rings.
     pub fn ingest(dr: *Drafter, e: anytype, runs: []const Run) !void {
         var N: usize = 0;
@@ -240,7 +248,7 @@ pub const Drafter = struct {
         if (N > MAX_CTX) return error.DrafterContextTooWide;
         var row: usize = 0;
         for (runs) |r| {
-            try block.copy(e, dr.cin + row * TAP_ROW, r.taps, r.n * TAP_ROW);
+            if (r.taps != dr.cin + row * TAP_ROW) try block.copy(e, dr.cin + row * TAP_ROW, r.taps, r.n * TAP_ROW); // promptIn's in place
             for (0..r.n) |j| {
                 dr.h_cpos[row + j] = r.pos0 + @as(i64, @intCast(j));
                 dr.h_crings[row + j] = r.ring;
@@ -326,5 +334,17 @@ pub fn promptRun(ring: u64, taps: u64, start: usize, rows: usize, len: usize, ro
 pub fn ingestPrompt(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize, row0: usize) !void {
     const s = try dr.slot(i);
     const run = (try promptRun(s.ring.?.ptr, dr.taps_prefill, start, rows, len, row0, dr.tap_rows)) orelse return;
+    try dr.ingest(e, &.{run});
+}
+
+/// ingestPrompt of a chunk tapped into the context input from row `row0` (pairTaps), its rows all in the last window.
+pub fn ingestPromptIn(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize, row0: usize) !void {
+    if (start < len -| @as(usize, @intCast(WIN))) return error.BadPromptContext; // a copy would skip its first rows
+    if (row0 > MAX_CTX) return error.DrafterContextTooWide;
+    const s = try dr.slot(i);
+    const cin = dr.cin;
+    defer dr.cin = cin;
+    dr.cin = cin + row0 * TAP_ROW; // the ingest's input starts at the chunk's rows
+    const run = (try promptRun(s.ring.?.ptr, dr.cin, start, rows, len, 0, MAX_CTX - row0)) orelse return;
     try dr.ingest(e, &.{run});
 }
