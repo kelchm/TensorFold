@@ -29,6 +29,15 @@ extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1,
     tf_exl3::grouped_body<2, 8, 4, GROUPED_LOAD>(a, blockIdx.x, blockIdx.y, blockIdx.z);
 }
 
+// GLM's decode windows (exl3_experts.zig tilesFor): grouped_1's k slices, MMA chains and warp-order sums: its bits.
+extern "C" __global__ void tf_exl3_grouped_1_nt4(tf_exl3::GroupedArgs a) {  // mcg at 4 tiles a block, any width
+    tf_exl3::grouped_body<1, 4, 4, GROUPED_LOAD>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
+extern "C" __global__ void tf_exl3_grouped_1_k8r8(tf_exl3::GroupedArgs a) {  // 4-bit mcg, windows of at most 8 rows
+    tf_exl3::grouped_body_one<1, 4, 4, GROUPED_LOAD, 8, 8>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
 namespace tf_exl3 {
 
 // Grouping in one block: distinct experts (< E) in id order, members row * 32 + slot in row order, -1 after the last.

@@ -124,6 +124,13 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
 /// The selected common EXL3 owner. This file adapts the family's checkpoint shard and slot layout only.
 pub const Kernels = cuda.exl3_experts.Experts;
 const common = cuda.exl3_experts;
+/// The common module with GLM's decode-window grouped kernels selected (windows of up to 32 rows; the same bits).
+pub fn loadKernels(d: *const cuda.Driver) !Kernels {
+    var k = try Kernels.load(d);
+    errdefer k.unload();
+    try k.selectDecode(.tiles);
+    return k;
+}
 pub const Scratch = struct { picks: u64, xg: u64, xu: u64, z: u64 };
 pub const top_k = 8;
 /// Rows a call to the common experts takes: each call reads every expert's weights, so a prompt pass needs few calls.

@@ -104,6 +104,12 @@ pub fn scratch(base: u64, l: Layer, rows: usize, slots: usize) !Scratch {
     return .{ .xg = xg, .xu = xu, .xd = xd, .z = z, .y = y, .ids = ids, .count = count, .members = members, .rows = rows, .slots = slots };
 }
 
+/// Decode windows' grouped kernels: grouped[codebook] (every family), or GLM's opt-in forms with grouped_1's bits.
+pub const DecodeForm = enum { common, tiles };
+
+/// A projection's grouped kernel and its 16-column tiles a block.
+pub const Tiles = struct { f: Function, nt: usize };
+
 /// The loaded kernels.
 pub const Experts = struct {
     mod: Module,
@@ -115,6 +121,9 @@ pub const Experts = struct {
     prompt: prompt.Kernels = undefined,
     plan_rotate: Function = undefined,
     plan_finish: Function = undefined,
+    decode: DecodeForm = .common,
+    nt4: Function = undefined, // tf_exl3_grouped_1_nt4: mcg at 4 tiles a block, any width
+    k8r8: Function = undefined, // tf_exl3_grouped_1_k8r8: 4-bit mcg at 4 tiles a block, windows of at most 8 rows
 
     pub fn load(d: *const Driver) !Experts {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -145,6 +154,28 @@ pub const Experts = struct {
 
     pub fn unload(e: *Experts) void {
         e.mod.unload();
+    }
+
+    /// A family's opt-in to the decode-window kernels (GLM's); a module that never calls it keeps grouped[codebook].
+    pub fn selectDecode(e: *Experts, form: DecodeForm) !void {
+        if (form != .common) {
+            e.nt4 = try e.mod.function("tf_exl3_grouped_1_nt4");
+            e.k8r8 = try e.mod.function("tf_exl3_grouped_1_k8r8");
+        }
+        e.decode = form;
+    }
+
+    /// A projection's grouped kernel at `rows` rows; a decode form moves only column spans and reduction rows.
+    pub fn tilesFor(e: *const Experts, l: Layer, rows: usize, which: enum { gate_up, down }) Tiles {
+        const common: Tiles = .{ .f = e.grouped[@backingInt(l.codebook)], .nt = 8 };
+        const n = if (which == .gate_up) l.width else l.dims;
+        if (e.decode == .common or l.codebook != .mcg or rows > 32 or n % 64 != 0) return common;
+        if (rows <= 8 and l.uniform_k2 == 8) return .{ .f = e.k8r8, .nt = 4 };
+        const four = switch (which) {
+            .gate_up => rows >= 3,
+            .down => rows == 1 or rows >= 8,
+        };
+        return if (four) .{ .f = e.nt4, .nt = 4 } else common;
     }
 
     /// Per-slot FP32 outputs after the same BF16-up contract; the caller owns its routing-weight reduction.
@@ -219,7 +250,8 @@ pub const Experts = struct {
         g.add(i32d(l.gu_stride));
         g.add(@as(i32, 0));
         g.add(@as(i32, -1));
-        try launch_.launch(e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(w / 128), .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
+        const gt = e.tilesFor(l, rows, .gate_up);
+        try launch_.launch(gt.f, .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(w / (gt.nt * 16)), .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
 
         var ep: launch_.Args = .{};
         ep.add(sc.z);
@@ -258,7 +290,8 @@ pub const Experts = struct {
         dn.add(@as(i32, 0));
         dn.add(@as(i32, 0));
         dn.add(@as(i32, -1));
-        try launch_.launch(e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(d / 128), .z = @intCast(d_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
+        const dt = e.tilesFor(l, rows, .down);
+        try launch_.launch(dt.f, .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(d / (dt.nt * 16)), .z = @intCast(d_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
 
         var cb: launch_.Args = .{};
         cb.add(sc.z);

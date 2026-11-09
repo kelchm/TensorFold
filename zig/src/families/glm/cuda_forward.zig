@@ -75,7 +75,7 @@ pub const Modules = struct {
         m.quant = try quant.Kernels.load(m.mods[4]);
         m.q4 = try q4.Kernels.load(m.mods[5], m.mods[3], ctx);
         m.glue = try glue.Kernels.load(m.mods[6]);
-        m.exl3 = try exl3.Kernels.load(d);
+        m.exl3 = try exl3.loadKernels(d);
         errdefer m.exl3.unload();
         m.mm = try mm_mod.Kernels.load(m.mods[7]);
         m.index = null;

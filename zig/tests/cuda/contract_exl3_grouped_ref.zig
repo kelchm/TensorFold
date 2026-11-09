@@ -64,6 +64,7 @@ pub fn spec(cb: Codebook, fault: Fault) c.Spec {
 pub const Fixture = struct {
     a: std.mem.Allocator,
     cb: Codebook,
+    hv: [experts]u16, // each expert's half-bits a value
     shape: c.Shape,
     sk: usize,
     trellis: [experts][]i16,
@@ -77,11 +78,15 @@ pub const Fixture = struct {
     }
 
     pub fn init(a: std.mem.Allocator, cb: Codebook, s: c.Shape, fill: rows_.Fill, seed: u64) !Fixture {
-        var f: Fixture = .{ .a = a, .cb = cb, .shape = s, .sk = split(s), .trellis = @splat(@as([]i16, &.{})), .x = &.{}, .pick = &.{} };
+        return initWidths(a, cb, halves(cb), s, fill, seed);
+    }
+
+    /// The same at the given widths (GLM's decode kernels: every expert 4-bit).
+    pub fn initWidths(a: std.mem.Allocator, cb: Codebook, hv: [experts]u16, s: c.Shape, fill: rows_.Fill, seed: u64) !Fixture {
+        var f: Fixture = .{ .a = a, .cb = cb, .hv = hv, .shape = s, .sk = split(s), .trellis = @splat(@as([]i16, &.{})), .x = &.{}, .pick = &.{} };
         errdefer f.deinit();
         var prng = std.Random.DefaultPrng.init(seed);
         const rng = prng.random();
-        const hv = halves(cb);
         for (&f.trellis, hv) |*t, h| {
             t.* = try a.alloc(i16, s.k / 16 * (s.n / 16) * @as(usize, h) * 8);
             for (t.*) |*v| v.* = rng.int(i16);
@@ -132,7 +137,7 @@ pub const Fixture = struct {
         if (f.w.len > 0) return f.w;
         const s = f.shape;
         f.w = try f.a.alloc(f16, experts * s.k * s.n);
-        for (f.trellis, halves(f.cb), 0..) |t, hv, e| fmt.unpack(.{ .halves = hv }, f.cb, t, s.k / 16, s.n / 16, f.w[e * s.k * s.n ..][0 .. s.k * s.n]);
+        for (f.trellis, f.hv, 0..) |t, hv, e| fmt.unpack(.{ .halves = hv }, f.cb, t, s.k / 16, s.n / 16, f.w[e * s.k * s.n ..][0 .. s.k * s.n]);
         return f.w;
     }
 
@@ -191,9 +196,10 @@ test "exl3 grouped contract: one, two and three k tiles a warp, and a split for 
 }
 
 /// A perfect fp32 kernel on the host (its outputs: the pairwise fp32 replay), so gate 4 judges its stress rows alone.
-const HostSums = struct {
+pub const HostSums = struct {
     a: std.mem.Allocator,
     cb: Codebook,
+    hv: ?[experts]u16 = null, // null: halves(cb)
     f: ?Fixture = null,
     out: []u8 = &.{},
 
@@ -204,7 +210,7 @@ const HostSums = struct {
         const h = of(ctx);
         if (h.f) |*f| f.deinit();
         h.f = null;
-        h.f = try Fixture.init(h.a, h.cb, s, fill, seed);
+        h.f = try Fixture.initWidths(h.a, h.cb, h.hv orelse halves(h.cb), s, fill, seed);
         return true;
     }
     fn run(ctx: *anyopaque) anyerror!void {
@@ -238,7 +244,7 @@ const HostSums = struct {
     fn simulate(ctx: *anyopaque, acc: c.Accum, order: rows_.Order, out: []f64) anyerror!void {
         return of(ctx).f.?.simulate(acc, order, out);
     }
-    const vt: core.contract.gates.VTable = .{ .prepare = prepare, .run = run, .output = output, .inputs = inputs, .intact = intact, .overlap = overlap, .count = count, .reference = reference, .simulate = simulate };
+    pub const vt: core.contract.gates.VTable = .{ .prepare = prepare, .run = run, .output = output, .inputs = inputs, .intact = intact, .overlap = overlap, .count = count, .reference = reference, .simulate = simulate };
 };
 
 test "exl3 grouped contract: gate 4's stress rows hold fp32 replays and make fp16 and bf16 sums miss" {

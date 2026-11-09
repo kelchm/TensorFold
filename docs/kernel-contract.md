@@ -414,6 +414,10 @@ sm_121 load a warp's next k tile while the current one decodes: each bit-equal t
 `contract_controls.cu`) at one, two and three k tiles a warp and at GLM-5.3-Flash's, MiMo-V2.6-Flash's and the Qwen3.5
 EXL3 pack's widths (two controls: the next load reading tile i + 2, the last tile decoding the words before it).
 Older SMs build main's loop, and their records are main's.
+GLM's decode-window kernels (`tf_exl3_grouped_1_k8r8` at one 4-bit width for windows of up to 8 rows,
+`tf_exl3_grouped_1_nt4` at 4 tiles a block to 32 rows) register as byte replacements of the served
+`tf_exl3_grouped_1` at those windows, the one-width kernel on 4-bit experts (`contract_exl3_decode.zig`; one control:
+the 8-row kernel summing its warps last to first). Only GLM selects them; their compile receipts remain pending.
 
 CUDA also checks MOSS-Image's glue (`moss_image.cu`: the norm, plain and modulated; q/k norm and rotary into packed
 rows; situ; the gated add), each output within float64's range at its torch bf16 points (five controls, each dropping
