@@ -21,6 +21,7 @@ pub const Kernels = struct {
     stream_mean: cuda.Function,
     rank_sum: cuda.Function,
     hc_post: cuda.Function,
+    hc_post_partial: cuda.Function, // TF_GLM_HC_FUSE: hc_post and the next site's hc_partial in one launch
     combine: cuda.Function,
     slice_sum: cuda.Function,
     top1: cuda.Function,
@@ -211,18 +212,26 @@ pub fn hcPartBytes(rows: usize) usize {
     return rows * hc_blocks * 32 * 4;
 }
 
+/// hc_pre's prompt rows: from this many rows a call, 4 rows a 128-thread hc_partial block (fewer: hc_partial8).
+pub const hc_prompt_rows = 64;
+
 /// glue.hc_pre: streams [rows][s d] -> the collapsed RMS-normed row and its 64-sums `xs`; `post`, `comb` (Sinkhorn).
 pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale: u64, norm: Norm, out: u64, xs: u64, post: u64, comb: u64, part: u64, eps: f32, hc_eps: f32, iters: usize, rows: usize, d: usize, s: usize) !void {
     if (d != 4096 or s != 4) return error.HcShape;
     var a: cuda.Args = .{};
     inline for (.{ x, fn_w, part, i64of(s * d), @as(c_int, hc_blocks) }) |v| a.add(v);
     // Decode windows (16 blocks a row) take each block's 8 steps at once; prompt rows 4 rows a 128-thread block.
-    if (rows < 64) {
+    if (rows < hc_prompt_rows) {
         try cuda.launch.launch(set.glue.hc_partial8, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks }, .block = .{ .x = 1024 } }, stream, &a);
     } else {
         a.add(i64of(rows));
         try cuda.launch.launch(set.glue.hc_partial, .{ .grid = .{ .x = cdiv(rows, 4), .y = hc_blocks }, .block = .{ .x = 128 } }, stream, &a);
     }
+    try hcFinish(set, stream, x, base, scale, norm, out, xs, post, comb, part, eps, hc_eps, iters, rows);
+}
+
+/// hc_pre's second launch alone, on the K blocks' partials already in `part` (hcPre's first, or hcPostPartial).
+pub fn hcFinish(set: Set, stream: cuda.Stream, x: u64, base: u64, scale: u64, norm: Norm, out: u64, xs: u64, post: u64, comb: u64, part: u64, eps: f32, hc_eps: f32, iters: usize, rows: usize) !void {
     const f, const w = switch (norm) {
         .bf16 => |p| .{ set.glue.hc_finish, p },
         .f32 => |p| .{ set.glue.hc_finish_f32w, p },
@@ -230,6 +239,17 @@ pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale:
     var b: cuda.Args = .{};
     inline for (.{ x, part, base, scale, w, out, xs, post, comb, eps, hc_eps, @as(c_int, hc_blocks), cint(iters) }) |v| b.add(v);
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &b);
+}
+
+/// TF_GLM_HC_FUSE: hcPost, then the next site's hc_partial (`fn_w`) into `part` for hcFinish; same bytes, x read once.
+pub fn hcPostPartial(set: Set, stream: cuda.Stream, x: u64, xout: u64, g: u64, post: u64, comb: u64, fn_w: u64, part: u64, rows: usize, d: usize, s: usize, world: usize) !void {
+    if (d != 4096 or s != 4) return error.HcShape;
+    if (rows < hc_prompt_rows) return error.HcFuseRows; // hcPre's decode rows run hc_partial8
+    inline for (.{ x, xout, g, fn_w }) |p| if (p % 16 != 0) return error.RowsUnaligned;
+    var a: cuda.Args = .{};
+    inline for (.{ x, xout, g, post, comb, fn_w, part, i64of(rows * d), cint(world), i64of(rows) }) |v| a.add(v);
+    // a block: 4 rows by a quarter of each stream (4 of the K blocks), 512 threads
+    try cuda.launch.launch(set.glue.hc_post_partial, .{ .grid = .{ .x = cdiv(rows, 4), .y = @intCast(d / 1024) }, .block = .{ .x = 512 } }, stream, &a);
 }
 
 /// glue.hc_post: branch = bf16(`g`, rank 0 first); xout[s] = bf16(post[s] branch + sum_t comb[t][s] x[t]); x may alias.
@@ -295,4 +315,12 @@ test "the wrappers' shape rules as glue.py's" {
     try std.testing.expectError(error.NoSwigluBlock, swigluBlock(96));
     try std.testing.expectEqual(@as(i64, 512), pow2(288 + 1)); // _topk's BLOCK for 288 experts
     try std.testing.expectEqual(@as(i64, 16), pow2(8 + 1)); // its SLOTP for top-8 and the shared slot
+}
+
+test "hcPostPartial takes prompt calls of 4 streams of 4096 on 16-byte rows only, before any launch" {
+    const set: Set = .{ .glue = undefined };
+    const s: cuda.Stream = undefined;
+    try std.testing.expectError(error.HcFuseRows, hcPostPartial(set, s, 0, 0, 0, 0, 0, 0, 0, hc_prompt_rows - 1, 4096, 4, 2));
+    try std.testing.expectError(error.HcShape, hcPostPartial(set, s, 0, 0, 0, 0, 0, 0, 0, hc_prompt_rows, 2048, 4, 2));
+    try std.testing.expectError(error.RowsUnaligned, hcPostPartial(set, s, 8, 8, 0, 0, 0, 0, 0, hc_prompt_rows, 4096, 4, 2));
 }

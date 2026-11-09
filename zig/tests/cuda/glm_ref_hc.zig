@@ -1,4 +1,4 @@
-//! GLM's hyper-connection dots (hcPre: 24 dots + squares a 1,024 block) vs float64; hc_partial8, _f32w: same bytes.
+//! GLM's hyper-connection dots (hcPre: 24 dots + squares a 1,024 block) vs float64; partial8, _f32w, fused: same bytes.
 const std = @import("std");
 const cuda = @import("cuda");
 const check = @import("check.zig");
@@ -105,4 +105,33 @@ pub fn mixing(r: *Rig, set: glue.Set) !void {
             try ref.sameRows(r, try std.fmt.bufPrint(&name, "hc pre: {d} rows' {s} equal the {d}-row call's", .{ m, label, rows }), want, got, m * n);
     }
     check.pass("hc mixing: dots and squares within float64 tolerance, decode windows' partials and outputs equal the prompt rows'", .{});
+}
+
+/// TF_GLM_HC_FUSE at 64 to 130 rows, two ranks: hcPostPartial then hcFinish give hcPost then hcPre's bytes.
+pub fn fused(r: *Rig, set: glue.Set) !void {
+    const world = 2;
+    const w = try mixWeights(r);
+    const norm: glue.Norm = .{ .bf16 = try r.dev(std.mem.sliceAsBytes(try r.bfs(d, 1.0))) };
+    var name: [128]u8 = undefined;
+    for ([_]usize{ 64, 65, 70, 130 }) |m| {
+        const streams = std.mem.sliceAsBytes(try r.bfs(m * wide, 1.0));
+        const g = try r.a.alloc(f32, world * m * d);
+        for (g) |*v| v.* = r.rng.float(f32) * 2 - 1;
+        const mix = try r.a.alloc(f32, m * (s + s * s));
+        for (mix) |*v| v.* = r.rng.float(f32) * 2;
+        const gd = try r.dev(std.mem.sliceAsBytes(g));
+        const post = try r.dev(std.mem.sliceAsBytes(mix[0 .. m * s]));
+        const comb = try r.dev(std.mem.sliceAsBytes(mix[m * s ..]));
+        const xa = try r.dev(streams);
+        const xb = try r.dev(streams);
+        try glue.hcPost(set, r.s, xa, xa, gd, post, comb, m, d, s, world);
+        const a = try pre(r, set, xa, w, norm, m);
+        const b: Outs = .{ .out = try r.zeros(m * d * 2), .xs = try r.zeros(m * (d / 64) * 4), .post = try r.zeros(m * s * 4), .comb = try r.zeros(m * s * s * 4), .part = try r.zeros(glue.hcPartBytes(m)) };
+        try glue.hcPostPartial(set, r.s, xb, xb, gd, post, comb, w[0], b.part, m, d, s, world);
+        try glue.hcFinish(set, r.s, xb, w[1], w[2], norm, b.out, b.xs, b.post, b.comb, b.part, 1e-6, 1e-6, 20, m);
+        try ref.sameRows(r, try std.fmt.bufPrint(&name, "hc fuse, {d} rows: streams equal hc_post's", .{m}), xa, xb, m * wide * 2);
+        for ([5]u64{ a.part, a.out, a.xs, a.post, a.comb }, [5]u64{ b.part, b.out, b.xs, b.post, b.comb }, [5]usize{ glue.hcPartBytes(1), d * 2, (d / 64) * 4, s * 4, s * s * 4 }, [5][]const u8{ "partials", "normed rows", "group sums", "post", "comb" }) |want, got, n, label|
+            try ref.sameRows(r, try std.fmt.bufPrint(&name, "hc fuse, {d} rows: {s} equal hc_pre's", .{ m, label }), want, got, m * n);
+    }
+    check.pass("hc fuse: hc_post_partial then hc_finish give hc_post then hc_pre's bytes (64, 65, 70, 130 rows)", .{});
 }

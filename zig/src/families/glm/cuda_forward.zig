@@ -209,6 +209,7 @@ pub const Forward = struct {
     taps: ?taps_mod.Taps = null, // DFlash2 (--drafter): the tapped layers' rows, after each such layer
     index_split: bool = false, // TF_GLM_INDEX_SPLIT: this prompt chunk's indexer rows split across the ranks (rank 0's choice)
     l2pf: ?*const l2pf_mod.L2pf = null, // TF_GLM_L2PF: a decode window's sites read their next weights into L2
+    hc_fuse: bool = false, // TF_GLM_HC_FUSE: a prompt call's hc_post writes the next hc_pre's partials (same bytes)
 
     /// TF_GLM_L2PF on this forward: a decode window of this process's one rank (a prompt chunk reads at full rate).
     pub fn prefetch(f: *const Forward) ?*const l2pf_mod.L2pf {
@@ -244,21 +245,9 @@ pub const Forward = struct {
         return r.b.gathered + r.w.share.rank * rows * r.w.config.hidden * 4;
     }
 
-    /// forward._pre: hc_pre of every row at a site into b.normed, xs, post and comb.
-    pub fn pre(f: *const Forward, r: Rank, hc: weights.Hc, norm: glue.Norm, rows: usize) !void {
-        const stamp = prof_mod.span(f.prof, f.stream, .glue);
-        defer stamp.end();
-        const c = &r.w.config;
-        const b = r.b;
-        try glue.hcPre(f.set(), f.stream, b.x, hc.fn_w, hc.base, hc.scale, norm, b.normed, b.xs, b.post, b.comb, b.hcpart, c.eps, c.hc_eps, c.sinkhorn, rows, c.hidden, c.hc);
-    }
-
-    fn post(f: *const Forward, r: Rank, rows: usize) !void {
-        const stamp = prof_mod.span(f.prof, f.stream, .glue);
-        defer stamp.end();
-        const c = &r.w.config;
-        try glue.hcPost(f.set(), f.stream, r.b.x, r.b.x, r.b.gathered, r.b.post, r.b.comb, rows, c.hidden, c.hc, r.w.share.world);
-    }
+    pub const pre = @import("cuda_forward_glue.zig").pre;
+    const post = @import("cuda_forward_glue.zig").post;
+    pub const fuses = @import("cuda_forward_glue.zig").fuses;
 
     /// forward._mixer: the layer's KDA or DSA block on b.normed; `li`/`di`: its index among loaded KDA / DSA layers.
     pub fn mixer(f: *const Forward, r: Rank, l: weights.Layer, li: usize, di: usize, rows: usize, nch: usize, out: ?u64) !void {
@@ -366,36 +355,7 @@ pub const Forward = struct {
 
     const exchangePieces = @import("cuda_forward_pieces.zig").exchangePieces;
 
-    /// hc_post of rows lo..hi from partials `g` [world][hi - lo][D] (a gathered room or a split one's own rows).
-    fn postRows(f: *const Forward, r: Rank, lo: usize, hi: usize, g: u64) !void {
-        const c = &r.w.config;
-        const b = r.b;
-        const S: usize = c.hc;
-        const D: usize = c.hidden;
-        const x = b.x + lo * S * D * 2;
-        try glue.hcPost(f.set(), f.stream, x, x, g, b.post + lo * S * 4, b.comb + lo * S * S * 4, hi - lo, D, S, r.w.share.world);
-    }
-
-    /// forward._pre of rows lo..hi.
-    fn preRows(f: *const Forward, r: Rank, hc: weights.Hc, norm: glue.Norm, lo: usize, hi: usize) !void {
-        const c = &r.w.config;
-        const b = r.b;
-        const S: usize = c.hc;
-        const D: usize = c.hidden;
-        try glue.hcPre(f.set(), f.stream, b.x + lo * S * D * 2, hc.fn_w, hc.base, hc.scale, norm, b.normed + lo * D * 2, b.xs + lo * (D / 64) * 4, b.post + lo * S * 4, b.comb + lo * S * S * 4, b.hcpart, c.eps, c.hc_eps, c.sinkhorn, hi - lo, D, S);
-    }
-
-    /// One piece's glue after a site: hc_post, then the next layer's hc_pre or (after the last layer) the stream mean.
-    pub fn glueRows(f: *const Forward, r: Rank, j: usize, site: Site, lo: usize, hi: usize, g: u64) !void {
-        const stamp = prof_mod.span(f.prof, f.stream, .glue);
-        defer stamp.end();
-        const c = &r.w.config;
-        const layers = r.w.layers;
-        try f.postRows(r, lo, hi, g);
-        if (site == .mixer) return f.preRows(r, layers[j].ffn_hc, layers[j].post_norm, lo, hi);
-        if (j + 1 < layers.len) return f.preRows(r, layers[j + 1].attn_hc, layers[j + 1].in_norm, lo, hi);
-        try glue.streamMean(f.set(), f.stream, r.b.x + lo * c.hc * c.hidden * 2, r.b.hidden + lo * c.hidden * 2, hi - lo, c.hidden, c.hc);
-    }
+    pub const glueRows = @import("cuda_forward_glue.zig").glueRows;
 
     const gluePieces = @import("cuda_forward_pieces.zig").gluePieces;
     const tapPieces = @import("cuda_forward_pieces.zig").tapPieces;
@@ -404,7 +364,7 @@ pub const Forward = struct {
     /// forward.pieced_layers: a prompt chunk's layers with exchanges in row pieces; same kernels and bits as unpieced.
     fn pieced(f: *const Forward, p: *const Pieces, R: usize, cut: []const [2]usize) !void {
         const layers = f.ranks[0].w.layers;
-        for (f.ranks) |r| try f.pre(r, r.w.layers[0].attn_hc, r.w.layers[0].in_norm, R);
+        for (f.ranks) |r| try f.pre(r, r.w.layers[0].attn_hc, r.w.layers[0].in_norm, R, false);
         var li: usize = 0;
         var di: usize = 0;
         for (layers, 0..) |_, j| {
@@ -457,13 +417,14 @@ pub const Forward = struct {
     fn whole(f: *const Forward, R: usize) !void {
         const c = &f.ranks[0].w.config;
         const pf = f.prefetch();
+        const fused = f.fuses(R); // each hc_post but the last wrote its next hc_pre's partials
         var li: usize = 0;
         var di: usize = 0;
         for (f.ranks[0].w.layers, 0..) |_, j| {
             prof_mod.context(f.prof, j, null, .mixer);
             for (f.ranks) |r| {
                 const l = r.w.layers[j];
-                try f.pre(r, l.attn_hc, l.in_norm, R);
+                try f.pre(r, l.attn_hc, l.in_norm, R, fused and j > 0);
                 if (r.segs.len > 0) try shared.mixer(f, r, l, li, di, R, slot(r, R)) else try f.mixer(r, l, li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), slot(r, R));
             }
             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].mixer == .kda) .kda else .mla);
@@ -473,14 +434,14 @@ pub const Forward = struct {
             prof_mod.context(f.prof, j, null, .ffn);
             for (f.ranks) |r| {
                 const l = r.w.layers[j];
-                try f.post(r, R);
-                try f.pre(r, l.ffn_hc, l.post_norm, R);
+                try f.post(r, R, l.ffn_hc);
+                try f.pre(r, l.ffn_hc, l.post_norm, R, fused);
                 try f.ffn(r, l, R, slot(r, R));
             }
             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].ffn == .dense) .dense else .shared); // MoE: its fill
             if (pf) |p| try p.fork(f.stream, j, .n);
             try f.gather(R);
-            for (f.ranks) |r| try f.post(r, R);
+            for (f.ranks) |r| try f.post(r, R, if (j + 1 < r.w.layers.len) r.w.layers[j + 1].attn_hc else null);
             if (f.taps) |t| try t.at(f.stream, j, f.ranks[0].b.x, 0, R);
             if (f.prof) |p| p.mark(f.stream, .gather_b);
             switch (f.ranks[0].w.layers[j].mixer) {

@@ -369,7 +369,9 @@ sparse). Its prompt indexer (`tf_glm_index_scores`, `tf_glm_index_pools`) is bit
 `tf_glm_select_rows`, and its decode select at a 1,024-thread block a row (`tf_glm_select_rows_wide`) to
 `tf_glm_select_rows`; both stated rules rank any NaN above +inf, as the GPU's `s + 0` makes every NaN one
 positive NaN. The sparse chunks with their merge in the kernel (`tf_glm_chunks_{16,32}{,_fp8}_fused`) are bit-equal
-to the chunk kernels then `tf_glm_merge`.
+to the chunk kernels then `tf_glm_merge`. `TF_GLM_HC_FUSE`'s `tf_glm_hc_post_partial` is bit-equal to
+`tf_glm_hc_post` then the next site's `tf_glm_hc_partial` (the streams in place, and the partials), with a wrong
+square-sum order and a dropped row as controls; its compile usage is pending.
 CUDA also checks `TF_GLM_KV_HOST`'s gather (`tf_glm_kvh_*` in `glm_ops.cu`, launched by `cuda_kv_host.zig`): the
 marks (a slot for each distinct pick; past its slots, the call flagged and no row left marked), the picked rows into
 their slots from host pages or the layer's row cache, the token lists' slots, the marks cleared, the dense rows through
