@@ -99,8 +99,8 @@ fn picks(r: *Rig, rows: usize) ![]i32 {
 
 const Run = struct { ey: u64, rows: usize };
 
-/// The family's dispatch on `x` (bf16 [rows][D]) and `pk`: ey [rows][slots][D] fp32, the shared slot left as filled.
-fn run(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, s: Set, x: []const u16, pk: []const i32, rows: usize, prompt: bool) !Run {
+/// The family's dispatch on `x` (bf16 [rows][D]) and `pk`: ey [rows][slots][D] fp32 or bf16, the shared slot as filled.
+fn run(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, s: Set, x: []const u16, pk: []const i32, rows: usize, prompt: bool, b16: bool) !Run {
     const P = rows * glm.exl3.top_k;
     const tile: usize = if (prompt) glm.experts.staged_tile else glm.experts.tile;
     const wide = P > cuda.grouped.small;
@@ -115,7 +115,7 @@ fn run(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, s: S
     const sc: glm.exl3.Scratch = .{ .picks = try r.zeros(sz[0]), .xg = try r.zeros(sz[1]), .xu = try r.zeros(sz[2]), .z = try r.zeros(sz[3]) };
     const ey = try r.zeros(rows * slots * D * 4);
     const xd = try r.zeros(P * N * 2);
-    try glm.exl3.run(k, ek, r.s, s.experts(), sc, plan, try r.dev(std.mem.sliceAsBytes(x)), D, try r.dev(std.mem.sliceAsBytes(pk)), slots, rows, E, D, N, limit, prompt, ey, xd);
+    try glm.exl3.run(k, ek, r.s, s.experts(), sc, plan, try r.dev(std.mem.sliceAsBytes(x)), D, try r.dev(std.mem.sliceAsBytes(pk)), slots, rows, E, D, N, limit, prompt, b16, ey, xd);
     try r.s.synchronize();
     return .{ .ey = ey, .rows = rows };
 }
@@ -207,12 +207,12 @@ pub fn run_(gpu: Gpu) !void {
         for ([_]usize{ 1, 3, 8 }) |rows| { // decode windows
             const x = try r.bfs(rows * D, 1.0);
             const pk = try picks(&r, rows);
-            const got = try run(&r, &k, &ek, s, x, pk, rows, false);
+            const got = try run(&r, &k, &ek, s, x, pk, rows, false, false);
             try expect(&r, if (one) "glm-exl3 decode, one rotation" else "glm-exl3 decode, a rotation an expert", got, s, x, pk);
             if (rows > 1) { // every row's bits as alone
                 const all = try r.back(got.ey, rows * slots * D * 4);
                 for (0..rows) |row| {
-                    const alone = try run(&r, &k, &ek, s, x[row * D ..][0..D], pk[row * slots ..][0..slots], 1, false);
+                    const alone = try run(&r, &k, &ek, s, x[row * D ..][0..D], pk[row * slots ..][0..slots], 1, false, false);
                     const mine = try r.back(alone.ey, slots * D * 4);
                     try check.expect(std.mem.eql(u8, mine[0 .. (slots - 1) * D * 4], all[row * slots * D * 4 ..][0 .. (slots - 1) * D * 4]), "glm-exl3 decode: row {d} of {d} equals the row alone", .{ row, rows });
                 }
@@ -221,16 +221,31 @@ pub fn run_(gpu: Gpu) !void {
         for ([_]usize{ 1, 40, 200, glm.exl3.chunk_rows + 6 }) |rows| { // prompt chunks, the last in two calls
             const x = try r.bfs(rows * D, 1.0);
             const pk = try picks(&r, rows);
-            const got = try run(&r, &k, &ek, s, x, pk, rows, true);
+            const got = try run(&r, &k, &ek, s, x, pk, rows, true, false);
             try expect(&r, if (one) "glm-exl3 prompt, one rotation" else "glm-exl3 prompt, a rotation an expert", got, s, x, pk);
             if (rows > glm.exl3.chunk_rows) { // the rows either side of the calls' boundary keep their bits as alone
                 const all = try r.back(got.ey, rows * slots * D * 4);
                 for ([_]usize{ 0, glm.exl3.chunk_rows - 1, glm.exl3.chunk_rows, rows - 1 }) |row| {
-                    const alone = try run(&r, &k, &ek, s, x[row * D ..][0..D], pk[row * slots ..][0..slots], 1, true);
+                    const alone = try run(&r, &k, &ek, s, x[row * D ..][0..D], pk[row * slots ..][0..slots], 1, true, false);
                     const mine = try r.back(alone.ey, slots * D * 4);
                     try check.expect(std.mem.eql(u8, mine[0 .. (slots - 1) * D * 4], all[row * slots * D * 4 ..][0 .. (slots - 1) * D * 4]), "glm-exl3 prompt: row {d} of {d} equals the row alone", .{ row, rows });
                 }
             }
+        }
+    }
+    { // TF_GLM_EXL3_BF16_SLOTS: each routed slot value is the fp32 run's, rounded to bf16; the shared slot left alone
+        const s = try weights(&r, true);
+        for ([_]usize{ 40, glm.exl3.chunk_rows + 6 }) |rows| {
+            const x = try r.bfs(rows * D, 1.0);
+            const pk = try picks(&r, rows);
+            const wide = try r.back((try run(&r, &k, &ek, s, x, pk, rows, true, false)).ey, rows * slots * D * 4);
+            const half = try r.back((try run(&r, &k, &ek, s, x, pk, rows, true, true)).ey, rows * slots * D * 2);
+            for (0..rows) |row| for (0..slots) |j| for (0..D) |c| {
+                const i = (row * slots + j) * D + c;
+                const got = std.mem.readInt(u16, half[i * 2 ..][0..2], .little);
+                const want: u16 = if (j == slots - 1) 0xffff else core.bf16_round.bits(@bitCast(std.mem.readInt(u32, wide[i * 4 ..][0..4], .little)));
+                try check.expect(got == want, "glm-exl3 bf16 slots: row {d} slot {d} column {d} is the fp32 value rounded", .{ row, j, c });
+            };
         }
     }
     { // a NaN in one row's input: that row's routed slots NaN, every other row finite
@@ -240,7 +255,7 @@ pub fn run_(gpu: Gpu) !void {
         x[2 * D + 17] = 0x7fc0;
         const pk = try picks(&r, rows);
         for ([_]bool{ false, true }) |prompt| {
-            const got = try run(&r, &k, &ek, s, x, pk, rows, prompt);
+            const got = try run(&r, &k, &ek, s, x, pk, rows, prompt, false);
             const raw = try r.back(got.ey, rows * slots * D * 4);
             for (0..rows) |row| for (0..slots - 1) |j| for (0..D) |c| {
                 const v: f32 = @bitCast(std.mem.readInt(u32, raw[((row * slots + j) * D + c) * 4 ..][0..4], .little));

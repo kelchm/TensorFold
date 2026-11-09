@@ -76,3 +76,6 @@ The command-line `--no-update-check` remains an accepted no-op.
 before rank placement, NCCL or weights; other CUDA families do not check this GLM-only scope.
 `1` selects arithmetic-changing prompt absorb/expand GEMMs, registered as arithmetic in the
 profile and agreed in every rank's fingerprint. See the [experiment and pending gates](recipes/glm-prompt-mla.md).
+
+`TF_GLM_EXL3_BF16_SLOTS` accepts `0` or `1` with the same checks, scope and rank agreement; unset or blank keeps it off.
+`1` has an EXL3 checkpoint's prompt chunks write their MoE slot rows (the eight routed experts' and the shared expert's) as bf16, as NVFP4 prompt chunks already do, so the combine reads half the bytes. Each routed value is the fp32 kernel's rounded once to bf16 (`tf_exl3_prompt_down_glm_b16`); decode windows and NVFP4 checkpoints are unchanged. It can change tokens, so it is registered as arithmetic; device qualification is pending.

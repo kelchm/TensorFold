@@ -505,3 +505,4 @@ Cases cover every item size from 1 through 64, multiple items, shared and separa
 nonfinite inputs and guarded repeats. Constant-weight FP64 stress proves fp16 overflow; BF16 epilogue rounding can
 hide a balanced reduced-precision sum, so that limitation is explicit. Two controls drop the last member or use
 compact output strides. New symbols' compile usage remains pending; see the [port receipt](receipts/glm-exl3-prompt-port.md).
+`tf_exl3_prompt_down_glm_b16` (`TF_GLM_EXL3_BF16_SLOTS`) registers as a byte replacement of the retained down kernel scattered into the slots and rounded on the host with `__float2bfloat16_rn`'s rule (NaN as `0x7fff`); its compile usage is pending too.

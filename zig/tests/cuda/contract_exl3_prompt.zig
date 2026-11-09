@@ -1,4 +1,4 @@
-//! GLM prompt replacements: identical full-K sums, every 8-member specialization, and untouched shared slots.
+//! GLM prompt replacements: identical full-K sums, every 8-member specialization, untouched shared slots, bf16 slots.
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
@@ -8,7 +8,7 @@ const ref = @import("contract_exl3_prompt_ref.zig");
 const c = core.contract.spec;
 const g = core.contract.gates;
 
-const Kind = enum { gu, slots, down };
+const Kind = enum { gu, slots, down, b16 }; // b16: the down kernel's slot rows rounded to bf16 (TF_GLM_EXL3_BF16_SLOTS)
 const Fault = enum { none, last_member, slot_stride };
 
 fn depth(s: c.Shape) usize {
@@ -61,6 +61,7 @@ pub const Case = struct {
             .none => switch (self.kind) {
                 .slots => "cuda exl3 tf_exl3_prompt_down_slots direct routed slots",
                 .down => "cuda exl3 tf_exl3_prompt_down_glm",
+                .b16 => "cuda exl3 tf_exl3_prompt_down_glm_b16 bf16 slots",
                 .gu => if (self.shared) "cuda exl3 tf_exl3_prompt_gu_glm shared rotation" else if (self.act == 0) "cuda exl3 tf_exl3_prompt_gu_glm separate bf16" else "cuda exl3 tf_exl3_prompt_gu_glm separate fp32",
             },
         };
@@ -68,10 +69,14 @@ pub const Case = struct {
             .name = name,
             .accum = .f32,
             .depth = depth,
-            .out = if (self.kind == .gu) .f16 else .f32,
+            .out = switch (self.kind) {
+                .gu => .f16,
+                .b16 => .bf16,
+                .slots, .down => .f32,
+            },
             .ops = 8,
-            .replaces = "retained common prompt kernel, compact down output scattered into routed slots",
-            .nan = .{ .stated = "the retained kernel's bytes on identical NaN and infinity plants" },
+            .replaces = if (self.kind == .b16) "retained common prompt kernel scattered into routed slots, then __float2bfloat16_rn" else "retained common prompt kernel, compact down output scattered into routed slots",
+            .nan = .{ .stated = if (self.kind == .b16) "the retained kernel's bytes rounded to bf16 on identical plants, NaN as 0x7fff" else "the retained kernel's bytes on identical NaN and infinity plants" },
             .served = &shapes,
             .tiles = .{ .{ .size = 64 }, .{ .size = 256, .step = 256, .min = 256 }, .{ .size = 128, .step = 128, .min = 128 } },
             .sums = .{ .exact = false, .bf16 = 0, .why = "balanced reduced-precision sums can retain constant terms; fp16 must overflow" },
@@ -131,11 +136,16 @@ pub const Case = struct {
         self.counts = try self.rig.input(std.mem.sliceAsBytes(&counts));
         self.out = try self.rig.output(self.count() * self.elemBytes());
         try self.rig.zero(self.out, self.count() * self.elemBytes());
-        self.base = try self.rig.scratch(sh.rows * sh.n * self.elemBytes());
+        self.base = try self.rig.scratch(sh.rows * sh.n * self.baseBytes());
         return true;
     }
 
     fn elemBytes(self: *Case) usize {
+        return if (self.kind == .gu or self.kind == .b16) 2 else 4;
+    }
+
+    /// The retained kernel's element: fp16 gate/up rows, fp32 down rows.
+    fn baseBytes(self: *Case) usize {
         return if (self.kind == .gu) 2 else 4;
     }
 
@@ -168,7 +178,7 @@ pub const Case = struct {
 
     pub fn replaced(self: *Case) ![]const u8 {
         try self.launch(self.old, self.base, true);
-        const src = try self.rig.bytes(self.base, self.shape.rows * self.shape.n * self.elemBytes());
+        const src = try self.rig.bytes(self.base, self.shape.rows * self.shape.n * self.baseBytes());
         if (self.kind == .gu) return src;
         try self.compact.resize(self.rig.gpu.gpa, self.count() * 4);
         @memset(self.compact.items, 0);
@@ -177,7 +187,13 @@ pub const Case = struct {
             const at = (p / 8 * 9 + p % 8) * rowbytes;
             @memcpy(self.compact.items[at..][0..rowbytes], src[p * rowbytes ..][0..rowbytes]);
         }
-        return self.compact.items;
+        if (self.kind != .b16) return self.compact.items;
+        const all = self.compact.items;
+        for (0..self.count()) |i| { // in place: value i's two bytes land before value i + 1's four are read
+            const v: f32 = @bitCast(std.mem.readInt(u32, all[i * 4 ..][0..4], .little));
+            std.mem.writeInt(u16, all[i * 2 ..][0..2], if (std.math.isNan(v)) 0x7fff else c.toBf16(v), .little);
+        }
+        return all[0 .. self.count() * 2];
     }
 
     pub fn check(self: *Case, _: g.Gate) !?[]const u8 {
@@ -209,7 +225,7 @@ pub const Case = struct {
 pub const Group = struct {
     a: std.mem.Allocator,
     mod: cuda.Module,
-    entries: [7]Case,
+    entries: [8]Case,
 
     pub fn create(a: std.mem.Allocator, gpu: check_.Gpu, s: cuda.Stream, kernels: *std.ArrayList(g.Kernel)) !*Group {
         const self = try a.create(Group);
@@ -222,11 +238,11 @@ pub const Group = struct {
             const gu = i < 3 or i == 5;
             x.* = .{
                 .rig = .{ .gpu = gpu, .s = s },
-                .kind = if (gu) .gu else if (i == 3) .slots else .down,
+                .kind = if (gu) .gu else if (i == 3) .slots else if (i == 7) .b16 else .down,
                 .shared = i == 0,
                 .act = if (i == 2) 1 else 0,
                 .fault = if (i == 5) .last_member else if (i == 6) .slot_stride else .none,
-                .f = if (gu) p.gateup_glm.? else if (i == 3) p.down_slots.? else p.down_glm.?,
+                .f = if (gu) p.gateup_glm.? else if (i == 3) p.down_slots.? else if (i == 7) p.down_glm_b16.? else p.down_glm.?,
                 .old = if (gu) p.gateup else p.down,
             };
         }
@@ -249,4 +265,8 @@ test "GLM prompt contract: every hook compiles without embedded CUDA images" {
     std.mem.doNotOptimizeAway(&Group.create);
     std.mem.doNotOptimizeAway(&Group.destroy);
     try std.testing.expectEqual(@as(usize, 69), kernel.spec.served.len);
+    x.kind = .b16;
+    const half = x.kernel();
+    try std.testing.expectEqual(c.Elem.bf16, half.spec.out);
+    try std.testing.expect(half.spec.replaces != null and half.vt.replaced != null);
 }

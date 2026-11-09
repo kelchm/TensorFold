@@ -106,6 +106,7 @@ opposite-peer warm-up; it does not add a switchless RoCE relay or qualify a four
 
 The fork-only [MLA port](glm-prompt-mla.md) adds the default-off arithmetic switch
 `TF_GLM_ABSORB_MMA=1` and bit-preserving FP8 tile-load changes. Device qualification is pending.
+`TF_GLM_EXL3_BF16_SLOTS=1` (default off) keeps an EXL3 prompt chunk's MoE slot rows in bf16, as NVFP4 prompt chunks do; see [environment](../environment.md#glm-cuda-prompt-arithmetic).
 
 ## Prompt chunk size
 

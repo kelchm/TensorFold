@@ -265,6 +265,36 @@ test "TF_GLM_PROMPT_TAIL: unset, 0 or 1, refused otherwise" {
         try std.testing.expectEqualStrings("TF_GLM_PROMPT_TAIL: 0 or 1", problem);
     }
 }
+test "TF_GLM_EXL3_BF16_SLOTS: off by default, 0 or 1, refused otherwise, arithmetic, and all ranks must agree" {
+    const Reader = struct {
+        var raw: ?[]const u8 = null;
+        fn get(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_EXL3_BF16_SLOTS")) raw else null;
+        }
+    };
+    var problem: []const u8 = "";
+    for ([_]?[]const u8{ null, "", "0" }) |raw| {
+        Reader.raw = raw;
+        try std.testing.expectEqual(@as(u32, 0), (try Settings.read(Reader.get, &problem)).numerics.bits());
+    }
+    Reader.raw = "1";
+    const on = try Settings.read(Reader.get, &problem);
+    try std.testing.expect(on.numerics.exl3_bf16_slots and !on.numerics.absorb_mma);
+    for ([_][]const u8{ "on", "2", " 1 " }) |raw| {
+        Reader.raw = raw;
+        try std.testing.expectError(error.BadSetting, Settings.read(Reader.get, &problem));
+        try std.testing.expectEqualStrings("TF_GLM_EXL3_BF16_SLOTS: 0 or 1", problem);
+    }
+    const h: [32]u8 = @splat(0);
+    var all = [_]Fingerprint{ Fingerprint.of(2, 0, on, 8192, true, h, h, h), Fingerprint.of(2, 1, .{}, 8192, true, h, h, h) };
+    try std.testing.expectEqual(@as(?Mismatch, .{ .field = .numerics, .rank = 1 }), mismatch(&all));
+    all[1] = Fingerprint.of(2, 1, on, 8192, true, h, h, h);
+    try std.testing.expect(mismatch(&all) == null);
+    const entry = @import("profile").entry(.TF_GLM_EXL3_BF16_SLOTS);
+    try std.testing.expectEqual(@import("profile").Class.arithmetic, entry.class);
+    try std.testing.expect(entry.stable == null and entry.differs("1") and !entry.differs("0"));
+}
+
 fn digestFixture(io: std.Io, dir: std.Io.Dir, sub: []const u8, byte: u8) !void {
     try dir.createDirPath(io, sub);
     var d = try dir.openDir(io, sub, .{});
