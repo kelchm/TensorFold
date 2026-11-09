@@ -124,12 +124,12 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
 /// The selected common EXL3 owner. This file adapts the family's checkpoint shard and slot layout only.
 pub const Kernels = cuda.exl3_experts.Experts;
 const common = cuda.exl3_experts;
-/// The common module with GLM's decode-window grouped kernels (TF_EXL3_SHFL=0: the lane-window loads; the same bits).
+/// The common module with GLM's decode-window kernels (TF_EXL3_SHFL=0: lane-window loads; TF_EXL3_PDL=0: no chain).
 pub fn loadKernels(d: *const cuda.Driver) !Kernels {
     const read_once = try @import("sys").environment.read(bool, "TF_EXL3_SHFL", true);
     var k = try Kernels.load(d);
     errdefer k.unload();
-    try k.selectDecode(if (read_once) .read_once else .tiles);
+    try k.selectDecode(if (read_once) .read_once else .tiles, cuda.exl3.dependent(d));
     return k;
 }
 pub const Scratch = struct { picks: u64, xg: u64, xu: u64, z: u64 };

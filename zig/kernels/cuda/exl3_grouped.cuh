@@ -24,7 +24,7 @@ struct GroupedArgs {
 };
 
 // How a warp reads its k tiles: main's loop, a tile ahead, or each word once (SHFL); the rest: the contract's faults.
-enum Load : int { PLAIN = 0, AHEAD = 1, SKIP = 2, STALE = 3, SHFL = 4, SHFL_SRC = 5, SHFL_A = 6 };
+enum Load : int { PLAIN = 0, AHEAD = 1, SKIP = 2, STALE = 3, SHFL = 4, SHFL_SRC = 5, SHFL_A = 6, SHFL_PDL = 7 };
 
 // One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc: per-lane loads and the shared decode (same bits).
 template <int CB, int K2, int NT, int LOAD>
@@ -106,17 +106,28 @@ __device__ __forceinline__ void warp_tiles_shfl(const uint32_t* T, int ntiles, i
     const bool own = TW == 32 || lane < TW;
     const uint32_t mask = 0x8FFF8FFFu | ((uint32_t)opq >> 8);  // exactly 0x8FFF8FFF (opq < 256), held in a register
     uint32_t nx[NT], na[4];  // the next tile's word `lane` of each n tile and its A fragment, in flight
-    auto load = [&](int i) {
+    auto words = [&](int i) {  // the trellis: immutable, so a dependent launch may read it before its wait
         const uint32_t* t0 = tb + (size_t)i * kstride;
 #pragma unroll
         for (int j = 0; j < NT; ++j) nx[j] = own ? ldg_stream_u32(t0 + j * TW + lane) : 0u;
+    };
+    auto inputs = [&](int i) {  // the rows: the grid before's outputs
         const int k = (kt0 + i) * 16;
         na[0] = ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u;
         na[1] = ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k) : 0u;
         na[2] = ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k + 8) : 0u;
         na[3] = ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k + 8) : 0u;
     };
-    if (nkt > 0) load(0);
+    auto load = [&](int i) {
+        words(i);
+        inputs(i);
+    };
+    if (nkt > 0) words(0);
+    if constexpr (LOAD == SHFL_PDL) {  // a dependent launch: every input of this grid and every write after the wait
+        qmm_frag::grid_wait();
+        qmm_frag::grid_launch();
+    }
+    if (nkt > 0) inputs(0);
     for (int i = 0; i < nkt; ++i) {
         uint32_t cur[NT], a[4];
 #pragma unroll
@@ -247,7 +258,12 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
 template <int CB, int NT, int W, int LOAD, int K2F, int RR, bool REV = false>
 __device__ __forceinline__ void grouped_body_one(const GroupedArgs a, int u, int nblock, int zz) {
     static_assert(K2F > 0 && RR > 0 && RR <= 16, "one trellis width, at most 16 reduction rows");
-    if (u >= a.ucount[0]) return;
+    // SHFL_PDL: before its wait a block reads only the plan (two grids back), trellis pointers, widths and first tile
+    constexpr bool PDL = LOAD == SHFL_PDL;
+    if (u >= a.ucount[0]) {
+        if constexpr (PDL) qmm_frag::grid_wait(); // every block waits before it exits
+        return;
+    }
     if (RR < 16 && a.maxm > RR) __trap(); // the launcher picks it only for windows of at most RR rows
     const int MT = (a.maxm + 15) / 16;
     const int mtile = zz % MT;
@@ -255,7 +271,10 @@ __device__ __forceinline__ void grouped_body_one(const GroupedArgs a, int u, int
     const int mat = zz / MT / a.sk;
     const half* X = mat ? a.x1 : a.x0;
     const int e = a.standard ? a.uids[3 * u] : a.uids[u];
-    if (a.standard && e == a.skip) return;
+    if (a.standard && e == a.skip) {
+        if constexpr (PDL) qmm_frag::grid_wait();
+        return;
+    }
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? a.tp1[e] : a.tp0[e]);
     if ((mat ? a.k2_1[e] : a.k2_0[e]) != K2F) __trap(); // and only for a projection whose every expert is K2F wide
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -271,7 +290,10 @@ __device__ __forceinline__ void grouped_body_one(const GroupedArgs a, int u, int
         rows_sh[threadIdx.x] = a.standard ? code : (code >= 0 ? (code >> 5) * a.slots + (code & 31) : -1);
     }
     __syncthreads();
-    if (rows_sh[0] < 0) return; // members come first, so this tile is empty
+    if (rows_sh[0] < 0) { // members come first, so this tile is empty
+        if constexpr (PDL) qmm_frag::grid_wait();
+        return;
+    }
     const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
     const half* x0 = X + (size_t)(r0 < 0 ? 0 : r0) * a.k + 2 * t;
     const half* x1 = X + (size_t)(r1 < 0 ? 0 : r1) * a.k + 2 * t;

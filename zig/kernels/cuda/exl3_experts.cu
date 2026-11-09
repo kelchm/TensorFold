@@ -53,6 +53,15 @@ extern "C" __global__ void tf_exl3_grouped_1_k8r16s(tf_exl3::GroupedArgs a) {  /
     tf_exl3::grouped_body_one<1, 4, 4, GROUPED_SHFL, 8, 16>(a, blockIdx.x, blockIdx.y, blockIdx.z);
 }
 
+// k8r8s and k8r16s as dependent launches (GLM's decode chain): the plan and first tile before the wait, the rest after.
+extern "C" __global__ void tf_exl3_grouped_1_k8r8p(tf_exl3::GroupedArgs a) {
+    tf_exl3::grouped_body_one<1, 4, 4, tf_exl3::SHFL_PDL, 8, 8>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
+extern "C" __global__ void tf_exl3_grouped_1_k8r16p(tf_exl3::GroupedArgs a) {
+    tf_exl3::grouped_body_one<1, 4, 4, tf_exl3::SHFL_PDL, 8, 16>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
 namespace tf_exl3 {
 
 // Grouping in one block: distinct experts (< E) in id order, members row * 32 + slot in row order, -1 after the last.
@@ -132,7 +141,13 @@ struct RotInArgs {
     int k, slots, experts;
 };
 
-extern "C" __global__ void tf_exl3_experts_rot_in(const RotInArgs a) {
+// PDL (GLM's decode chain, tf_exl3_experts_rot_in_p): wait for the grids before, then let the next one launch.
+template <bool PDL>
+__device__ __forceinline__ void rot_in(const RotInArgs a) {
+    if constexpr (PDL) {
+        qmm_frag::grid_wait();
+        qmm_frag::grid_launch();
+    }
     const int p = blockIdx.x, blk = blockIdx.y, mat = blockIdx.z;
     const int e = a.pick[p];
     if (e < 0 || e >= a.experts) return;
@@ -156,6 +171,9 @@ extern "C" __global__ void tf_exl3_experts_rot_in(const RotInArgs a) {
     for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
 }
 
+extern "C" __global__ void tf_exl3_experts_rot_in(const RotInArgs a) { rot_in<false>(a); }
+extern "C" __global__ void tf_exl3_experts_rot_in_p(const RotInArgs a) { rot_in<true>(a); }
+
 // Program (slot, 128-block of the width): splits summed in order, rotated, * svh, SwiGLU (0: bf16, 1: fp32), then Xd.
 struct GateUpArgs {
     const float* z; // [(mat * sk + split) * P + p] * N + col
@@ -169,7 +187,13 @@ struct GateUpArgs {
     int act_mode;
 };
 
-extern "C" __global__ void tf_exl3_gateup_epilogue(const GateUpArgs a) {
+// PDL (GLM's decode chain, tf_exl3_gateup_epilogue_p): wait for the grids before, then let the next one launch.
+template <bool PDL>
+__device__ __forceinline__ void gateup_epilogue(const GateUpArgs a) {
+    if constexpr (PDL) {
+        qmm_frag::grid_wait();
+        qmm_frag::grid_launch();
+    }
     const int p = blockIdx.x, blk = blockIdx.y;
     const int e = a.pick[p];
     if (e < 0 || e >= a.experts) return;
@@ -210,6 +234,9 @@ extern "C" __global__ void tf_exl3_gateup_epilogue(const GateUpArgs a) {
 #pragma unroll
     for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
 }
+
+extern "C" __global__ void tf_exl3_gateup_epilogue(const GateUpArgs a) { gateup_epilogue<false>(a); }
+extern "C" __global__ void tf_exl3_gateup_epilogue_p(const GateUpArgs a) { gateup_epilogue<true>(a); }
 
 // Program (member row, 128-block of the width): down epilogue and combine in one launch, the same bits as the two.
 struct DownArgs {

@@ -5,6 +5,10 @@ pub const records = [_]registry.CudaRecord{
     .{ .launch = .{ .name = "exl3_experts tf_exl3_grouped_1_k8r8", .symbol = "tf_exl3_grouped_1_k8r8", .image = "exl3_experts", .threads = 128 }, .usage = registry.none },
     .{ .launch = .{ .name = "exl3_experts tf_exl3_grouped_1_k8r8s", .symbol = "tf_exl3_grouped_1_k8r8s", .image = "exl3_experts", .threads = 128 }, .usage = registry.none },
     .{ .launch = .{ .name = "exl3_experts tf_exl3_grouped_1_k8r16s", .symbol = "tf_exl3_grouped_1_k8r16s", .image = "exl3_experts", .threads = 128 }, .usage = registry.none },
+    .{ .launch = .{ .name = "exl3_experts tf_exl3_grouped_1_k8r8p", .symbol = "tf_exl3_grouped_1_k8r8p", .image = "exl3_experts", .threads = 128 }, .usage = registry.none },
+    .{ .launch = .{ .name = "exl3_experts tf_exl3_grouped_1_k8r16p", .symbol = "tf_exl3_grouped_1_k8r16p", .image = "exl3_experts", .threads = 128 }, .usage = registry.none },
+    .{ .launch = .{ .name = "exl3_experts tf_exl3_experts_rot_in_p", .symbol = "tf_exl3_experts_rot_in_p", .image = "exl3_experts", .threads = 32 }, .usage = registry.none },
+    .{ .launch = .{ .name = "exl3_experts tf_exl3_gateup_epilogue_p", .symbol = "tf_exl3_gateup_epilogue_p", .image = "exl3_experts", .threads = 32 }, .usage = registry.none },
 };
 
 test "GLM decode port: source kit counts never stand in for missing compile receipts" {

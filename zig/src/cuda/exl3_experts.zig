@@ -108,7 +108,7 @@ pub fn scratch(base: u64, l: Layer, rows: usize, slots: usize) !Scratch {
 pub const DecodeForm = enum { common, tiles, read_once };
 
 /// A projection's grouped kernel and its 16-column tiles a block.
-pub const Tiles = struct { f: Function, nt: usize };
+pub const Tiles = struct { f: Function, nt: usize, chain: bool = false }; // chain: f waits as a dependent launch
 
 /// The loaded kernels.
 pub const Experts = struct {
@@ -125,6 +125,10 @@ pub const Experts = struct {
     nt4: Function = undefined, // tf_exl3_grouped_1_nt4: mcg at 4 tiles a block, any width
     k8r8: Function = undefined, // tf_exl3_grouped_1_k8r8: 4-bit mcg at 4 tiles a block, windows of at most 8 rows
     read_once: [2]Function = undefined, // k8r8 reading each trellis word once: k8r8s (1-8 rows), k8r16s (9-32 rows)
+    chain: bool = false, // read-once windows' rot_in, gate/up, epilogue and down as dependent launches (GLM's opt-in)
+    dependent: [2]Function = undefined, // k8r8p, k8r16p: read_once waiting for the grids before
+    rot_in_p: Function = undefined, // tf_exl3_experts_rot_in_p: rot_in waiting for the grids before
+    gateup_p: Function = undefined, // tf_exl3_gateup_epilogue_p: the epilogue waiting for the grids before
 
     pub fn load(d: *const Driver) !Experts {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -158,12 +162,18 @@ pub const Experts = struct {
     }
 
     /// A family's opt-in to the decode-window kernels (GLM's); a module that never calls it keeps grouped[codebook].
-    pub fn selectDecode(e: *Experts, form: DecodeForm) !void {
+    pub fn selectDecode(e: *Experts, form: DecodeForm, chain: bool) !void {
         if (form != .common) {
             e.nt4 = try e.mod.function("tf_exl3_grouped_1_nt4");
             e.k8r8 = try e.mod.function("tf_exl3_grouped_1_k8r8");
         }
         if (form == .read_once) e.read_once = .{ try e.mod.function("tf_exl3_grouped_1_k8r8s"), try e.mod.function("tf_exl3_grouped_1_k8r16s") };
+        if (form == .read_once and chain) {
+            e.dependent = .{ try e.mod.function("tf_exl3_grouped_1_k8r8p"), try e.mod.function("tf_exl3_grouped_1_k8r16p") };
+            e.rot_in_p = try e.mod.function("tf_exl3_experts_rot_in_p");
+            e.gateup_p = try e.mod.function("tf_exl3_gateup_epilogue_p");
+        }
+        e.chain = form == .read_once and chain;
         e.decode = form;
     }
 
@@ -172,7 +182,7 @@ pub const Experts = struct {
         const common: Tiles = .{ .f = e.grouped[@backingInt(l.codebook)], .nt = 8 };
         const n = if (which == .gate_up) l.width else l.dims;
         if (e.decode == .common or l.codebook != .mcg or rows > 32 or n % 64 != 0) return common;
-        if (e.decode == .read_once and l.uniform_k2 == 8) return .{ .f = e.read_once[@intFromBool(rows > 8)], .nt = 4 };
+        if (e.decode == .read_once and l.uniform_k2 == 8) return .{ .f = (if (e.chain) e.dependent else e.read_once)[@intFromBool(rows > 8)], .nt = 4, .chain = e.chain };
         if (rows <= 8 and l.uniform_k2 == 8) return .{ .f = e.k8r8, .nt = 4 };
         const four = switch (which) {
             .gate_up => rows >= 3,
@@ -216,6 +226,10 @@ pub const Experts = struct {
         a.add(i32d(l.experts));
         a.add(i32d(rows));
         try launch_.launch(e.group, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 1024, .y = 1, .z = 1 }, .shared = @intCast(rows * slots * 4) }, s, &a);
+        const gt = e.tilesFor(l, rows, .gate_up);
+        const dt = e.tilesFor(l, rows, .down);
+        // dependent launches where both projections wait: each reads the grid before's outputs only after its wait
+        const chain = gt.chain and dt.chain;
 
         var r: launch_.Args = .{};
         r.add(x);
@@ -229,7 +243,7 @@ pub const Experts = struct {
         r.add(i32d(d));
         r.add(i32d(slots));
         r.add(i32d(l.experts));
-        try launch_.launch(e.rot_in, .{ .grid = .{ .x = @intCast(p), .y = @intCast(d / 128), .z = 2 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &r);
+        try launch_.launch(if (chain) e.rot_in_p else e.rot_in, .{ .grid = .{ .x = @intCast(p), .y = @intCast(d / 128), .z = 2 }, .block = .{ .x = 32, .y = 1, .z = 1 }, .pdl = chain }, s, &r);
 
         var g: launch_.Args = .{};
         g.add(sc.xg);
@@ -253,8 +267,7 @@ pub const Experts = struct {
         g.add(i32d(l.gu_stride));
         g.add(@as(i32, 0));
         g.add(@as(i32, -1));
-        const gt = e.tilesFor(l, rows, .gate_up);
-        try launch_.launch(gt.f, .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(w / (gt.nt * 16)), .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
+        try launch_.launch(gt.f, .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(w / (gt.nt * 16)), .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 }, .pdl = chain }, s, &g);
 
         var ep: launch_.Args = .{};
         ep.add(sc.z);
@@ -269,7 +282,7 @@ pub const Experts = struct {
         ep.add(i32d(l.experts));
         ep.add(l.limit);
         ep.add(l.act_mode);
-        try launch_.launch(e.gateup, .{ .grid = .{ .x = @intCast(p), .y = @intCast(w / 128), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &ep);
+        try launch_.launch(if (chain) e.gateup_p else e.gateup, .{ .grid = .{ .x = @intCast(p), .y = @intCast(w / 128), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 }, .pdl = chain }, s, &ep);
 
         var dn: launch_.Args = .{};
         dn.add(sc.xd);
@@ -293,8 +306,7 @@ pub const Experts = struct {
         dn.add(@as(i32, 0));
         dn.add(@as(i32, 0));
         dn.add(@as(i32, -1));
-        const dt = e.tilesFor(l, rows, .down);
-        try launch_.launch(dt.f, .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(d / (dt.nt * 16)), .z = @intCast(d_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
+        try launch_.launch(dt.f, .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(d / (dt.nt * 16)), .z = @intCast(d_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 }, .pdl = chain }, s, &dn);
 
         var cb: launch_.Args = .{};
         cb.add(sc.z);

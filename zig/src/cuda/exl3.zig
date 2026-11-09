@@ -147,6 +147,12 @@ pub fn planOf(w: Weight) struct { sk: u32, wk: u32 } {
     return .{ .sk = p.sk, .wk = p.wk };
 }
 
+/// EXL3's dependent launches: sm_90 and newer (the kernels' waits compile to nothing below), or as TF_EXL3_PDL says.
+pub fn dependent(d: *const Driver) bool {
+    if (platform.c.getenv("TF_EXL3_PDL")) |v| return !std.mem.eql(u8, std.mem.span(v), "0");
+    return dependentLaunches(d);
+}
+
 /// Whether the current context's device takes programmatic dependent launches (compute capability 9.0 or newer).
 fn dependentLaunches(d: *const Driver) bool {
     var dev: abi.Device = 0;
@@ -190,8 +196,7 @@ pub const Linear = struct {
         }
         l.group = .{ try l.mod.function("tf_exl3_group_8_2_4"), try l.mod.function("tf_exl3_group_8_2_8") };
         l.rot_group = try l.mod.function("tf_exl3_rot_group");
-        l.pdl = dependentLaunches(d); // sm_90 and newer; the kernels' waits compile to nothing below
-        if (platform.c.getenv("TF_EXL3_PDL")) |v| l.pdl = !std.mem.eql(u8, std.mem.span(v), "0");
+        l.pdl = dependent(d);
         return l;
     }
 

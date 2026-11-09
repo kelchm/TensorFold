@@ -5,7 +5,7 @@ const glm = @import("glm");
 const lanes = @import("lanes");
 const ex = cuda.exl3_experts;
 const Capture = struct {
-    const Call = struct { id: usize, grid: [3]u32, block: u32, args: [20]u64 = @splat(0) };
+    const Call = struct { id: usize, grid: [3]u32, block: u32, args: [20]u64 = @splat(0), pdl: bool = false };
     var calls: [256]Call = undefined;
     var count: usize = 0;
     var copies: [16]cuda.abi.Memcpy2D = undefined;
@@ -25,6 +25,11 @@ const Capture = struct {
         }
         count += 1;
         return cuda.abi.success;
+    }
+    fn launchEx(c: *const cuda.abi.LaunchConfig, f: cuda.abi.Function, args: ?[*]?*anyopaque, extra: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+        const r = launch(f, c.grid_x, c.grid_y, c.grid_z, c.block_x, c.block_y, c.block_z, c.shared_bytes, c.stream, args, extra);
+        calls[count - 1].pdl = c.num_attrs > 0;
+        return r;
     }
     fn copy(m: *const cuda.abi.Memcpy2D, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
         copies[copied] = m.*;
@@ -49,13 +54,15 @@ fn function(d: *const cuda.Driver, id: usize) cuda.Function {
     return .{ .d = d, .handle = @ptrFromInt(id) };
 }
 var form: ex.DecodeForm = .read_once; // what GLM's loadKernels selects (TF_EXL3_SHFL=0: tiles)
+var chain = false; // dependent launches (GLM's loadKernels on sm_90 up)
 fn run(rows: usize, prompt: bool, shared: bool) !void {
     Capture.reset();
     var d: cuda.Driver = undefined;
     d.api.cuLaunchKernel = Capture.launch;
+    d.api.cuLaunchKernelEx = Capture.launchEx;
     d.api.cuMemcpy2DAsync_v2 = Capture.copy;
     const s: cuda.Stream = .{ .d = &d, .handle = null };
-    var k: ex.Experts = .{ .mod = undefined, .group = function(&d, 1), .rot_in = function(&d, 2), .grouped = @splat(function(&d, 3)), .gateup = function(&d, 4), .down_combine = function(&d, 5), .decode = form, .nt4 = function(&d, 6), .k8r8 = function(&d, 7), .read_once = .{ function(&d, 8), function(&d, 9) } };
+    var k: ex.Experts = .{ .mod = undefined, .group = function(&d, 1), .rot_in = function(&d, 2), .grouped = @splat(function(&d, 3)), .gateup = function(&d, 4), .down_combine = function(&d, 5), .decode = form, .nt4 = function(&d, 6), .k8r8 = function(&d, 7), .read_once = .{ function(&d, 8), function(&d, 9) }, .chain = chain, .dependent = .{ function(&d, 30), function(&d, 31) }, .rot_in_p = function(&d, 32), .gateup_p = function(&d, 33) };
     if (comptime @hasField(ex.Experts, "prompt")) k.prompt = .{ .rotate = function(&d, 11), .gateup = function(&d, 12), .down = function(&d, 13), .down_slots = function(&d, 13), .gateup_glm = function(&d, 12), .down_glm = function(&d, 13) };
     const ek: glm.experts.Kernels = .{ .nvfp4 = undefined, .b32 = null, .router = .{ .plan_small = function(&d, 20), .plan_rank = function(&d, 21), .plan_offsets = function(&d, 22), .plan_scatter = function(&d, 23), .plan_rows = function(&d, 24), .plan_rank_rows = function(&d, 25), .plan_scatter_rows = function(&d, 26) } };
     const w: glm.exl3.Experts = .{ .gt = 100, .ut = 200, .dt = 300, .k2 = 400, .suh_g = 500, .suh_u = 600, .svh_g = 700, .svh_u = 800, .suh_d = 900, .svh_d = 1000, .shx = shared };
@@ -163,6 +170,23 @@ test "exl3 prompt: GLM decode windows take the one-width and 4-tile kernels to 3
             try std.testing.expectEqual(id, Capture.calls[at].id);
             try std.testing.expectEqual(n / (if (id == 3) @as(u32, 128) else 64), Capture.calls[at].grid[1]);
             try std.testing.expectEqual(@as(u32, 128), Capture.calls[at].block);
+        }
+    };
+}
+
+test "exl3 prompt: GLM's read-once windows chain rot_in, gate/up, epilogue and down as dependents, combine plain" {
+    chain = true;
+    defer chain = false;
+    defer form = .read_once;
+    for ([_]ex.DecodeForm{ .tiles, .read_once }) |f| for (1..41) |rows| {
+        form = f;
+        try run(rows, false, true);
+        const on = f == .read_once and rows <= 32;
+        const grouped: usize = if (!on) 0 else if (rows <= 8) 30 else 31;
+        const ids = [6]usize{ 1, if (on) 32 else 2, grouped, if (on) 33 else 4, grouped, 5 };
+        for (Capture.calls[0..6], ids, [6]bool{ false, on, on, on, on, false }) |call, id, pdl| {
+            if (id != 0) try std.testing.expectEqual(id, call.id);
+            try std.testing.expectEqual(pdl, call.pdl);
         }
     };
 }

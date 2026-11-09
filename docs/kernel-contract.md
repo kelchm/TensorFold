@@ -420,7 +420,10 @@ each trellis word once and shuffle it to the lanes that decode it) register as b
 `tf_exl3_grouped_1` at those windows, the one-width kernels on 4-bit experts (`contract_exl3_decode.zig`; three
 controls: the 8-row kernel summing its warps last to first, and the read-once loop taking a last-tile word from the
 next lane or the last tile's A fragment from the tile before). Only GLM selects them (`TF_EXL3_SHFL=0` keeps the
-lane-window loads); their compile receipts remain pending.
+lane-window loads); their compile receipts remain pending. GLM chains the read-once windows as dependent launches
+(`TF_EXL3_PDL=0` turns that off) through `_k8r8p`, `_k8r16p`, `tf_exl3_experts_rot_in_p` and
+`tf_exl3_gateup_epilogue_p`, which wait for the grids before them; the two grouped ones register here as byte
+replacements in plain launches, and the rotation and epilogue are their plain kernels' bodies after that wait.
 
 CUDA also checks MOSS-Image's glue (`moss_image.cu`: the norm, plain and modulated; q/k norm and rotary into packed
 rows; situ; the gated add), each output within float64's range at its torch bf16 points (five controls, each dropping
