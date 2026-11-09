@@ -118,7 +118,15 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp / T::WN, wn = warp % T::WN;
     const int KG = K >> 6, per = KG / SK, N8 = N >> 3;
-    const int n0 = (ROWS_FIRST ? blockIdx.y : blockIdx.x) * T::BN, m0 = (ROWS_FIRST ? blockIdx.x : blockIdx.y) * BM;
+    int bx = blockIdx.x, by = blockIdx.y;
+    if constexpr (P2) {   // groups of 8 row blocks, rows fastest: a group's inputs stay in L2 and each weight tile is read once a group
+        constexpr int G = 8;
+        const int nx = gridDim.x, id = blockIdx.y * nx + blockIdx.x, first = id / (G * nx) * G;
+        const int gm = min((int)gridDim.y - first, G), r = id - first * nx;
+        by = first + r % gm;
+        bx = r / gm;
+    }
+    const int n0 = (ROWS_FIRST ? by : bx) * T::BN, m0 = (ROWS_FIRST ? bx : by) * BM;
     const int slice = blockIdx.z, g0 = slice * per;
     const int t0 = n0 >> 3;                                   // the block's first column tile
     auto stage = [&](int st) { return buf + st * T::STAGE; };
