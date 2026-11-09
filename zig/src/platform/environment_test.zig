@@ -47,6 +47,7 @@ const valid = [_]Case{
     .{ .name = "TF_CUDA_DEVICE", .raw = " 3 ", .n = 3 },
     .{ .name = "TF_GLM_ABSORB_MMA", .raw = "1", .n = 1 },
     .{ .name = "TF_GLM_EXL3_BF16_SLOTS", .raw = "1", .n = 1 },
+    .{ .name = "TF_GLM_HC_FUSE", .raw = "1", .n = 1 },
     .{ .name = "TF_CUDA_DEVICE", .raw = "4294967295", .n = std.math.maxInt(u32) },
     .{ .name = "TF_CUDA_SEGMENTS", .raw = " 1 ", .n = 1 },
     .{ .name = "TF_CUDA_SEGMENTS", .raw = "4", .n = 4 },
@@ -253,4 +254,9 @@ test "environment: malformed GLM opt-in affects only GLM startup" {
     const slots_why = (try e.refusal(a, slots, .{ .glm = true })).?;
     defer a.free(slots_why);
     try t.expectEqualStrings("TF_GLM_EXL3_BF16_SLOTS=\"2\": expected 0 or 1", slots_why);
+    const fuse: Env = .{ .name = "TF_GLM_HC_FUSE", .raw = "yes" };
+    try t.expect((try e.refusal(a, fuse, .{ .cuda = true })) == null);
+    const fuse_why = (try e.refusal(a, fuse, .{ .glm = true })).?;
+    defer a.free(fuse_why);
+    try t.expectEqualStrings("TF_GLM_HC_FUSE=\"yes\": expected 0 or 1", fuse_why);
 }

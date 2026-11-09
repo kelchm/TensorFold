@@ -79,3 +79,6 @@ profile and agreed in every rank's fingerprint. See the [experiment and pending 
 
 `TF_GLM_EXL3_BF16_SLOTS` accepts `0` or `1` with the same checks, scope and rank agreement; unset or blank keeps it off.
 `1` has an EXL3 checkpoint's prompt chunks write their MoE slot rows (the eight routed experts' and the shared expert's) as bf16, as NVFP4 prompt chunks already do, so the combine reads half the bytes. Each routed value is the fp32 kernel's rounded once to bf16 (`tf_exl3_prompt_down_glm_b16`); decode windows and NVFP4 checkpoints are unchanged. It can change tokens, so it is registered as arithmetic; device qualification is pending.
+
+`TF_GLM_HC_FUSE` accepts `0` or `1` with the same checks and scope; unset or blank keeps it off.
+`1` has a prompt call's `hc_post` (64 rows or more) also compute the next site's `hc_pre` partials from the streams it just wrote (`tf_glm_hc_post_partial`), so those streams are not read back: 128 MiB less traffic a site at 4,096 rows. The last layer's `hc_post` and decode windows are unchanged. Every byte stays the same, so it is registered as identical and the ranks need not agree; device qualification is pending.

@@ -25,7 +25,7 @@ pub fn pairBody(a: *const Forward, b: *const Forward, ra: usize, rb: usize) !voi
         if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, r.b.x, c.hc);
         n[i] = fw.ranges(R, f.pieces.?.count, &cuts[i]);
         if (n[i] == 1 and !f.splits(R)) return error.BadPair; // run would take this chunk whole
-        for (f.ranks) |r| try f.pre(r, r.w.layers[0].attn_hc, r.w.layers[0].in_norm, R);
+        for (f.ranks) |r| try f.pre(r, r.w.layers[0].attn_hc, r.w.layers[0].in_norm, R, false);
     }
     const layers = a.ranks[0].w.layers;
     var li: usize = 0;

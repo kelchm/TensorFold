@@ -119,6 +119,17 @@ test "stable profile: GLM's raw prompt tail registers as an exact-one switch, of
     try t.expectEqual(p.Switch.TF_GLM_PROMPT_TAIL, p.registered("TF_GLM_PROMPT_TAIL").?);
 }
 
+test "stable profile: GLM's fused hc glue registers as an identical exact-one switch, off unless set" {
+    const e = p.entry(.TF_GLM_HC_FUSE);
+    try t.expectEqual(p.Class.identical, e.class);
+    try t.expectEqual(p.Syntax.one, e.syntax);
+    try t.expect(e.applies("glm5_next", "cuda") and !e.applies("qwen3_5", "cuda") and !e.applies("glm5_next", "metal"));
+    try t.expect(p.resolve(.stable, .TF_GLM_HC_FUSE, null) == null);
+    try t.expect(e.differs("1"));
+    for ([_][]const u8{ "0", "", " 1 " }) |raw| try t.expect(!e.differs(raw));
+    try t.expectEqual(p.Switch.TF_GLM_HC_FUSE, p.registered("TF_GLM_HC_FUSE").?);
+}
+
 test "stable profile: the keep-others rule registers as an identical exact-one CUDA switch, off unless set" {
     const e = p.entry(.TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS);
     try t.expectEqual(p.Class.identical, e.class);
