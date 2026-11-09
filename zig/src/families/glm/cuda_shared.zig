@@ -51,6 +51,8 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             // decode on the three-kernel chain: every segment in one launch a kernel, q and y apart (kda.chainSegs)
             const batched = kda.useSegs(b.prefill, f.kda_wide, f.m.kda.segs, r.segs.len);
             var t: kda.Segs = undefined;
+            var copies: kda.Copies = undefined; // batched: every segment's rows in one copy launch when all fit
+            var copy_all = batched;
             for (r.segs, 0..) |g, i| {
                 const st = g.st;
                 const cur = st.cur[li];
@@ -68,7 +70,11 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
                     continue;
                 }
                 v.p = st.proj + li * st.proj_layer * 2; // the window's rows stay with the layer until its commit
-                try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(v.p, b.kproj + g.row0 * w * 2, g.rows * w * 2, f.stream.handle), "cuMemcpyDtoDAsync");
+                const src = b.kproj + g.row0 * w * 2;
+                if (batched) {
+                    copy_all = copy_all and kda.copyFits(src, v.p, g.rows * w * 2);
+                    copies.c[i] = .{ .src = src, .dst = v.p, .n = @intCast(g.rows * w * 2 / 16) };
+                } else try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(v.p, src, g.rows * w * 2, f.stream.handle), "cuMemcpyDtoDAsync");
                 const kv = li * fw.window_rows * st.heads * kda.dk;
                 v.saves.k = st.save_k + kv * 4;
                 v.saves.v = st.save_v + kv * 2;
@@ -78,7 +84,11 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
                     t.s[i] = kda_block.segOf(k, v, g.rows, conv, st.recAt(cur, li), g.row0);
                 } else try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), f.kda_wide);
             }
-            if (batched) try kda_block.chainSegs(&f.m.kda, f.stream, k, &t, r.segs.len);
+            if (batched) {
+                if (copy_all) try kda.copySegs(&f.m.kda, f.stream, &copies, r.segs.len) else for (r.segs, copies.c[0..r.segs.len]) |g, x|
+                    try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(x.dst, x.src, g.rows * w * 2, f.stream.handle), "cuMemcpyDtoDAsync");
+                try kda_block.chainSegs(&f.m.kda, f.stream, k, &t, r.segs.len);
+            }
             if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
         },
         .mla => |a| {

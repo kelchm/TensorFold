@@ -19,11 +19,12 @@ pub const Kernels = struct {
     prep_segs: cuda.Function, // a shared window's segments in one launch a kernel (chainSegs)
     step_segs: cuda.Function,
     out_segs: cuda.Function,
+    copy_segs: cuda.Function, // and the segments' projection rows into their streams (copySegs)
     segs: bool = true, // TF_GLM_KDA_SEGS=0: a shared window's segments take their own launches (the same bits)
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
-        inline for (.{ "chain", "replay", "replay_layers", "prep", "step", "out", "prep_segs", "step_segs", "out_segs" }) |name| @field(k, name) = try m.function("tf_glm_kda_" ++ name);
+        inline for (.{ "chain", "replay", "replay_layers", "prep", "step", "out", "prep_segs", "step_segs", "out_segs", "copy_segs" }) |name| @field(k, name) = try m.function("tf_glm_kda_" ++ name);
         k.segs = try @import("sys").environment.read(bool, "TF_GLM_KDA_SEGS", true); // once, local to the rank
         return k;
     }
@@ -45,6 +46,26 @@ pub fn useSegs(prefill: bool, wide: bool, on: bool, n: usize) bool {
 pub fn seg(c: Chain, s: Saves, w: Wide, row0: usize, rows: usize) Seg {
     const n = c.heads * dk;
     return .{ .p = c.p, .a = c.a, .g = c.g, .cs = c.conv_state, .state_in = c.state_in, .state_out = s.state_out, .q = w.q + row0 * n * 4, .k = s.k, .v = s.v, .gs = s.g, .b = s.b, .y = w.y + row0 * n * 2, .out = s.out, .rows = @intCast(rows) };
+}
+
+/// One of copySegs' copies, as glm_kda.cu's KdaCopy: `n` 16-byte units from src to dst.
+pub const Copy = extern struct { src: u64, dst: u64, n: i64 };
+pub const Copies = extern struct { c: [max_segs]Copy };
+
+/// Whether `bytes` from src to dst can go in copySegs: all three whole 16-byte units.
+pub fn copyFits(src: u64, dst: u64, bytes: usize) bool {
+    return (src | dst | @as(u64, bytes)) % 16 == 0;
+}
+
+/// The table's first `n` copies in one launch (tf_glm_kda_copy_segs, grid y the copy): cuMemcpyDtoDAsync's bytes.
+pub fn copySegs(ks: *const Kernels, stream: cuda.Stream, t: *const Copies, n: usize) !void {
+    if (n == 0 or n > max_segs) return error.TooManySegments;
+    var most: i64 = 1;
+    for (t.c[0..n]) |c| most = @max(most, c.n);
+    var a: cuda.Args = .{};
+    a.add(t.*);
+    const blocks: u32 = @intCast(@min(@as(i64, 128), @divFloor(most + 255, 256)));
+    try cuda.launch.launch(ks.copy_segs, .{ .grid = .{ .x = blocks, .y = @intCast(n) }, .block = .{ .x = 256 } }, stream, &a);
 }
 
 /// The three-kernel chain, all `t`'s segments in one launch each (z): each `chain`'s blocks; `c`: the layer's fields.
@@ -214,4 +235,17 @@ test "GLM KDA segs: only decode windows of two to sixteen segments on the three-
     try std.testing.expect(try env.value(bool, "TF_GLM_KDA_SEGS", "1", true));
     try std.testing.expect(!try env.value(bool, "TF_GLM_KDA_SEGS", "0", true));
     try std.testing.expectError(error.InvalidEnvironment, env.value(bool, "TF_GLM_KDA_SEGS", "off", true));
+}
+
+test "GLM KDA segs: the copy table is glm_kda.cu's KdaCopies and takes only whole 16-byte units" {
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(Copy));
+    try std.testing.expectEqual(@as(usize, max_segs * 24), @sizeOf(Copies));
+    try std.testing.expect(copyFits(256, 4096, 48));
+    try std.testing.expect(!copyFits(256, 4096 + 8, 48));
+    try std.testing.expect(!copyFits(256 + 2, 4096, 48));
+    try std.testing.expect(!copyFits(256, 4096, 40));
+    // TP 2's rows (12,576 columns) fit; TP 3's unpadded 8,726 do not past row 0, its TF_GLM_KDA_PAD rows (8,728) do
+    try std.testing.expect(copyFits(12576 * 2 * 3, 0, 12576 * 2 * 5));
+    try std.testing.expect(!copyFits(8726 * 2 * 3, 0, 8726 * 2 * 5));
+    try std.testing.expect(copyFits(8728 * 2 * 3, 0, 8728 * 2 * 5));
 }

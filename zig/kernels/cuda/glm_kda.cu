@@ -477,3 +477,20 @@ extern "C" __global__ void __launch_bounds__(128) tf_glm_kda_out_segs(
     if (static_cast<int>(blockIdx.x) >= g.rows) return;
     out_kernel_body(H, g.y, g.G, g_stride, norm_w, eps, g.out);
 }
+
+// A shared window's projection rows into each segment's stream, 16-byte units, in one launch (y: the copy).
+struct KdaCopy {
+    const uint4* src;
+    uint4* dst;
+    int64_t n;  // 16-byte units
+};
+struct KdaCopies {
+    KdaCopy c[KDA_SEGS];
+};
+static_assert(sizeof(KdaCopies) == KDA_SEGS * 24, "cuda_kda.zig's Copies");
+
+extern "C" __global__ void __launch_bounds__(256) tf_glm_kda_copy_segs(const KdaCopies t) {
+    const KdaCopy& c = t.c[blockIdx.y];
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < c.n; i += (int64_t)gridDim.x * blockDim.x)
+        c.dst[i] = c.src[i];
+}

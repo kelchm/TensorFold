@@ -215,10 +215,117 @@ pub const Case = struct {
     }
 };
 
+/// The segments' projection rows into their streams in one launch (kda.copySegs) against cuMemcpyDtoDAsync a segment.
+pub const CopyCase = struct {
+    rig: Rig,
+    ks: *const kda.Kernels,
+    short: bool, // the planted control: each copy one 16-byte unit short
+    msg: [128]u8 = undefined,
+    rows: [kda.max_segs]usize = undefined,
+    segs: usize = 0,
+    width: usize = 0,
+    src: u64 = 0,
+    out: u64 = 0,
+    base: u64 = 0,
+    total: usize = 0,
+
+    const vt = g.hooks(CopyCase);
+    const gap = 16; // poisoned bytes between the destinations: a copy past its rows shows
+
+    /// rows: the window's rows over k segments; n: a row's bf16 columns (TP 2's stack, TP 3's padded one).
+    const shapes = [_]c.Shape{ .{ .rows = 32, .n = 12576, .k = 4 }, .{ .rows = 37, .n = 8728, .k = 7 }, .{ .rows = 128, .n = 12576, .k = 16 } };
+
+    pub fn deinit(self: *CopyCase) void {
+        self.rig.deinit();
+    }
+
+    pub fn kernel(self: *CopyCase) g.Kernel {
+        const s: c.Spec = .{
+            .name = if (self.short) "control: GLM KDA segs copies one unit short" else "cuda GLM KDA segs: every segment's projection rows in one copy",
+            .accum = .none,
+            .depth = noSums,
+            .out = .raw,
+            .replaces = "cuMemcpyDtoDAsync a segment",
+            .nan = .{ .stated = "bytes are copied, NaN payloads included" },
+            .served = &shapes,
+            .tiles = .{ .{}, .{}, .{ .size = 16 } },
+            .sums = .{ .f16 = 0, .bf16 = 0, .why = "a copy sums nothing" },
+        };
+        return .{ .spec = s, .ctx = self, .vt = &vt, .control = if (self.short) .shapes else null };
+    }
+
+    fn dst(self: *const CopyCase, to: u64, row0: usize, i: usize) u64 {
+        return to + row0 * self.width * 2 + i * gap;
+    }
+
+    pub fn prepare(self: *CopyCase, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
+        if (shape.n % 8 != 0 or !split(shape.rows, shape.k, &self.rows)) return false;
+        self.rig.reset();
+        self.segs = shape.k;
+        self.width = shape.n;
+        const a = self.rig.gpu.gpa;
+        const bytes = try a.alloc(u8, shape.rows * shape.n * 2);
+        defer a.free(bytes);
+        var prng = std.Random.DefaultPrng.init(seed ^ 0x636f7079);
+        prng.random().bytes(bytes);
+        if (fill == .nonfinite) std.mem.writeInt(u16, bytes[10..12], 0x7fc1, .little);
+        self.src = try self.rig.input(bytes);
+        self.total = bytes.len + shape.k * gap;
+        self.out = try self.rig.output(self.total);
+        self.base = try self.rig.scratch(self.total);
+        return true;
+    }
+
+    pub fn run(self: *CopyCase) !void {
+        var t: kda.Copies = undefined;
+        var row0: usize = 0;
+        for (self.rows[0..self.segs], 0..) |r, i| {
+            const n: i64 = @intCast(r * self.width * 2 / 16);
+            t.c[i] = .{ .src = self.src + row0 * self.width * 2, .dst = self.dst(self.out, row0, i), .n = if (self.short) n - 1 else n };
+            row0 += r;
+        }
+        try kda.copySegs(self.ks, self.rig.s, &t, self.segs);
+        try self.rig.s.synchronize();
+    }
+
+    pub fn count(self: *CopyCase) usize {
+        return self.total;
+    }
+
+    pub fn reference(self: *CopyCase, want: []f64, mag: []f64) !void {
+        for (want, mag, try self.replaced()) |*w, *m, byte| {
+            w.* = @floatFromInt(byte);
+            m.* = @abs(w.*);
+        }
+    }
+
+    /// Each segment's rows by cuMemcpyDtoDAsync, over the output's poison, as the mixer copied them before.
+    pub fn replaced(self: *CopyCase) ![]const u8 {
+        const d = self.rig.gpu.d;
+        const base: cuda.DeviceBuffer = .{ .d = d, .ptr = self.base, .len = self.total };
+        try base.fill8(0xff, self.rig.s.handle);
+        var row0: usize = 0;
+        for (self.rows[0..self.segs], 0..) |r, i| {
+            try d.check(d.api.cuMemcpyDtoDAsync_v2(self.dst(self.base, row0, i), self.src + row0 * self.width * 2, r * self.width * 2, self.rig.s.handle), "cuMemcpyDtoDAsync");
+            row0 += r;
+        }
+        return self.rig.bytes(self.base, self.total);
+    }
+
+    pub fn check(self: *CopyCase, _: g.Gate) !?[]const u8 {
+        const a = self.rig.gpu.gpa;
+        const got = try a.dupe(u8, try self.rig.outputBytes());
+        defer a.free(got);
+        if (std.mem.indexOfDiff(u8, got, try self.replaced())) |i| return try std.fmt.bufPrint(&self.msg, "byte {d} differs from cuMemcpyDtoDAsync's", .{i});
+        return null;
+    }
+};
+
 pub const Group = struct {
     module: cuda.Module,
     ks: kda.Kernels,
     cases: [3]Case,
+    copies: [2]CopyCase,
 
     pub fn create(a: std.mem.Allocator, gpu: check.Gpu, s: cuda.Stream, kernels: *std.ArrayList(g.Kernel)) !*Group {
         const self = try a.create(Group);
@@ -230,11 +337,16 @@ pub const Group = struct {
             x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .ks = &self.ks, .fault = fault };
             try kernels.append(a, x.kernel());
         }
+        for (&self.copies, [_]bool{ false, true }) |*x, short| {
+            x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .ks = &self.ks, .short = short };
+            try kernels.append(a, x.kernel());
+        }
         return self;
     }
 
     pub fn destroy(self: *Group, a: std.mem.Allocator) void {
         for (&self.cases) |*x| x.deinit();
+        for (&self.copies) |*x| x.deinit();
         self.module.unload();
         a.destroy(self);
     }
@@ -253,6 +365,18 @@ test "GLM KDA segs contract: every served window splits into ragged segments of 
         if (s.rows > s.k and s.rows < s.k * window) try std.testing.expect(std.mem.min(usize, rows[0..s.k]) != std.mem.max(usize, rows[0..s.k]));
     }
     try std.testing.expect(!split(3, 4, &rows) and !split(33, 4, &rows) and !split(17, 17, &rows) and !split(1, 0, &rows));
+}
+
+test "GLM KDA segs contract: every served copy window splits and copies whole 16-byte units" {
+    var rows: [kda.max_segs]usize = undefined;
+    for (CopyCase.shapes) |s| {
+        try std.testing.expect(split(s.rows, s.k, &rows));
+        var row0: usize = 0;
+        for (rows[0..s.k], 0..) |r, i| {
+            try std.testing.expect(kda.copyFits(row0 * s.n * 2, row0 * s.n * 2 + i * CopyCase.gap, r * s.n * 2));
+            row0 += r;
+        }
+    }
 }
 
 test "GLM KDA segs contract: each planted table fault moves what its segments read" {

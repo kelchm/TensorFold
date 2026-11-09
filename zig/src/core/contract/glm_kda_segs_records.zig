@@ -4,6 +4,7 @@ pub const records = [_]registry.CudaRecord{
     .{ .launch = .{ .name = "glm_kda tf_glm_kda_prep_segs", .symbol = "tf_glm_kda_prep_segs", .image = "glm_kda", .threads = 512 }, .usage = registry.none },
     .{ .launch = .{ .name = "glm_kda tf_glm_kda_step_segs", .symbol = "tf_glm_kda_step_segs", .image = "glm_kda", .threads = 256 }, .usage = registry.none },
     .{ .launch = .{ .name = "glm_kda tf_glm_kda_out_segs", .symbol = "tf_glm_kda_out_segs", .image = "glm_kda", .threads = 128 }, .usage = registry.none },
+    .{ .launch = .{ .name = "glm_kda tf_glm_kda_copy_segs", .symbol = "tf_glm_kda_copy_segs", .image = "glm_kda", .threads = 256 }, .usage = registry.none },
 };
 
 test "GLM KDA segs: the per-segment kernels' compiles never stand in for the batched kernels' receipts" {

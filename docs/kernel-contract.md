@@ -513,4 +513,6 @@ The comparison covers out rows, every segment's state and the k, v, decay and be
 split raggedly over 1 to 16 segments of up to 8 rows, at 32 and 22 heads, with padded projection rows and nonfinite
 inputs. Two controls corrupt the table: each segment reads the next segment's state, or every segment shares row 0's
 q and y scratch. `glm_kda_segs_records.zig` holds the launch geometry; compile resources remain pending on every
-served SM. `TF_GLM_KDA_SEGS=0` keeps the per-segment launches.
+served SM. `TF_GLM_KDA_SEGS=0` keeps the per-segment launches. The segments' projection rows reach their streams in
+one `tf_glm_kda_copy_segs` launch when every copy is whole 16-byte units, a byte replacement of `cuMemcpyDtoDAsync` a
+segment over poisoned gaps between the destinations; its control copies each segment one unit short.
