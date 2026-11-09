@@ -48,7 +48,10 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             s.p = b.kproj;
             try kda_block.project(f.set(), f.stream, k, s, b.normed, c.hidden, rows);
             if (f.prefetch()) |p| try p.fork(f.stream, l.index, .o); // TF_GLM_L2PF: o read into L2 while the chains run
-            for (r.segs) |g| {
+            // decode on the three-kernel chain: every segment in one launch a kernel, q and y apart (kda.chainSegs)
+            const batched = kda.useSegs(b.prefill, f.kda_wide, f.m.kda.segs, r.segs.len);
+            var t: kda.Segs = undefined;
+            for (r.segs, 0..) |g, i| {
                 const st = g.st;
                 const cur = st.cur[li];
                 var v = s;
@@ -71,8 +74,11 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
                 v.saves.v = st.save_v + kv * 2;
                 v.saves.g = st.save_g + kv * 4;
                 v.saves.b = st.save_b + li * fw.window_rows * st.heads * 4;
-                try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), f.kda_wide);
+                if (batched) {
+                    t.s[i] = kda_block.segOf(k, v, g.rows, conv, st.recAt(cur, li), g.row0);
+                } else try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), f.kda_wide);
             }
+            if (batched) try kda_block.chainSegs(&f.m.kda, f.stream, k, &t, r.segs.len);
             if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
         },
         .mla => |a| {

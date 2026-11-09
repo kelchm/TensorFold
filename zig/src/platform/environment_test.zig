@@ -46,6 +46,7 @@ const valid = [_]Case{
     .{ .name = "TENSORFOLD_RESTORE_PREFETCH_MS", .raw = "1099511627777", .n = 1099511627777 },
     .{ .name = "TF_CUDA_DEVICE", .raw = " 3 ", .n = 3 },
     .{ .name = "TF_GLM_ABSORB_MMA", .raw = "1", .n = 1 },
+    .{ .name = "TF_GLM_KDA_SEGS", .raw = "0", .n = 0 },
     .{ .name = "TF_CUDA_DEVICE", .raw = "4294967295", .n = std.math.maxInt(u32) },
     .{ .name = "TF_CUDA_SEGMENTS", .raw = " 1 ", .n = 1 },
     .{ .name = "TF_CUDA_SEGMENTS", .raw = "4", .n = 4 },

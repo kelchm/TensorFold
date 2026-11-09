@@ -505,3 +505,12 @@ Cases cover every item size from 1 through 64, multiple items, shared and separa
 nonfinite inputs and guarded repeats. Constant-weight FP64 stress proves fp16 overflow; BF16 epilogue rounding can
 hide a balanced reduced-precision sum, so that limitation is explicit. Two controls drop the last member or use
 compact output strides. New symbols' compile usage remains pending; see the [port receipt](receipts/glm-exl3-prompt-port.md).
+
+GLM's shared decode windows run every segment's KDA chain in one launch a kernel (`tf_glm_kda_prep_segs`,
+`tf_glm_kda_step_segs` and `tf_glm_kda_out_segs`, the segment in grid z). They register as byte replacements of
+`kda.chain`'s three per-segment launches, one segment after another with the q and y scratch reused from row 0.
+The comparison covers out rows, every segment's state and the k, v, decay and beta saves. Windows of 4 to 128 rows
+split raggedly over 1 to 16 segments of up to 8 rows, at 32 and 22 heads, with padded projection rows and nonfinite
+inputs. Two controls corrupt the table: each segment reads the next segment's state, or every segment shares row 0's
+q and y scratch. `glm_kda_segs_records.zig` holds the launch geometry; compile resources remain pending on every
+served SM. `TF_GLM_KDA_SEGS=0` keeps the per-segment launches.

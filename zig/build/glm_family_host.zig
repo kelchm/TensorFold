@@ -25,6 +25,12 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
     const startup_run = b.addRunArtifact(b.addTest(.{ .root_module = startup }));
     b.step("test-glm-startup-host", "Page refusals propagate through rank liveness before engine construction").dependOn(&startup_run.step);
     step.dependOn(&startup_run.step);
+    const segs_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM KDA segs:"} }));
+    const segs_contract = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_glm_kda_segs.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm_cuda", .module = glm }, .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } });
+    const segs_step = b.step("test-glm-kda-segs-host", "A shared window's KDA segment table, its batching rule and its contract's planted faults without devices");
+    segs_step.dependOn(&segs_run.step);
+    segs_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = segs_contract, .filters = &.{"GLM KDA segs contract:"} })).step);
+    step.dependOn(segs_step);
     b.step("test-glm-tp3-host", "Uneven KDA head shares through actual projection and load planning, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM TP3:"} })).step);
     // TF_GLM_INDEX_CUDA: the launch rules, and (its own slower step) glm_index_*.cuh as host C++ against plain models
     const index_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM index:"} }));

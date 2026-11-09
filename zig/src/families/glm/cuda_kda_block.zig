@@ -129,12 +129,44 @@ fn columns(set: glue.Set, stream: cuda.Stream, src: u64, cols: usize, dst: u64, 
 
 /// The chain over `rows` projected rows (s.p, s.ka, s.kg) on one sequence's conv window and recurrent state.
 pub fn chainRows(ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, rows: usize, conv_state: u64, state_in: u64, wide: bool) !void {
+    try kda.chain(ks, stream, chainOf(l, s, conv_state, state_in), rows, s.saves, if (wide or rows >= kda.wide_rows) s.wide else null);
+}
+
+/// chainRows' chain: the layer's fields (TF_GLM_KDA_PAD's row width), s's rows and the sequence's conv and state.
+fn chainOf(l: Layer, s: Scratch, conv_state: u64, state_in: u64) kda.Chain {
     const n = l.heads * kda.dk;
     const fa = 3 * n;
-    const c: kda.Chain = .{ .p = s.p, .p_stride = l.matWidth(), .b_off = fa + 2 * kda.dk, .a = s.ka, .a_stride = n, .g = s.kg, .g_stride = n, .conv_state = conv_state, .conv_w = l.conv_w, .state_in = state_in, .a_log = l.a_log, .dt_bias = l.dt_bias, .norm_w = l.norm_w, .eps = l.eps, .lower = l.lower, .heads = l.heads };
-    try kda.chain(ks, stream, c, rows, s.saves, if (wide or rows >= kda.wide_rows) s.wide else null);
+    return .{ .p = s.p, .p_stride = l.matWidth(), .b_off = fa + 2 * kda.dk, .a = s.ka, .a_stride = n, .g = s.kg, .g_stride = n, .conv_state = conv_state, .conv_w = l.conv_w, .state_in = state_in, .a_log = l.a_log, .dt_bias = l.dt_bias, .norm_w = l.norm_w, .eps = l.eps, .lower = l.lower, .heads = l.heads };
+}
+
+/// A shared window's segment as chainRows (wide) would run it, for chainSegs: its q and y rows at `row0` of s.wide.
+pub fn segOf(l: Layer, s: Scratch, rows: usize, conv_state: u64, state_in: u64, row0: usize) kda.Seg {
+    return kda.seg(chainOf(l, s, conv_state, state_in), s.saves, s.wide, row0, rows);
+}
+
+/// A shared window's chains (decode, three-kernel): every segment of `t` in one launch a kernel (kda.chainSegs).
+pub fn chainSegs(ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, t: *const kda.Segs, n: usize) !void {
+    try kda.chainSegs(ks, stream, chainOf(l, std.mem.zeroes(Scratch), 0, 0), t, n);
 }
 
 test {
     _ = @import("cuda_kda_tp3_test.zig");
+}
+
+test "GLM KDA segs: a segment's row and the shared fields are what chainRows passes, padded rows included" {
+    const was = pad_to;
+    defer pad_to = was;
+    pad_to = padWidth(64, 3);
+    const l: Layer = .{ .proj = .{ .bf16 = 0 }, .fb = 0, .gb = 0, .o = .{ .bf16 = 0 }, .conv_w = 11, .a_log = 12, .dt_bias = 13, .norm_w = 14, .eps = 1e-6, .lower = -5, .heads = 22, .dims = 6144 };
+    const s: Scratch = .{ .p = 1, .ka = 2, .kg = 3, .saves = .{ .out = 4, .state_out = 5, .k = 6, .v = 7, .g = 8, .b = 9 }, .wide = .{ .q = 1 << 30, .y = 1 << 31 }, .mm_part = 0 };
+    const c = chainOf(l, s, 21, 22);
+    const g = segOf(l, s, 5, 21, 22, 3);
+    try std.testing.expectEqualSlices(u64, &.{ c.p, c.a, c.g, c.conv_state, c.state_in, s.saves.state_out, s.saves.out }, &.{ g.p, g.a, g.g, g.cs, g.state_in, g.state_out, g.out });
+    try std.testing.expectEqual(s.wide.q + 3 * 22 * kda.dk * 4, g.q);
+    try std.testing.expectEqual(s.wide.y + 3 * 22 * kda.dk * 2, g.y);
+    const shared = chainOf(l, std.mem.zeroes(Scratch), 0, 0); // chainSegs' layer fields
+    try std.testing.expectEqual(pad_to, shared.p_stride);
+    try std.testing.expect(shared.p_stride != l.width());
+    inline for (.{ "p_stride", "b_off", "a_stride", "g_stride", "conv_w", "a_log", "dt_bias", "norm_w", "eps", "lower", "heads" }) |f|
+        try std.testing.expectEqual(@field(c, f), @field(shared, f));
 }

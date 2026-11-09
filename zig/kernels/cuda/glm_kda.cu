@@ -2,6 +2,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "common/reduce.cuh"
 #include "common/act.cuh"
@@ -430,4 +431,49 @@ extern "C" __global__ void __launch_bounds__(128) tf_glm_kda_out(
         int H, const __nv_bfloat16* __restrict__ y_in, const __nv_bfloat16* __restrict__ G, int g_stride,
         const __nv_bfloat16* __restrict__ norm_w, float eps, __nv_bfloat16* __restrict__ out) {
     out_kernel_body(H, y_in, G, g_stride, norm_w, eps, out);
+}
+
+// A shared window's segments in one launch a kernel (z: the segment): each its own prep/step/out launch's blocks.
+struct KdaSeg {
+    const __nv_bfloat16* P;   // the segment's projection rows (its stream's copy)
+    const __nv_bfloat16* A;   // its decay rows
+    const __nv_bfloat16* G;   // its gate rows
+    const __nv_bfloat16* cs;  // its stream's conv window
+    const float* state_in;
+    float* state_out;
+    float* q;                 // the window's q scratch from the segment's first row
+    float* k_save;
+    __nv_bfloat16* v_save;
+    float* g_save;
+    float* b_save;
+    __nv_bfloat16* y;         // the window's read-out scratch from the segment's first row
+    __nv_bfloat16* out;       // the window's out rows from the segment's first row
+    int rows;
+};
+constexpr int KDA_SEGS = 16;  // Engine.max_shared
+struct KdaSegs {
+    KdaSeg s[KDA_SEGS];
+};
+static_assert(sizeof(KdaSeg) == 112 && offsetof(KdaSeg, rows) == 104, "cuda_kda.zig's Seg");
+static_assert(sizeof(KdaSegs) == KDA_SEGS * 112, "cuda_kda.zig's Segs");
+
+extern "C" __global__ void __launch_bounds__(512) tf_glm_kda_prep_segs(
+        int H, int p_stride, int b_off, int a_stride, const float* __restrict__ cw, const float* __restrict__ a_log,
+        const float* __restrict__ dt_bias, float lower, const KdaSegs t) {
+    const KdaSeg& g = t.s[blockIdx.z];
+    if (static_cast<int>(blockIdx.x) >= g.rows) return;  // past the segment's own grid (its rows), the whole block
+    prep_kernel_body(H, g.P, p_stride, b_off, g.A, a_stride, g.cs, cw, a_log, dt_bias, lower, g.q, g.k_save, g.v_save,
+                     g.g_save, g.b_save);
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_glm_kda_step_segs(int H, const KdaSegs t) {
+    const KdaSeg& g = t.s[blockIdx.z];
+    step_kernel_body<8, 16>(H, g.state_in, g.q, g.k_save, g.v_save, g.g_save, g.b_save, g.rows, g.y, g.state_out);
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_glm_kda_out_segs(
+        int H, int g_stride, const __nv_bfloat16* __restrict__ norm_w, float eps, const KdaSegs t) {
+    const KdaSeg& g = t.s[blockIdx.z];
+    if (static_cast<int>(blockIdx.x) >= g.rows) return;
+    out_kernel_body(H, g.y, g.G, g_stride, norm_w, eps, g.out);
 }
