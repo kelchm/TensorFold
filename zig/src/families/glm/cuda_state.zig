@@ -284,6 +284,13 @@ pub const Buffers = struct {
         return @max(total, 256);
     }
 
+    /// A twin's allocation (initTwin of `rows`-row prompt buffers): only the fields it holds apart.
+    pub fn twinBytes(w: *const weights.Weights, rows: usize, capacity: usize) usize {
+        var total: usize = 0;
+        for (sizesFor(w, rows, true, capacity, rows), 0..) |n, i| total += if (twinHolds(i)) std.mem.alignForward(usize, n, 256) else 0;
+        return @max(total, 256);
+    }
+
     /// The chunk partials' nch x rows: the dense calls, and a window's sparse call (a prompt's merges in the kernel).
     fn partialRows(rows: usize, prefill: bool, capacity: usize, seg: usize) usize {
         const part_rows = if (prefill) @min(rows, dsa_block.prompt_att_rows) else seg;

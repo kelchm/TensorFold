@@ -505,7 +505,7 @@ fn release(own: *Owned) void {
 /// The server's words for this family's refusals.
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
-        error.GlmSoloMemory => "TF_GLM_CHUNK_SOLO=8192 does not fit the startup memory budget; use 4096 or 2048, or reduce --context / --parallel",
+        error.GlmSoloMemory => "TF_GLM_CHUNK_SOLO=8192, or 4096 with TF_GLM_PROMPT_PAIR=solo, does not fit the startup memory budget; use 4096 unpaired or 2048, or reduce --context / --parallel",
         error.BadRoceCap => "TF_ROCE_MAX_KB: give an integer from 1 through 4194303 KiB, or unset it for 4096 KiB",
         error.NoRank => "GLM-5.3-Flash runs at TP over hosts: set TF_GLM_RANK and TF_GLM_WORLD on every host (WORLD 1: one GPU, with TF_GLM_LAYERS for a thin model)",
         error.NoCommId => "GLM-5.3-Flash's ranks meet over NCCL: with TF_GLM_WORLD 2 or more, set NCCL_COMM_ID to rank 0's address:port on every host",

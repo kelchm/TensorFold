@@ -126,3 +126,26 @@ test "a solo pass: exact startup plans charge EXL3 scratch, every ring and DFlas
     try t.expectEqual(@as(usize, (state.mlaLayers(&w) + 1) * 2 * 4096 * 128 * 2), sequence[2] - sequence[1]);
     try t.expect(prompt[2] > prompt[1] and prompt[1] > prompt[0]);
 }
+
+test "a solo pass pairs (TF_GLM_PROMPT_PAIR=solo): startup plans charge the twin and index rings of both chunks" {
+    const weights = @import("cuda_weights.zig");
+    var layers: [45]weights.Layer = undefined;
+    var w: weights.Weights = .{ .gpa = t.allocator, .config = .{ .exl3 = true, .head_unit = 128 }, .share = undefined, .layers = &layers };
+    w.share = try @import("cuda_shard.zig").Share.of(&w.config, 0, 2);
+    for (&layers, 0..) |*l, i| {
+        l.mixer = if (w.config.kind(@intCast(i)) == .mla) .{ .mla = undefined } else .{ .kda = undefined };
+        if (l.mixer == .kda) l.mixer.kda.proj = .{ .bf16 = 0 };
+    }
+    const cap = 1 << 20;
+    const alone: engine.Options = .{ .capacity = cap, .mtp = true, .settings = .{ .solo = 2 * C } };
+    var paired = alone;
+    paired.settings.pair_solo = true;
+    const twin = state.Buffers.twinBytes(&w, 2 * C, cap);
+    const rings = (state.mlaLayers(&w) + 1) * 2 * 4096 * 128 * 2; // 4,096 more rows in every ring, the MTP head's too
+    try t.expectEqual(twin + rings, try memory.bytes(t.allocator, &w, paired) - try memory.bytes(t.allocator, &w, alone));
+    try t.expectEqual(try state.State.bytesFor(t.allocator, &w, cap, false, null, 4 * C), try state.State.bytesFor(t.allocator, &w, cap, false, null, paired.settings.ringWidth()));
+    // the twin holds its own rows only: under the whole buffer, and twice the grid pair's but one logits block
+    try t.expect(twin < state.Buffers.bytes(&w, 2 * C, true, cap, 2 * C));
+    const logits = std.mem.alignForward(usize, state.prompt_heads * w.share.vocab.len() * 2, 256);
+    try t.expectEqual(2 * (state.Buffers.twinBytes(&w, C, cap) - logits), twin - logits);
+}
