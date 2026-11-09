@@ -30,6 +30,7 @@ pub const Settings = struct {
     kv_host: u8 = 0, // TF_GLM_KV_HOST=1: KV pages in host memory (1); with TF_GLM_KV_HOST_SHARED=1, one copy a host (2)
     kv_host_gib: f64 = 0, // TF_GLM_KV_HOST_GIB: the host pages' GiB (0: one full window)
     l2pf: l2pf.Options = .{}, // TF_GLM_L2PF and its knobs: a decode window's next weights read into L2 beside it
+    hc_fuse: bool = false, // TF_GLM_HC_FUSE: a prompt call's hc_post writes the next hc_pre's partials; same bytes, so ranks may differ
 
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
@@ -139,6 +140,10 @@ pub const Settings = struct {
         };
         s.numerics.exl3_bf16_slots = @import("sys").environment.value(bool, "TF_GLM_EXL3_BF16_SLOTS", get("TF_GLM_EXL3_BF16_SLOTS"), false) catch {
             problem.* = "TF_GLM_EXL3_BF16_SLOTS: 0 or 1";
+            return error.BadSetting;
+        };
+        s.hc_fuse = @import("sys").environment.value(bool, "TF_GLM_HC_FUSE", get("TF_GLM_HC_FUSE"), false) catch {
+            problem.* = "TF_GLM_HC_FUSE: 0 or 1";
             return error.BadSetting;
         };
         s.heat = heat.bandsFrom(get("TF_HEAT_HIGH"), get("TF_HEAT_LOW")) catch {
