@@ -359,9 +359,10 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu_glm(const
     else tgateup<2 * TPM, 8>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, 1, limit, act_mode, smem_raw, rows_sh);
 }
 
-template <int K2, int NBA>
+// Y: float slot rows, or __nv_bfloat16 (TF_GLM_EXL3_BF16_SLOTS: each value __float2bfloat16_rn of the float one).
+template <int K2, int NBA, typename Y>
 __device__ __forceinline__ void prompt_down_n(const half* __restrict__ Xd, const uint64_t* __restrict__ Td, const half* __restrict__ svh_d,
-        float* __restrict__ y, int K, int D, int ys, int yrow, unsigned char* smem_raw, const int* rows_sh, int cb, int e, int cnt, int warp,
+        Y* __restrict__ y, int K, int D, int ys, int yrow, unsigned char* smem_raw, const int* rows_sh, int cb, int e, int cnt, int warp,
         int lane) {
     float acc[TMT][NBA][4];
     tmain<1, TPM, K2, NBA, 4>(Xd, Xd, Td, Td, rows_sh, e, K, D >> 4, cb, 1, smem_raw, acc);
@@ -384,35 +385,60 @@ __device__ __forceinline__ void prompt_down_n(const half* __restrict__ Xd, const
                 float o[4];
 #pragma unroll
                 for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
-                // one 16-byte store (y rows and n are 16-byte aligned: Kernels.run checks y)
-                *reinterpret_cast<float4*>(y + at * D + n) = make_float4(o[0], o[1], o[2], o[3]);
+                if constexpr (sizeof(Y) == 2) {
+                    // the lane's 4 bf16 in one 8-byte store (y rows and n are 8-byte aligned: Kernels.runGlm checks y)
+                    const __nv_bfloat162 o01 = __halves2bfloat162(__float2bfloat16_rn(o[0]), __float2bfloat16_rn(o[1]));
+                    const __nv_bfloat162 o23 = __halves2bfloat162(__float2bfloat16_rn(o[2]), __float2bfloat16_rn(o[3]));
+                    uint2 packed;
+                    packed.x = *reinterpret_cast<const uint32_t*>(&o01);
+                    packed.y = *reinterpret_cast<const uint32_t*>(&o23);
+                    *reinterpret_cast<uint2*>(y + at * D + n) = packed;
+                } else {
+                    // one 16-byte store (y rows and n are 16-byte aligned: Kernels.run checks y)
+                    *reinterpret_cast<float4*>(y + at * D + n) = make_float4(o[0], o[1], o[2], o[3]);
+                }
             }
         }
     }
 }
 // The item's main loop and epilogue compiled for its 8-member column blocks (exl3_prompt.cuh TF_EXL3_PROMPT_NBA).
-template <int K2>
+template <int K2, typename Y>
 __device__ __forceinline__ void prompt_down(const half* __restrict__ Xd, const uint64_t* __restrict__ Td, const half* __restrict__ svh_d,
-        float* __restrict__ y, int K, int D, int ys, int yrow, unsigned char* smem_raw, const int* rows_sh, int cb, int e, int cnt, int warp,
+        Y* __restrict__ y, int K, int D, int ys, int yrow, unsigned char* smem_raw, const int* rows_sh, int cb, int e, int cnt, int warp,
         int lane) {
-#define TF_EXL3_PROMPT_DN(NBA) prompt_down_n<K2, NBA>(Xd, Td, svh_d, y, K, D, ys, yrow, smem_raw, rows_sh, cb, e, cnt, warp, lane)
+#define TF_EXL3_PROMPT_DN(NBA) prompt_down_n<K2, NBA, Y>(Xd, Td, svh_d, y, K, D, ys, yrow, smem_raw, rows_sh, cb, e, cnt, warp, lane)
     TF_EXL3_PROMPT_NBA(cnt, TF_EXL3_PROMPT_DN)
 #undef TF_EXL3_PROMPT_DN
 }
 
-extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_glm(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
-        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
-        float* __restrict__ y, int K, int D, int ys, int yrow) {
-
-    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<8>()];
-    __shared__ int rows_sh[TPM];
+template <typename Y>
+__device__ __forceinline__ void prompt_down_glm(const half* __restrict__ Xd, const uint64_t* __restrict__ Td, const int* __restrict__ items,
+        const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d, Y* __restrict__ y, int K, int D,
+        int ys, int yrow, unsigned char* smem_raw, int* rows_sh) {
     const int cb = blockIdx.x, item = blockIdx.y;
     if (item >= counts[0]) return;
     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
     if (threadIdx.x < TPM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    prompt_down<8>(Xd, Td, svh_d, y, K, D, ys, yrow, smem_raw, rows_sh, cb, e, cnt, warp, lane);
+    prompt_down<8, Y>(Xd, Td, svh_d, y, K, D, ys, yrow, smem_raw, rows_sh, cb, e, cnt, warp, lane);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_glm(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+        float* __restrict__ y, int K, int D, int ys, int yrow) {
+    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<8>()];
+    __shared__ int rows_sh[TPM];
+    prompt_down_glm<float>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, yrow, smem_raw, rows_sh);
+}
+
+// TF_GLM_EXL3_BF16_SLOTS: tf_exl3_prompt_down_glm's slot rows as bf16 (yrow > 0 only).
+extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_glm_b16(const half* __restrict__ Xd,
+        const uint64_t* __restrict__ Td, const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members,
+        const half* __restrict__ svh_d, __nv_bfloat16* __restrict__ y, int K, int D, int ys, int yrow) {
+    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<8>()];
+    __shared__ int rows_sh[TPM];
+    prompt_down_glm<__nv_bfloat16>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, yrow, smem_raw, rows_sh);
 }
 
 

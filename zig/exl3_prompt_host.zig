@@ -12,7 +12,7 @@ const Capture = struct {
     var copied: usize = 0;
     fn launch(f: cuda.abi.Function, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
         calls[count] = .{ .id = @intFromPtr(f), .grid = .{ gx, gy, gz }, .block = bx };
-        if (@intFromPtr(f) >= 11 and @intFromPtr(f) <= 13) {
+        if (@intFromPtr(f) >= 11 and @intFromPtr(f) <= 14) {
             const sizes: []const u8 = switch (@intFromPtr(f)) {
                 11 => &.{ 8, 4, 8, 8, 4 },
                 12 => &.{ 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4, 4 },
@@ -49,18 +49,21 @@ fn function(d: *const cuda.Driver, id: usize) cuda.Function {
     return .{ .d = d, .handle = @ptrFromInt(id) };
 }
 fn run(rows: usize, prompt: bool, shared: bool) !void {
+    return runAs(rows, prompt, shared, false);
+}
+fn runAs(rows: usize, prompt: bool, shared: bool, b16: bool) !void {
     Capture.reset();
     var d: cuda.Driver = undefined;
     d.api.cuLaunchKernel = Capture.launch;
     d.api.cuMemcpy2DAsync_v2 = Capture.copy;
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     var k: ex.Experts = .{ .mod = undefined, .group = function(&d, 1), .rot_in = function(&d, 2), .grouped = @splat(function(&d, 3)), .gateup = function(&d, 4), .down_combine = function(&d, 5) };
-    if (comptime @hasField(ex.Experts, "prompt")) k.prompt = .{ .rotate = function(&d, 11), .gateup = function(&d, 12), .down = function(&d, 13), .down_slots = function(&d, 13), .gateup_glm = function(&d, 12), .down_glm = function(&d, 13) };
+    if (comptime @hasField(ex.Experts, "prompt")) k.prompt = .{ .rotate = function(&d, 11), .gateup = function(&d, 12), .down = function(&d, 13), .down_slots = function(&d, 13), .gateup_glm = function(&d, 12), .down_glm = function(&d, 13), .down_glm_b16 = function(&d, 14) };
     const ek: glm.experts.Kernels = .{ .nvfp4 = undefined, .b32 = null, .router = .{ .plan_small = function(&d, 20), .plan_rank = function(&d, 21), .plan_offsets = function(&d, 22), .plan_scatter = function(&d, 23), .plan_rows = function(&d, 24), .plan_rank_rows = function(&d, 25), .plan_scatter_rows = function(&d, 26) } };
     const w: glm.exl3.Experts = .{ .gt = 100, .ut = 200, .dt = 300, .k2 = 400, .suh_g = 500, .suh_u = 600, .svh_g = 700, .svh_u = 800, .suh_d = 900, .svh_d = 1000, .shx = shared };
     const sc: glm.exl3.Scratch = .{ .picks = 0x100000000, .xg = 0, .xu = 0, .z = 0 };
     const plan: cuda.grouped.Plan = .{ .items = 10000, .members = 20000, .counts = 30000, .rank = 40000, .hist = 50000 };
-    try glm.exl3.run(&k, &ek, s, w, sc, plan, 0x200000000, 520, 0x300000000, 9, rows, 9, 512, 256, 10, prompt, 0x400000000, 0);
+    try glm.exl3.run(&k, &ek, s, w, sc, plan, 0x200000000, 520, 0x300000000, 9, rows, 9, 512, 256, 10, prompt, b16, 0x400000000, 0);
 }
 
 test "exl3 prompt: dispatch rotates once per row only with verified shared scales, with fused full-K kernels" {
@@ -108,8 +111,10 @@ test "exl3 prompt: scratch omits global split partials and shared rotation stora
 
 test "exl3 prompt: whole passes and the next chunk keep input, pick and direct-slot offsets" {
     const cap = glm.exl3.chunk_rows;
-    for ([_]usize{ 1030, cap, cap + 6 }) |rows| {
-        try run(rows, true, true);
+    for ([_]usize{ 1030, cap, cap + 6 }) |rows| for ([_]bool{ false, true }) |b16| {
+        try runAs(rows, true, true, b16);
+        const down: usize = if (b16) 14 else 13; // TF_GLM_EXL3_BF16_SLOTS: the bf16 kernel at bf16 row offsets
+        try std.testing.expectEqual(@as(usize, 0), Capture.by(if (b16) 13 else 14).len);
         const chunks: usize = if (rows > cap) 2 else 1;
         try std.testing.expectEqual(chunks, Capture.copied);
         try std.testing.expectEqual(@min(rows, cap), Capture.copies[0].height);
@@ -124,14 +129,21 @@ test "exl3 prompt: whole passes and the next chunk keep input, pick and direct-s
                 try std.testing.expectEqual(@as(u64, 0x200000000 + rotations * cap * 520 * 2), call.args[0]);
                 rotations += 1;
             }
-            if (call.id == 13) {
-                try std.testing.expectEqual(@as(u64, 0x400000000 + downs * cap * 9 * 512 * 4), call.args[6]);
+            if (call.id == down) {
+                try std.testing.expectEqual(@as(u64, 0x400000000 + downs * cap * 9 * 512 * @as(usize, if (b16) 2 else 4)), call.args[6]);
+                try std.testing.expectEqual(@as(u64, 9), call.args[10]);
                 downs += 1;
             }
         }
         try std.testing.expectEqual(chunks, rotations);
         try std.testing.expectEqual(chunks, downs);
-    }
+    };
+}
+
+test "exl3 prompt: bf16 slot rows only from the fused prompt kernels, before any launch" {
+    Capture.reset();
+    try std.testing.expectError(error.NotExl3Mcg4, runAs(4, false, true, true));
+    try std.testing.expectEqual(@as(usize, 0), Capture.count);
 }
 
 test "exl3 prompt: decode retains the existing split-K launches" {
@@ -203,6 +215,14 @@ test "exl3 prompt: GLM refuses unaligned vector outputs before any driver call" 
     sc.xd = 8;
     sc.yrow = 0;
     try std.testing.expectError(error.Exl3Shape, k.runGlm(undefined, undefined, undefined, undefined, 0, 0, 0, 0, sc, undefined));
+    sc.yrow = 9; // bf16 slot rows: 8-byte aligned, the GLM kernel resolved, never through the common entry
+    sc.b16 = true;
+    sc.y = 20;
+    try std.testing.expectError(error.Exl3Shape, k.runGlm(undefined, undefined, undefined, undefined, 0, 0, 0, 0, sc, undefined));
+    sc.y = 24;
+    try std.testing.expectError(error.Exl3Shape, k.runGlm(undefined, undefined, undefined, undefined, 0, 0, 0, 0, sc, undefined));
+    const l: ex.Layer = .{ .gate = 0, .up = 0, .down = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .dims = 512, .width = 256, .experts = 8, .codebook = .mcg, .uniform_k2 = 8 };
+    try std.testing.expectError(error.Exl3Shape, k.run(undefined, undefined, undefined, l, 0, 512, 0, 1, sc, undefined));
     try std.testing.expectEqual(@as(usize, 0), Capture.count);
 }
 

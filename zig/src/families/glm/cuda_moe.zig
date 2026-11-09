@@ -31,7 +31,7 @@ pub const Scratch = struct {
     wts: u64, // fp32 [rows][top_k + 1]
     plan: cuda.grouped.Plan,
     eact: u64, // bf16 [rows (top_k + 1)][width]
-    ey: u64, // [rows][top_k + 1][dims]: fp32, bf16 in a prompt chunk
+    ey: u64, // [rows][top_k + 1][dims]: fp32, bf16 in a prompt chunk (bf16Slots)
     sgu: u64, // bf16 [rows][2 shared]
     sact: u64, // bf16 [rows][shared]
     sxs: u64, // fp32 [rows][shared / 64]
@@ -41,7 +41,13 @@ pub const Scratch = struct {
 };
 
 /// The kernels the block runs: the captured Triton set, the grouped NVFP4 experts, the plan, and glm_ops.
-pub const Kernels = struct { set: glue.Set, experts: *const experts.Kernels, exl3: *const exl3.Kernels, put_slot: cuda.Function, prof: ?*prof_mod.Prof = null };
+pub const Kernels = struct { set: glue.Set, experts: *const experts.Kernels, exl3: *const exl3.Kernels, put_slot: cuda.Function, prof: ?*prof_mod.Prof = null, exl3_b16: bool = false };
+
+/// The slot rows' type: bf16 in an NVFP4 prompt chunk, and in an EXL3 one with TF_GLM_EXL3_BF16_SLOTS=1; else fp32.
+pub fn bf16Slots(k: Kernels, l: Layer, prompt: bool) bool {
+    if (l.exl3 == null) return prompt;
+    return prompt and k.exl3_b16 and exl3.fused(l.routed.dims, l.routed.width);
+}
 
 /// forward.moe_block: out [rows][dims] fp32 partial; `prompt`: 64-pair items, the prompt kernels, bf16 slot rows.
 pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool, out: u64) !void {
@@ -62,7 +68,7 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     defer stamp.end();
     if (k.prof) |p| p.mark(stream, .router);
     defer if (k.prof) |p| p.mark(stream, .routed);
-    if (l.exl3) |w| return exl3.run(k.exl3, k.experts, stream, w, s.x3, s.plan, x, x_stride, s.pick, slots, rows, l.count, d, l.routed.width, l.routed.limit, prompt, s.ey, s.eact);
+    if (l.exl3) |w| return exl3.run(k.exl3, k.experts, stream, w, s.x3, s.plan, x, x_stride, s.pick, slots, rows, l.count, d, l.routed.width, l.routed.limit, prompt, bf16Slots(k, l, prompt), s.ey, s.eact);
     const plan: experts.Plan = .{ .route = s.plan, .slots = slots, .experts = l.count + 1, .prompt = prompt };
     try experts.route(k.experts, stream, s.pick, rows * slots, plan);
     try experts.run(k.experts, stream, .gate_up, l.routed, plan, x, x_stride, rows, s.eact, shared_id);
@@ -76,7 +82,7 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     const d = l.routed.dims;
     const slots = l.top_k + 1;
     const n = hi - lo;
-    const bf16_slots = prompt and l.exl3 == null; // the slot rows: bf16 in an NVFP4 prompt chunk, else fp32
+    const bf16_slots = bf16Slots(k, l, prompt);
     const eb: usize = if (bf16_slots) 2 else 4;
     try projection.matmul(k.set, stream, l.shared_gu, x + lo * x_stride * 2, x_stride, s.sgu + lo * 2 * l.shared * 2, s.mm_part, n, 2 * l.shared, d, false);
     try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
@@ -87,4 +93,22 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     for ([_]usize{ n, d, slots, l.top_k, @intFromBool(bf16_slots) }) |v| a.add(@as(c_int, @intCast(v)));
     try cuda.launch.launch(k.put_slot, .{ .grid = .{ .x = @intCast((n * d + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
     try glue.combine(k.set, stream, s.ey + lo * slots * d * eb, !bf16_slots, s.wts + lo * slots * 4, out, n, d, slots);
+}
+
+test "slot rows: bf16 in an NVFP4 prompt chunk, in an EXL3 one only with TF_GLM_EXL3_BF16_SLOTS, fp32 in decode" {
+    const t = std.testing;
+    var k: Kernels = undefined;
+    var l: Layer = undefined;
+    for ([_]bool{ false, true }) |opted| {
+        k.exl3_b16 = opted;
+        l.routed.dims = 4096;
+        l.routed.width = 1024;
+        l.exl3 = null;
+        try t.expect(bf16Slots(k, l, true) and !bf16Slots(k, l, false));
+        l.exl3 = std.mem.zeroes(exl3.Experts);
+        try t.expectEqual(opted, bf16Slots(k, l, true));
+        try t.expect(!bf16Slots(k, l, false));
+        l.routed.width = 1000; // not the fused kernels' shape: the copied fp32 rows
+        try t.expect(!bf16Slots(k, l, true));
+    }
 }

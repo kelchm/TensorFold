@@ -8,8 +8,8 @@ const Function = @import("module.zig").Function;
 const Stream = @import("stream.zig").Stream;
 
 pub const tile = 64;
-/// With yrow set, pair p lands at (p / slots) * yrow + p % slots in the caller's output.
-pub const Scratch = struct { xg: u64, xu: u64, xd: u64, y: u64, rows: usize, slots: usize, yrow: usize = 0 };
+/// With yrow set, pair p lands at (p / slots) * yrow + p % slots in the caller's output; b16: as bf16 (runGlm only).
+pub const Scratch = struct { xg: u64, xu: u64, xd: u64, y: u64, rows: usize, slots: usize, yrow: usize = 0, b16: bool = false };
 pub fn eligible(l: ex.Layer) bool {
     return l.codebook == .mcg and l.uniform_k2 == 8 and l.gu_stride == 0 and l.dims > 0 and l.width > 0 and l.dims % 256 == 0 and l.width % 128 == 0 and (l.act_mode == 0 or l.act_mode == 1);
 }
@@ -63,20 +63,23 @@ pub const Kernels = struct {
     down_slots: ?Function = null,
     gateup_glm: ?Function = null,
     down_glm: ?Function = null,
+    down_glm_b16: ?Function = null,
     pub fn resolve(mod: Module) !Kernels {
-        return .{ .rotate = try mod.function("tf_exl3_prompt_rotate"), .gateup = try mod.function("tf_exl3_prompt_gu"), .down = try mod.function("tf_exl3_prompt_down"), .down_slots = try mod.function("tf_exl3_prompt_down_slots"), .gateup_glm = try mod.function("tf_exl3_prompt_gu_glm"), .down_glm = try mod.function("tf_exl3_prompt_down_glm") };
+        return .{ .rotate = try mod.function("tf_exl3_prompt_rotate"), .gateup = try mod.function("tf_exl3_prompt_gu"), .down = try mod.function("tf_exl3_prompt_down"), .down_slots = try mod.function("tf_exl3_prompt_down_slots"), .gateup_glm = try mod.function("tf_exl3_prompt_gu_glm"), .down_glm = try mod.function("tf_exl3_prompt_down_glm"), .down_glm_b16 = try mod.function("tf_exl3_prompt_down_glm_b16") };
     }
     /// GLM opts into patch 0078; other families retain the common prompt kernels.
     pub fn runGlm(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan) !void {
-        if (sc.y % 16 != 0 or sc.xd % 8 != 0 or sc.yrow == 0) return error.Exl3Shape;
+        if (sc.y % @as(u64, if (sc.b16) 8 else 16) != 0 or sc.xd % 8 != 0 or sc.yrow == 0) return error.Exl3Shape;
         var tuned = k;
         tuned.gateup = k.gateup_glm orelse return error.Exl3Shape;
-        tuned.down_slots = k.down_glm orelse return error.Exl3Shape;
-        try tuned.run(e, router, s, l, x, stride, picks, rows, sc, p);
+        tuned.down_slots = (if (sc.b16) k.down_glm_b16 else k.down_glm) orelse return error.Exl3Shape;
+        var plain = sc;
+        plain.b16 = false; // run refuses b16: only the slot kernel chosen here writes bf16
+        try tuned.run(e, router, s, l, x, stride, picks, rows, plain, p);
     }
     pub fn run(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan) !void {
         if (!eligible(l) or rows == 0 or rows > sc.rows or stride < l.dims or stride > std.math.maxInt(i32)) return error.Exl3Shape;
-        if (sc.y == 0 or sc.yrow > std.math.maxInt(i32) or (sc.yrow != 0 and sc.yrow < sc.slots)) return error.Exl3Shape;
+        if (sc.y == 0 or sc.b16 or sc.yrow > std.math.maxInt(i32) or (sc.yrow != 0 and sc.yrow < sc.slots)) return error.Exl3Shape;
         _ = try bytes(l, rows, sc.slots);
         const pairs = rows * sc.slots;
         try router.route(s, picks, pairs, l.experts, tile, p);

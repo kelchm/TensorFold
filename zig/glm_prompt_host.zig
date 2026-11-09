@@ -19,7 +19,7 @@ const fw = struct {
     pub const Rank = struct { w: *u8, st: *State, b: *Buffers, segs: []const Seg = &.{} };
     pub var observed_ring = false;
     pub var observed_taps = false;
-    pub var observed_absorb_mma = false;
+    pub var observed_numerics: glm.ranks.Numerics = .{};
     pub const Forward = struct {
         d: u8,
         m: *u8,
@@ -29,12 +29,12 @@ const fw = struct {
         pieces: ?*u8,
         split: bool,
         kda_wide: bool,
-        absorb_mma: bool = false,
+        numerics: glm.ranks.Numerics = .{},
         ring: bool = false,
         taps: ?Taps = null,
         pub fn run(f: *Forward, ids: []const i32) !void {
             observed_ring = f.ring;
-            observed_absorb_mma = f.absorb_mma;
+            observed_numerics = f.numerics;
             observed_taps = f.taps != null;
             if (f.taps) |taps| if (taps.out != 0) {
                 for (ids, 0..) |id, i| {
@@ -291,12 +291,12 @@ test "GLM structured: prompt rows survive without an MTP head" {
 test "GLM prompt workflow: a batched prompt carries the arithmetic opt-in into its forward" {
     var b: Box = .{};
     var e = b.make();
-    e.settings.numerics.absorb_mma = true;
+    e.settings.numerics = .{ .absorb_mma = true, .exl3_bf16_slots = true };
     try pass(&e, &.{.{ .slot = 4, .ids = &.{ 31, 32 } }});
-    try t.expect(fw.observed_absorb_mma);
-    e.settings.numerics.absorb_mma = false;
+    try t.expect(fw.observed_numerics.absorb_mma and fw.observed_numerics.exl3_bf16_slots);
+    e.settings.numerics = .{};
     try pass(&e, &.{.{ .slot = 9, .ids = &.{ 61, 62 } }});
-    try t.expect(!fw.observed_absorb_mma);
+    try t.expectEqual(@as(u32, 0), fw.observed_numerics.bits());
 }
 
 /// Drafter.ingest over tagged rows: each run's rows into the context input (unless already there), then into the ring.

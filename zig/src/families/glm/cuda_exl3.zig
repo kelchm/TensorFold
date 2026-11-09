@@ -135,6 +135,10 @@ fn shape(dims: usize, width: usize) common.Layer {
     const w: Experts = .{ .gt = 0, .ut = 0, .dt = 0, .k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .shx = false };
     return layer(w, cuda.grouped.max_experts, dims, width, 0);
 }
+/// Whether a prompt call of this shape runs the fused GLM kernels (their slot rows may be bf16), not the copied path.
+pub fn fused(dims: usize, width: usize) bool {
+    return common.prompt.eligible(shape(dims, width));
+}
 /// A chunk's compacted picks ahead of the common scratch, 256-aligned; the usize keeps @min from narrowing to u7.
 fn picksBytes(rows: usize) usize {
     const cap: usize = @min(rows, chunk_rows);
@@ -152,22 +156,25 @@ fn copyRows(stream: cuda.Stream, dst: u64, dpitch: usize, src: u64, spitch: usiz
     const m: cuda.abi.Memcpy2D = .{ .src = src, .src_pitch = spitch, .dst = dst, .dst_pitch = dpitch, .width = width, .height = height };
     try stream.d.check(stream.d.api.cuMemcpy2DAsync_v2(&m, stream.handle), what);
 }
-pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, plan_buf: cuda.grouped.Plan, x: u64, x_stride: usize, picks: u64, slots: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32, prompt: bool, ey: u64, xd: u64) !void {
+pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, plan_buf: cuda.grouped.Plan, x: u64, x_stride: usize, picks: u64, slots: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32, prompt: bool, b16: bool, ey: u64, xd: u64) !void {
     _ = xd;
     if (slots != top_k + 1) return error.UnsupportedTopK;
     if (dims % 256 != 0 or width % 128 != 0) return error.NotExl3Mcg4;
     const l = layer(w, count, dims, width, limit);
     const cap: usize = @min(rows, chunk_rows);
     const arena = sc.picks + picksBytes(rows);
-    const fused = prompt and common.prompt.eligible(l);
+    const direct = prompt and common.prompt.eligible(l); // the GLM kernels write the slot rows themselves
+    if (b16 and !direct) return error.NotExl3Mcg4; // bf16 slot rows only from those (fused())
+    const eb: usize = if (b16) 2 else 4; // ey's element: TF_GLM_EXL3_BF16_SLOTS
     var at: usize = 0;
     while (at < rows) : (at += chunk_rows) {
         const n: usize = @min(chunk_rows, rows - at);
         try copyRows(stream, sc.picks, top_k * 4, picks + at * slots * 4, slots * 4, top_k * 4, n, "EXL3 compact route rows");
-        if (fused) {
+        if (direct) {
             var scratch = try common.prompt.scratchFor(arena, l, cap, top_k, false);
-            scratch.y = ey + at * slots * dims * 4;
+            scratch.y = ey + at * slots * dims * eb;
             scratch.yrow = slots;
+            scratch.b16 = b16;
             try k.prompt.runGlm(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, sc.picks, n, scratch, plan_buf);
             continue;
         }

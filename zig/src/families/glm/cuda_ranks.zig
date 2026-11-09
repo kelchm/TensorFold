@@ -137,6 +137,10 @@ pub const Settings = struct {
             problem.* = "TF_GLM_ABSORB_MMA: 0 or 1";
             return error.BadSetting;
         };
+        s.numerics.exl3_bf16_slots = @import("sys").environment.value(bool, "TF_GLM_EXL3_BF16_SLOTS", get("TF_GLM_EXL3_BF16_SLOTS"), false) catch {
+            problem.* = "TF_GLM_EXL3_BF16_SLOTS: 0 or 1";
+            return error.BadSetting;
+        };
         s.heat = heat.bandsFrom(get("TF_HEAT_HIGH"), get("TF_HEAT_LOW")) catch {
             problem.* = "TF_HEAT_HIGH and TF_HEAT_LOW: both or neither, in degrees, with low at or under high";
             return error.BadSetting;
@@ -185,7 +189,8 @@ pub const Settings = struct {
 /// Off-by-default prompt arithmetic, agreed by every rank before weights load.
 pub const Numerics = packed struct(u32) {
     absorb_mma: bool = false,
-    unused: u31 = 0,
+    exl3_bf16_slots: bool = false, // TF_GLM_EXL3_BF16_SLOTS: an EXL3 prompt chunk's MoE slot rows in bf16
+    unused: u30 = 0,
     pub fn bits(n: Numerics) u32 {
         return @bitCast(n);
     }
@@ -471,7 +476,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .solo => "TF_GLM_CHUNK_SOLO",
         .l2pf => "TF_GLM_L2PF, _MB, _CTAS or _PACE_GBPS",
         .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
-        .numerics => "TF_GLM_ABSORB_MMA",
+        .numerics => "TF_GLM_ABSORB_MMA or TF_GLM_EXL3_BF16_SLOTS",
         .capacity => "the sequence capacity (the context)",
         .heat_high => "TF_HEAT_HIGH",
         .heat_low => "TF_HEAT_LOW",
