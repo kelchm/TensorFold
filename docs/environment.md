@@ -82,6 +82,9 @@ profile and agreed in every rank's fingerprint. See the [experiment and pending 
 
 `TF_GLM_HC_FUSE` accepts `0` or `1` with the same checks and scope; unset or blank keeps it off.
 `1` has a prompt call's `hc_post` (64 rows or more) also compute the next site's `hc_pre` partials from the streams it just wrote (`tf_glm_hc_post_partial`), so those streams are not read back: 128 MiB less traffic a site at 4,096 rows. The last layer's `hc_post` and decode windows are unchanged. Every byte stays the same, so it is registered as identical and the ranks need not agree; device qualification is pending.
+
+`TF_GLM_DENSE_PRUNE` accepts `0` or `1` with the same checks and scope; unset or blank keeps it on.
+A chunk that starts before the dense limit (2,051 positions) runs dense attention, then sparse attention for its rows from the limit on, which writes each such row whole (its token count is nonzero from position 2,051). With `1` the dense pass stops at the limit: a 4,096-row first chunk computes 2,051 dense rows rather than 4,096, with the chunk's head block, chunk count and 512-row blocks unchanged. No kernel changes and no kept row's inputs change, so every byte stays the same; it is registered as identical and the ranks need not agree. `0` computes every row densely as before.
 ## GLM CUDA decode launches
 
 These switches change only how a decode window's kernels are scheduled; every output keeps its bytes. GLM checks each before rank placement, NCCL or weights, and other CUDA families do not check this scope. They stay out of the ranks' fingerprint: each rank's own launches, no collective among them.
