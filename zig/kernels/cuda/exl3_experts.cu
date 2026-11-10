@@ -368,3 +368,4 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_slots(c
 }
 
 #include "exl3_prompt_glm.cuh"
+#include "exl3_prompt_glm_pc.cuh"   // TF_EXL3_PROMPT_GU=pc

@@ -91,6 +91,9 @@ A chunk that starts before the dense limit (2,051 positions) runs dense attentio
 
 `TF_GLM_MM_FAST4` accepts `0` or `1` with the same checks and scope; unset or blank keeps it off.
 `1` has 4-bit packed prompt matmuls (`TF_GLM_DENSE_BITS=4`) take `glm_mm4_128s2f` (and `glm_mm4_128s2f_ld` under `TF_GLM_SHARED_SLOT`): each weight pair is built as BF16 `0x4300 | u` (128 + u) for its two nibbles and one BF16 pair subtraction of 136, exactly u - 8 and +0 for code 8, the bits the int-to-float-to-BF16 conversions give. The MMAs, scales and their order are unchanged, so every byte is the same; registered as identical. It stays off until the new kernels compile and pass their device gates.
+
+`TF_EXL3_PROMPT_GU` accepts `0` or `pc` with the same checks and scope; unset or blank keeps `0`.
+`pc` runs an EXL3 prompt call's gate/up (shared input rotation only) on items of up to 128 members with `tf_exl3_prompt_gu_glm_pc`: 640 threads, where three decoder warps decode each compressed weight tile once a k step into shared memory for the 16 warps that run the MMAs, the stages handed over through mbarriers. The slot kernel takes each 64-member half of those items (`tf_exl3_prompt_down_glm_h` and its bf16 form), so down runs the same members as before. Each output keeps the current kernel's decoded operands, ascending-K chain from zero and epilogue, so every byte stays the same: registered as identical, out of the ranks' fingerprint. It stays off until the kernels pass their device gates and timings; separate gate and up rotations keep the current kernel.
 ## GLM CUDA decode launches
 
 These switches change only how a decode window's kernels are scheduled; every output keeps its bytes. GLM checks each before rank placement, NCCL or weights, and other CUDA families do not check this scope. They stay out of the ranks' fingerprint: each rank's own launches, no collective among them.

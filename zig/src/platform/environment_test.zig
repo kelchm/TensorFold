@@ -53,6 +53,8 @@ const valid = [_]Case{
     .{ .name = "TF_GLM_DENSE_PRUNE", .raw = "0", .n = 0 },
     .{ .name = "TF_GLM_SHARED_SLOT", .raw = "1", .n = 1 },
     .{ .name = "TF_GLM_MM_FAST4", .raw = "1", .n = 1 },
+    .{ .name = "TF_EXL3_PROMPT_GU", .raw = "pc", .n = 1 },
+    .{ .name = "TF_EXL3_PROMPT_GU", .raw = " 0 ", .n = 0 },
     .{ .name = "TF_GLM_KDA_STEP_WARPS", .raw = "auto", .n = 0 },
     .{ .name = "TF_GLM_KDA_STEP_WARPS", .raw = "2", .n = 3 },
     .{ .name = "TF_GLM_PDL_CHAIN", .raw = "1", .n = 8 },
@@ -268,6 +270,11 @@ test "environment: malformed GLM opt-in affects only GLM startup" {
     const fuse_why = (try e.refusal(a, fuse, .{ .glm = true })).?;
     defer a.free(fuse_why);
     try t.expectEqualStrings("TF_GLM_HC_FUSE=\"yes\": expected 0 or 1", fuse_why);
+    const gu: Env = .{ .name = "TF_EXL3_PROMPT_GU", .raw = "1" };
+    try t.expect((try e.refusal(a, gu, .{ .cuda = true })) == null);
+    const gu_why = (try e.refusal(a, gu, .{ .glm = true })).?;
+    defer a.free(gu_why);
+    try t.expectEqualStrings("TF_EXL3_PROMPT_GU=\"1\": expected 0 or pc", gu_why);
     const chain: Env = .{ .name = "TF_GLM_PDL_CHAIN", .raw = "moe,reduce" };
     try t.expect((try e.refusal(a, chain, .{ .cuda = true })) == null);
     const chain_why = (try e.refusal(a, chain, .{ .glm = true })).?;
