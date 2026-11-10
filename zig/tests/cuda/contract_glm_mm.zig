@@ -57,6 +57,8 @@ pub const Product = struct {
     bits: u8,
     wide: bool,
     drop_tail: bool = false,
+    plain: ?*const glm.mm.Kernels = null, // TF_GLM_MM_FAST4: `kernels` hold glm_mm4_128s2f (or a control), these its parent
+    swap: bool = false, // the control: B pairs' halves swapped
     d: ?Dense = null,
     x: u64 = 0,
     w: glm.mm.Tiled = undefined,
@@ -71,8 +73,9 @@ pub const Product = struct {
     }
 
     pub fn kernel(self: *Product) !g.Kernel {
-        const name = try std.fmt.bufPrint(&self.name, "{s}glm_mm{d}_128s2 {s}", .{ if (self.drop_tail) "control: dropped prompt row " else "cuda ", self.bits, if (self.wide) "fp32" else "bf16" });
-        const parent = try std.fmt.bufPrint(&self.parent, "glm_mm{d}_128", .{self.bits});
+        const lead = if (self.drop_tail) "control: dropped prompt row " else if (self.swap) "control: B pairs' halves swapped " else "cuda ";
+        const name = try std.fmt.bufPrint(&self.name, "{s}glm_mm{d}_128s2{s} {s}", .{ lead, self.bits, if (self.plain != null) "f" else "", if (self.wide) "fp32" else "bf16" });
+        const parent = try std.fmt.bufPrint(&self.parent, "glm_mm{d}_128{s}", .{ self.bits, if (self.plain != null) "s2" else "" });
         return .{ .spec = .{
             .name = name,
             .accum = .f32,
@@ -81,7 +84,7 @@ pub const Product = struct {
             .replaces = parent,
             .tiles = .{ .{ .size = 128 }, .{ .size = 64, .step = 8, .min = 8 }, .{ .size = 64, .step = 64, .min = 64 } },
             .served = &served,
-        }, .ctx = self, .vt = &vt, .control = if (self.drop_tail) .shapes else null };
+        }, .ctx = self, .vt = &vt, .control = if (self.drop_tail or self.swap) .shapes else null };
     }
 
     const vt = g.hooks(Product);
@@ -174,6 +177,10 @@ pub const Product = struct {
     }
 
     pub fn replaced(self: *Product) ![]const u8 {
+        if (self.plain) |k| { // glm_mm4_128s2f: its two-stage parent
+            try self.launch(k.packed_prompt[(self.bits - 4) / 2], self.base, self.d.?.shape.rows, 2);
+            return self.rig.bytes(self.base, self.count() * @as(usize, if (self.wide) 4 else 2));
+        }
         try self.launch(self.kernels.packed_rows[(self.bits - 4) / 2][3], self.base, self.d.?.shape.rows, 3);
         return self.rig.bytes(self.base, self.count() * @as(usize, if (self.wide) 4 else 2));
     }
@@ -194,29 +201,46 @@ pub const Product = struct {
 pub const Prompts = struct {
     module: cuda.Module,
     ops: cuda.Module, // glm_ops: tf_glm_put_slot, the shared slot's parent copy
-    kernels: glm.mm.Kernels,
+    kernels: glm.mm.Kernels, // the parents, and TF_GLM_SHARED_SLOT's kernels, whatever the environment says
+    fast: glm.mm.Kernels, // TF_GLM_MM_FAST4's: glm_mm4_128s2f and glm_mm4_128s2f_ld
+    swapped: glm.mm.Kernels, // the fast decode's planted control, tf_ctl_glm_mm4_128s2f_swap
     cases: [12]Product = undefined,
-    slots: [10]slot_k.Slot = undefined,
+    fasts: [3]Product = undefined,
+    slots: [11]slot_k.Slot = undefined,
 
-    pub fn init(gpu: check.Gpu) !Prompts {
+    /// `controls`: the planted-controls image (fatbin_contract_controls).
+    pub fn init(gpu: check.Gpu, controls: cuda.Module) !Prompts {
         var m = try cuda.Module.load(gpu.d, cuda.kernels.glm_mm);
         errdefer m.unload();
         var ops = try cuda.Module.load(gpu.d, cuda.kernels.glm_ops);
         errdefer ops.unload();
+        const smem = glm.mm.sharedBytesStages(4, 128, 2);
         var k = try glm.mm.Kernels.load(m);
-        k.strided = try glm.mm.Strided.load(m); // TF_GLM_SHARED_SLOT's kernels, whatever the environment says
-        return .{ .module = m, .ops = ops, .kernels = k };
+        k.packed_prompt[0] = try m.function("glm_mm4_128s2");
+        try k.packed_prompt[0].allowDynamicShared(smem);
+        k.strided = try glm.mm.Strided.load(m, false);
+        var fast = k;
+        fast.packed_prompt[0] = try m.function("glm_mm4_128s2f");
+        try fast.packed_prompt[0].allowDynamicShared(smem);
+        fast.strided = try glm.mm.Strided.load(m, true);
+        var swapped = k;
+        swapped.packed_prompt[0] = try controls.function("tf_ctl_glm_mm4_128s2f_swap");
+        try swapped.packed_prompt[0].allowDynamicShared(smem);
+        return .{ .module = m, .ops = ops, .kernels = k, .fast = fast, .swapped = swapped };
     }
 
     pub fn append(self: *Prompts, gpu: check.Gpu, s: cuda.Stream, kernels: *std.ArrayList(g.Kernel)) !void {
         for (&self.cases, 0..) |*p, i| p.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kernels = &self.kernels, .bits = @intCast(4 + 2 * (i % 3)), .wide = i % 6 >= 3, .drop_tail = i >= 6 };
         for (&self.cases) |*p| try kernels.append(gpu.gpa, try p.kernel());
-        slot_k.cases(&self.slots, .{ .gpu = gpu, .s = s }, &self.kernels, try self.ops.function("tf_glm_put_slot"));
+        for (&self.fasts, 0..) |*p, i| p.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kernels = if (i == 2) &self.swapped else &self.fast, .plain = &self.kernels, .bits = 4, .wide = i == 1, .swap = i == 2 };
+        for (&self.fasts) |*p| try kernels.append(gpu.gpa, try p.kernel());
+        slot_k.cases(&self.slots, .{ .gpu = gpu, .s = s }, &self.kernels, &self.fast, try self.ops.function("tf_glm_put_slot"));
         for (&self.slots) |*p| try kernels.append(gpu.gpa, try p.kernel());
     }
 
     pub fn deinit(self: *Prompts) void {
         for (&self.cases) |*p| p.deinit();
+        for (&self.fasts) |*p| p.deinit();
         for (&self.slots) |*p| p.deinit();
         self.ops.unload();
         self.module.unload();
@@ -270,4 +294,51 @@ test "GLM prompt contract: fast eight-bit pair decode preserves every pair inclu
             try std.testing.expectEqual(c.toBf16(@floatFromInt(signed)), got);
         }
     }
+}
+
+/// PRMT: result byte n is byte (s >> 4 n) & 7 of x (0 to 3) then y (4 to 7).
+fn bytePerm(x: u32, y: u32, s: u32) u32 {
+    const all = @as(u64, y) << 32 | x;
+    var out: u32 = 0;
+    for (0..4) |n| {
+        const b: u32 = @as(u8, @truncate(all >> @intCast(8 * ((s >> @intCast(4 * n)) & 7))));
+        out |= b << @intCast(8 * n);
+    }
+    return out;
+}
+
+/// bpairs4_fast's pair i of words p (SWAP: the control's halves), as BF16 subtraction gives it: exact, so rounded once.
+fn fastPair(p: [2]u32, i: usize, swap: bool) u32 {
+    const w = p[i >> 2];
+    const j: u32 = @intCast(i & 3);
+    const a = (bytePerm(w, w >> 4, if (swap) (j + 4) | (j << 8) else j | ((j + 4) << 8)) & 0x000F000F) | 0x43004300;
+    var out: u32 = 0;
+    for ([_]u5{ 0, 16 }) |shift| out |= @as(u32, c.toBf16(c.fromBf16(@truncate(a >> shift)) - c.fromBf16(0x4308))) << shift;
+    return out;
+}
+
+/// bpairs<4>: codes16's codes (nibble i % 8 of word i / 8, less 8) as floats, pairs of them rounded to BF16.
+fn plainPair(p: [2]u32, i: usize) u32 {
+    var out: u32 = 0;
+    for (0..2) |h| {
+        const v = 2 * i + h;
+        const q: i32 = @as(i32, @intCast((p[v / 8] >> @intCast(4 * (v % 8))) & 15)) - 8;
+        out |= @as(u32, c.toBf16(@floatFromInt(q))) << @intCast(16 * h);
+    }
+    return out;
+}
+
+test "GLM prompt contract: fast four-bit pair decode gives bpairs<4>'s every pair, +0 for code 8, and its control does not" {
+    var rng = std.Random.DefaultPrng.init(0x4308);
+    var swapped: usize = 0;
+    for (0..4) |j| for (0..256) |v| for (0..4) |_| { // every byte at every position, the other bytes at random
+        var p = [2]u32{ rng.random().int(u32), rng.random().int(u32) };
+        for (&p) |*w| w.* = w.* & ~(@as(u32, 0xff) << @intCast(8 * j)) | @as(u32, @intCast(v)) << @intCast(8 * j);
+        for (0..8) |i| {
+            try std.testing.expectEqual(plainPair(p, i), fastPair(p, i, false));
+            if (fastPair(p, i, true) != plainPair(p, i)) swapped += 1;
+        }
+    };
+    try std.testing.expectEqual(@as(u32, 0), fastPair(.{ 0x88888888, 0x88888888 }, 5, false)); // code 8: +0 in both halves
+    try std.testing.expect(swapped > 0);
 }

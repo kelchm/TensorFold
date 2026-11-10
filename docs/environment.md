@@ -88,6 +88,9 @@ A chunk that starts before the dense limit (2,051 positions) runs dense attentio
 
 `TF_GLM_SHARED_SLOT` accepts `0` or `1` with the same checks and scope; unset or blank keeps it off.
 `1` has the shared expert's down projection write its MoE slot (the ninth of each row's nine) itself whenever glm_mm takes the call in one launch of one K slice: a prompt chunk's, or a call of 128 rows or more. `glm_mm16_rows_ld` and `glm_mm{4,6,8}_128s2_ld` are the prompt kernels with an output row stride; fp32 slots get the fp32 sums, bf16 slots the sums rounded once to nearest even, as `tf_glm_put_slot` rounds the contiguous fp32 rows. That removes the fp32 `sy` write, its read and a launch per MoE layer. Smaller decode windows, K-sliced calls, FP8 projections and the fixed-K prompt experiment keep `sy` and `tf_glm_put_slot`. The bytes are registered as the same (identical in the profile, out of the ranks' fingerprint); it stays off until device gates confirm the bf16 rounding of NaN and the unchanged parents.
+
+`TF_GLM_MM_FAST4` accepts `0` or `1` with the same checks and scope; unset or blank keeps it off.
+`1` has 4-bit packed prompt matmuls (`TF_GLM_DENSE_BITS=4`) take `glm_mm4_128s2f` (and `glm_mm4_128s2f_ld` under `TF_GLM_SHARED_SLOT`): each weight pair is built as BF16 `0x4300 | u` (128 + u) for its two nibbles and one BF16 pair subtraction of 136, exactly u - 8 and +0 for code 8, the bits the int-to-float-to-BF16 conversions give. The MMAs, scales and their order are unchanged, so every byte is the same; registered as identical. It stays off until the new kernels compile and pass their device gates.
 ## GLM CUDA decode launches
 
 These switches change only how a decode window's kernels are scheduled; every output keeps its bytes. GLM checks each before rank placement, NCCL or weights, and other CUDA families do not check this scope. They stay out of the ranks' fingerprint: each rank's own launches, no collective among them.
