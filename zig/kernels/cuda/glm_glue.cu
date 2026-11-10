@@ -6,6 +6,7 @@
 #include "glm_glue_hc_split.cuh"
 #include "glm_glue_moe.cuh"
 #include "glm_glue_router.cuh"
+#include "glm_glue_router_tile.cuh"
 #include "glm_glue_latent.cuh"
 #include "glm_glue_index.cuh"
 #include "glm_glue_bmm.cuh"
