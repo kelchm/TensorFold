@@ -1,4 +1,4 @@
-//! One-GPU packed prompt projections at GLM-5.3-Flash TP=2 shapes against tuned cuBLASLt BF16.
+//! One-GPU packed prompt projections at GLM-5.3-Flash TP=2 shapes against tuned cuBLASLt BF16 (`kernel=`: GLM's pick).
 const std = @import("std");
 const cuda = @import("cuda");
 const glm = @import("glm_cuda");
@@ -72,7 +72,8 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
     defer ws.free();
     var total: [shapes.rows.len]Sum = @splat(.{});
     var groups: [shapes.rows.len][4]Sum = @splat(@splat(.{}));
-    std.debug.print("GLM_PROMPT_MM config bits={d} seconds_per_path={d:.3} rows=2048,4096,8192 device=0 tp_shape=2 warmup=3 min_repeats=7 graph_batch_target_ms=10 peak_bf16_TFLOPS={d:.1} cublaslt_version={d} workspace_limit={d} pdl={d}\n", .{ bits, seconds, peak, library.api.cublasLtGetVersion(), gemm.workspace_bytes, @intFromBool(mk.pdl) });
+    const kernel = mk.prompt_symbols[(bits - 4) / 2];
+    std.debug.print("GLM_PROMPT_MM config bits={d} kernel={s} seconds_per_path={d:.3} rows=2048,4096,8192 device=0 tp_shape=2 warmup=3 min_repeats=7 graph_batch_target_ms=10 peak_bf16_TFLOPS={d:.1} cublaslt_version={d} workspace_limit={d} pdl={d}\n", .{ bits, kernel, seconds, peak, library.api.cublasLtGetVersion(), gemm.workspace_bytes, @intFromBool(mk.pdl) });
     std.debug.print("GLM_PROMPT_MM scope=packed-backbone-linears inputs=bf16 activation_conversion=none output=served-type accumulate=fp32 fixture=dyadic-qpack weights_and_input_setup=untimed cache=warm-reused-buffers\n", .{});
     std.debug.print("GLM_PROMPT_MM excluded=head-last-row,mtp,routed-experts,routers,mla-absorb-expand,nonlinearities,communication indexer_qb=enabled sums=modeled-serial-45-layer-backbone ratio=packed-ms/cublaslt-ms lower_ratio_is_faster=1 fp8=not-measured\n", .{});
     for (list) |sh| {
@@ -84,7 +85,7 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
         // b16.matmul takes this branch before reading glue; match Forward.set's tiled packed prompt selection.
         const set: glm.glue.Set = .{ .glue = undefined, .mm = &mk, .packs = &packs, .prompt = true };
         for (shapes.rows, 0..) |m, ri| {
-            const pair = try bench(gpu, &library, handle, stream, ws, sh, m, seconds, bits, set, weights);
+            const pair = try bench(gpu, &library, handle, stream, ws, sh, m, seconds, bits, kernel, set, weights);
             total[ri].add(sh, m, pair[0], pair[1]);
             groups[ri][@backingInt(sh.group)].add(sh, m, pair[0], pair[1]);
         }
@@ -97,7 +98,7 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
     check.pass("glm-prompt-mm-bench: all 39 packed prompt cases agree with dequantized cuBLASLt", .{});
 }
 
-fn bench(gpu: check.Gpu, library: *const cuda.cublaslt.Library, handle: cuda.cublaslt.Handle, stream: cuda.Stream, ws: cuda.DeviceBuffer, sh: shapes.Shape, m: usize, seconds: f64, bits: u8, set: glm.glue.Set, weights: data.Weights) ![2]timing.Stats {
+fn bench(gpu: check.Gpu, library: *const cuda.cublaslt.Library, handle: cuda.cublaslt.Handle, stream: cuda.Stream, ws: cuda.DeviceBuffer, sh: shapes.Shape, m: usize, seconds: f64, bits: u8, kernel: []const u8, set: glm.glue.Set, weights: data.Weights) ![2]timing.Stats {
     var x = try data.input(gpu, sh, m);
     defer x.free();
     const bytes = m * sh.n * @as(usize, if (sh.wide) 4 else 2);
@@ -123,7 +124,7 @@ fn bench(gpu: check.Gpu, library: *const cuda.cublaslt.Library, handle: cuda.cub
     try data.validate(sh, m, bits, out, reference);
     for ([_]timing.Stats{ quantized, lt }, [_][]const u8{ "packed", "cublaslt-bf16" }) |s, path| {
         const work = sh.work(m);
-        std.debug.print("GLM_PROMPT_MM result={s} M={d} N={d} K={d} layers={d} bits={d} path={s} output={s} best_ms={d:.6} median_ms={d:.6} best_TFLOPS={d:.3} median_TFLOPS={d:.3} best_peak_pct={d:.2} median_peak_pct={d:.2} packed_over_cublaslt_best={d:.3} packed_over_cublaslt_median={d:.3} repeats={d} batch={d} gpu_ms={d:.1} workspace={d} heuristic={d}/{d}\n", .{ sh.name, m, sh.n, sh.k, sh.layers, bits, path, if (sh.wide) "fp32" else "bf16", s.best_ms, s.median_ms, s.best(work), s.middle(work), 100 * s.best(work) / peak, 100 * s.middle(work) / peak, quantized.best_ms / lt.best_ms, quantized.median_ms / lt.median_ms, s.repeats, s.batch, s.gpu_ms, if (std.mem.eql(u8, path, "packed")) @as(usize, 0) else plan.workspace_need, selected.index, selected.count });
+        std.debug.print("GLM_PROMPT_MM result={s} M={d} N={d} K={d} layers={d} bits={d} path={s} output={s} best_ms={d:.6} median_ms={d:.6} best_TFLOPS={d:.3} median_TFLOPS={d:.3} best_peak_pct={d:.2} median_peak_pct={d:.2} packed_over_cublaslt_best={d:.3} packed_over_cublaslt_median={d:.3} repeats={d} batch={d} gpu_ms={d:.1} workspace={d} heuristic={d}/{d} kernel={s}\n", .{ sh.name, m, sh.n, sh.k, sh.layers, bits, path, if (sh.wide) "fp32" else "bf16", s.best_ms, s.median_ms, s.best(work), s.middle(work), 100 * s.best(work) / peak, 100 * s.middle(work) / peak, quantized.best_ms / lt.best_ms, quantized.median_ms / lt.median_ms, s.repeats, s.batch, s.gpu_ms, if (std.mem.eql(u8, path, "packed")) @as(usize, 0) else plan.workspace_need, selected.index, selected.count, if (std.mem.eql(u8, path, "packed")) kernel else "cublaslt" });
     }
     return .{ quantized, lt };
 }
