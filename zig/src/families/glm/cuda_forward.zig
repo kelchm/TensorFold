@@ -210,6 +210,7 @@ pub const Forward = struct {
     index_split: bool = false, // TF_GLM_INDEX_SPLIT: this prompt chunk's indexer rows split across the ranks (rank 0's choice)
     l2pf: ?*const l2pf_mod.L2pf = null, // TF_GLM_L2PF: a decode window's sites read their next weights into L2
     hc_fuse: bool = false, // TF_GLM_HC_FUSE: a prompt call's hc_post writes the next hc_pre's partials (same bytes)
+    side: ?moe.Side = null, // TF_GLM_SHARED_SIDE: a decode window's MoE shared expert on its own stream (same bytes)
 
     /// TF_GLM_L2PF on this forward: a decode window of this process's one rank (a prompt chunk reads at full rate).
     pub fn prefetch(f: *const Forward) ?*const l2pf_mod.L2pf {
@@ -311,7 +312,7 @@ pub const Forward = struct {
     }
 
     fn moeKernels(f: *const Forward) moe.Kernels {
-        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .put_slot = f.m.put_slot, .prof = f.prof, .exl3_b16 = f.numerics.exl3_bf16_slots };
+        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .put_slot = f.m.put_slot, .prof = f.prof, .exl3_b16 = f.numerics.exl3_bf16_slots, .side = f.side };
     }
 
     pub const Site = enum { mixer, ffn };

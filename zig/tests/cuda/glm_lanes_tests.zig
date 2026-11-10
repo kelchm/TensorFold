@@ -214,7 +214,7 @@ pub fn concurrentCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, ra
     if (c.failed) return error.TestFailed;
 }
 
-/// `glm-shared-check`: streams verified in one shared forward equal lone twins byte for byte.
+/// `glm-shared-check`: shared windows equal lone twins byte for byte (with TF_GLM_SHARED_SIDE, rank 0's twins in line).
 pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_int, world: c_int, id_path: []const u8) !void {
     const glm = @import("glm_cuda");
     var arena = std.heap.ArenaAllocator.init(gpu.gpa);
@@ -241,6 +241,8 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: 
     }
     const x: glm.follow.Leader = .{ .e = e, .link = &link };
     defer x.end() catch {};
+    const side = e.side; // the streams fork their decode shared experts (the default), the twins (slots S on) do not
+    defer e.side = side;
     const S = 5; // streams: every prompt, the first twice, the last sampled
     const V = e.share.vocab.len();
     var failed = false;
@@ -250,6 +252,7 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: 
         const k = dc.kinds[i % dc.kinds.len];
         const ids = try a.alloc(u32, k.prompt.len);
         for (ids, k.prompt) |*u, v| u.* = @intCast(v);
+        e.side = if (slot < S) side else null;
         try x.bind(@intCast(slot));
         try x.begin(if (i == S - 1) .{ .seed = 77, .temperature = 0.7, .top_k = 20, .top_p = 0.95 } else null);
         const t = try x.prefill(ids, null, null, null);
@@ -276,11 +279,13 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: 
             for (0..rows) |r| ids[i][r] = @intCast(100 + (round * 31 + i * 7 + r * 13) % 5000);
             parts[i] = .{ .slot = @intCast(i), .ids = ids[i][0..rows], .out = outs[i][0..rows] };
         }
+        e.side = side;
         try x.verifyShared(parts[0..n]);
         var row0: usize = 0;
         for (0..n) |i| { // each stream's rows of the shared forward against its twin's lone round (verify, keep, draft)
             const rows = parts[i].ids.len;
             try cuda.memory.download(gpu.d, e.bs.?.logits + row0 * V * 2, std.mem.sliceAsBytes(mine)[0 .. rows * V * 2]);
+            e.side = null;
             try x.bind(@intCast(S + i));
             try x.verify(parts[i].ids, twin[i][0..rows], 0);
             try cuda.memory.download(gpu.d, e.bd.logits, std.mem.sliceAsBytes(lone)[0 .. rows * V * 2]);
@@ -294,6 +299,7 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: 
             var d0: [glm.engine.max_drafts]u32 = undefined;
             var d1: [glm.engine.max_drafts]u32 = undefined;
             for ([_]u32{ @intCast(S + i), @intCast(i) }, [_]*[glm.engine.max_drafts]u32{ &d1, &d0 }) |slot, d| {
+                e.side = if (slot < S) side else null;
                 try x.bind(slot);
                 try x.keep(keep);
                 try x.draft(false, outs[i][0..keep], 2, d, null);
@@ -320,7 +326,7 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: 
         }
     }
     if (failed) return error.TestFailed;
-    check.pass("shared windows at TP={d}: {d} rows of {d} streams over 12 rounds (2 to {d} streams a forward, 1 to 4 rows each, greedy and sampled) equal their lone twins' logits, tokens and drafts byte for byte, and every state its twin's", .{ world, compared, S, S });
+    check.pass("shared windows at TP={d}: {d} rows of {d} streams over 12 rounds (2 to {d} streams a forward, 1 to 4 rows each, greedy and sampled) equal their lone twins' logits, tokens and drafts byte for byte, and every state its twin's{s}", .{ world, compared, S, S, if (side != null) " (TF_GLM_SHARED_SIDE: the streams' shared experts on the side stream, the twins' in line on rank 0)" else "" });
 }
 
 /// A concurrent case's stream: prompt `p` joining at round `at`; `filled`: its prompt a chunk at a time between rounds.

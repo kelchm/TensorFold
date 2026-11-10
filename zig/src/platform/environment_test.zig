@@ -50,6 +50,7 @@ const valid = [_]Case{
     .{ .name = "TF_GLM_HC_FUSE", .raw = "1", .n = 1 },
     .{ .name = "TF_GLM_HC_SPLIT", .raw = "0", .n = 0 },
     .{ .name = "TF_GLM_HC_PART", .raw = "1", .n = 1 },
+    .{ .name = "TF_GLM_SHARED_SIDE", .raw = "0", .n = 0 },
     .{ .name = "TF_GLM_KDA_STEP_WARPS", .raw = "auto", .n = 0 },
     .{ .name = "TF_GLM_KDA_STEP_WARPS", .raw = "2", .n = 3 },
     .{ .name = "TF_GLM_PDL_CHAIN", .raw = "1", .n = 8 },

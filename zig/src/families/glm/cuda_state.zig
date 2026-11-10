@@ -119,6 +119,11 @@ fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize
     return sizes.toOwnedSlice(gpa);
 }
 
+/// The split-K partials of a decode window's shared expert ([gate | up], then down) on its side stream (cuda_moe.Side).
+pub fn sidePart(rows: usize, shared: usize, dims: usize) usize {
+    return @max(b16.partBytes(rows, 2 * shared, dims), b16.partBytes(rows, dims, shared));
+}
+
 /// A rank's B16 matmul shapes ([n, k]) whose split-K partials the buffers hold.
 fn b16Shapes(w: *const weights.Weights) [12][2]usize {
     const c = &w.config;
@@ -197,7 +202,7 @@ pub const Buffers = struct {
     /// The fields a twin holds apart, by their index in make's sizes (make reads the fields from these indexes too).
     const twin_at = .{ .ids = 0, .x = 1, .normed = 2, .xs = 3, .post = 4, .comb = 5, .hcpart = 6, .gathered = 7, .hidden = 62, .fnormed = 63, .fxs = 64, .logits = 65, .part = 70 };
     /// make's size count when twin_at's indexes were last checked: adding or removing a size fails the build.
-    const twin_checked = 76;
+    const twin_checked = 77;
 
     /// Whether make's size `i` is one a twin holds apart.
     fn twinHolds(i: usize) bool {
@@ -268,6 +273,7 @@ pub const Buffers = struct {
         };
         out.moe.x3 = .{ .picks = p[71], .xg = p[72], .xu = p[73], .z = p[74] };
         out.kda.tmp = p[75];
+        if (!prefill) out.moe.side_part = p[76]; // TF_GLM_SHARED_SIDE: decode windows alone fork the shared expert
         if (twin) |of| {
             var t = of.*;
             t.arena = out.arena;
@@ -361,6 +367,7 @@ pub const Buffers = struct {
             rows * D * 4, // part: this rank's fp32 partial rows a split exchange sends from
             x3[0], x3[1], x3[2], x3[3], // EXL3 experts: 8-slot picks, rotated inputs, a decode window's partials
             if (split) rows * @max(3 * n, kw - 3 * n) * 2 else 4, // a split KDA stack's part rows
+            if (prefill) 4 else @max(4, sidePart(@min(rows, b16.rows_from - 1), sh, D)), // the side shared expert's slices
         };
     }
 

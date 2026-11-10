@@ -49,6 +49,7 @@ pub const disk_ranks = @import("cuda_disk_ranks.zig");
 test {
     _ = @import("cuda_mla_test.zig");
     _ = @import("cuda_glue_pdl_test.zig");
+    _ = @import("cuda_moe_side_test.zig");
     _ = @import("cuda_formats_csf0_test.zig");
     _ = @import("cuda_tile.zig");
     _ = @import("cuda_kv8_test.zig");
