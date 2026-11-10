@@ -43,6 +43,13 @@ test "glm packed: two-stage prompt geometry is registered without claiming unmea
         try t.expectEqual(@as(usize, 5), try registry.checkCuda(t.allocator, &.{r}, true));
         try t.expectEqual(registry.none, registry.usageFor(r, .{ .major = 13, .minor = 3 }));
     }
+    for ([_][]const u8{ "glm_mm4_128s2f", "glm_mm4_128s2f_ld", "tf_ctl_glm_mm4_128s2f_swap" }) |symbol| { // TF_GLM_MM_FAST4
+        const r = try record(symbol);
+        try t.expectEqual(glm.mm.sharedBytesStages(4, 128, 2), r.launch.dynamic);
+        try t.expectEqual(@as(u32, 256), r.launch.threads);
+        try t.expectEqualStrings(if (symbol[0] == 't') "contract_controls" else "glm_mm", r.launch.image);
+        try t.expectEqual(registry.none, registry.usageFor(r, .{ .major = 13, .minor = 3 }));
+    }
     const ld = try record("glm_mm16_rows_ld"); // TF_GLM_SHARED_SLOT: glm_mm16_rows' launch, its usage pending
     const parent = try record("glm_mm16_rows");
     try t.expectEqual(parent.launch.dynamic, ld.launch.dynamic);

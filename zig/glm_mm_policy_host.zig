@@ -108,3 +108,11 @@ test "TF_GLM_SHARED_SLOT: a one-launch call takes its strided kernel and grid wi
     try std.testing.expectError(error.BadShape, mm.matmulStrided(&k, .{}, 4096, 2048, w, 16384, 4095, 2048, false, true));
     try std.testing.expectError(error.BadShape, mm.matmulStrided(&k, .{}, 4096, 2048, w, 16386, 9 * 4096, 2048, false, true));
 }
+
+test "TF_GLM_MM_FAST4: 4-bit prompt kernels take the f symbols, every other width its own" {
+    try std.testing.expectEqualStrings("glm_mm4_128s2f", mm.promptSymbol(4, true, ""));
+    try std.testing.expectEqualStrings("glm_mm4_128s2f_ld", mm.promptSymbol(4, true, "_ld"));
+    try std.testing.expectEqualStrings("glm_mm4_128s2", mm.promptSymbol(4, false, ""));
+    try std.testing.expectEqualStrings("glm_mm6_128s2_ld", mm.promptSymbol(6, true, "_ld"));
+    try std.testing.expectEqualStrings("glm_mm8_128s2", mm.promptSymbol(8, true, ""));
+}

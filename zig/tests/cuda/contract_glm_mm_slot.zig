@@ -40,6 +40,7 @@ pub const Slot = struct {
     }
 
     fn symbol(self: *Slot) []const u8 {
+        if (self.p.plain != null) return "glm_mm4_128s2f"; // TF_GLM_MM_FAST4's, its parent glm_mm4_128s2
         return switch (self.p.bits) {
             16 => "glm_mm16_rows",
             4 => "glm_mm4_128s2",
@@ -56,7 +57,7 @@ pub const Slot = struct {
             .seventh => "control: shared expert in slot 7 ",
         };
         const name = try std.fmt.bufPrint(&self.name, "{s}{s}_ld shared slot {s}", .{ lead, self.symbol(), if (self.p.wide) "fp32" else "bf16" });
-        const parent = try std.fmt.bufPrint(&self.parent, "{s} fp32 then tf_glm_put_slot", .{self.symbol()});
+        const parent = try std.fmt.bufPrint(&self.parent, "{s} fp32 then tf_glm_put_slot", .{if (self.p.plain != null) "glm_mm4_128s2" else self.symbol()});
         return .{ .spec = .{
             .name = name,
             .accum = .f32,
@@ -85,15 +86,15 @@ pub const Slot = struct {
         return true;
     }
 
-    fn kernels(self: *Slot) glm.mm.Kernels {
-        var k = self.p.kernels.*;
+    fn kernels(self: *Slot, parent: bool) glm.mm.Kernels {
+        var k = if (parent) (self.p.plain orelse self.p.kernels).* else self.p.kernels.*;
         k.prompt_fixed_k = false;
         return k;
     }
 
     pub fn run(self: *Slot) !void {
         const sh = self.p.d.?.shape;
-        const k = self.kernels();
+        const k = self.kernels(false);
         const slot: usize = if (self.fault == .seventh) slots - 2 else slots - 1;
         const ldo = sh.n * @as(usize, if (self.fault == .short) slots - 1 else slots);
         if (!try glm.mm.matmulStrided(&k, self.p.rig.s, self.p.x, sh.k + 8, self.p.w, self.out + slot * sh.n * self.eb(), ldo, sh.rows, self.p.wide, true)) return error.NotStrided;
@@ -103,7 +104,7 @@ pub const Slot = struct {
     /// The prompt call as fill makes it without the switch: the parent's fp32 rows, then tf_glm_put_slot into slot 8.
     pub fn replaced(self: *Slot) ![]const u8 {
         const sh = self.p.d.?.shape;
-        const k = self.kernels();
+        const k = self.kernels(true);
         try glm.mm.matmul(&k, self.p.rig.s, self.p.x, sh.k + 8, self.p.w, self.sy, 0, sh.rows, true, true);
         try self.p.rig.zero(self.ey, self.count() * self.eb());
         var a: cuda.Args = .{};
@@ -150,11 +151,11 @@ pub const Slot = struct {
     }
 };
 
-/// Every width in fp32 and bf16 slots, and two controls: a 4-bit bf16 call a slot short, a bf16 weight's in slot 7.
-pub fn cases(out: *[10]Slot, rig: Rig, kernels: *const glm.mm.Kernels, put: cuda.Function) void {
-    const bits = [10]u8{ 16, 4, 6, 8, 16, 4, 6, 8, 4, 16 };
+/// Every width in fp32 and bf16 slots, fast 4 bits, two controls: 4-bit bf16 rows a slot short, bf16 weights in slot 7.
+pub fn cases(out: *[11]Slot, rig: Rig, kernels: *const glm.mm.Kernels, fast: *const glm.mm.Kernels, put: cuda.Function) void {
+    const bits = [11]u8{ 16, 4, 6, 8, 16, 4, 6, 8, 4, 16, 4 };
     for (out, bits, 0..) |*x, b, i| x.* = .{
-        .p = .{ .rig = rig, .kernels = kernels, .bits = b, .wide = i >= 4 and i != 8 },
+        .p = .{ .rig = rig, .kernels = if (i == 10) fast else kernels, .plain = if (i == 10) kernels else null, .bits = b, .wide = i >= 4 and i != 8 and i != 10 },
         .put = put,
         .fault = if (i == 8) .short else if (i == 9) .seventh else .none,
     };

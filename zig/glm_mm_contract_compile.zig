@@ -11,7 +11,7 @@ export fn compileGlmMmContract(gpu: *const gate.Gpu) void {
 fn compile(gpu: gate.Gpu) !void {
     var stream = try cuda.Stream.init(gpu.d, false);
     defer stream.deinit();
-    var prompts = try gate.Prompts.init(gpu);
+    var prompts = try gate.Prompts.init(gpu, try cuda.Module.load(gpu.d, &.{})); // analyzed only: no images
     defer prompts.deinit();
     var kernels: std.ArrayList(g.Kernel) = .empty;
     defer kernels.deinit(gpu.gpa);

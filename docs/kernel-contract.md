@@ -444,6 +444,10 @@ replacements of their parent prompt kernel's fp32 rows put into slot 8 of nine b
 slot buffer (the other slots must stay zero), with NaN and infinities checked byte for byte. Two controls must fail:
 rows a slot short of the slot stride (4-bit, bf16) and the shared expert written to slot 7 (bf16 weights, fp32).
 Their launch records are pending with the two-stage ones.
+`TF_GLM_MM_FAST4`'s `glm_mm4_128s2f` registers in bf16 and fp32 as a byte replacement of `glm_mm4_128s2`, and
+`glm_mm4_128s2f_ld` with the shared-slot cases (bf16 slots, parent `glm_mm4_128s2`). Its control,
+`tf_ctl_glm_mm4_128s2f_swap` in the controls image, swaps each B pair's halves and must fail the byte gate; the
+host checks every byte of codes against `codes16` and `bpairs<4>`, including +0 for code 8.
 
 nvcc allocates registers differently from one release to the next, so the CUDA records are kept per release.
 `registry.cuda` holds what nvcc 13.0 compiles, the compiler of the release fatbins. `registry.cuda_sets` lists what

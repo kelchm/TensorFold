@@ -507,7 +507,7 @@ fn registered(gpu: check.Gpu, only: []const []const u8, t0: *i96) !g.Tally {
     for (&wrows) |*x| try kernels.append(a, x.kernel());
     var glm_glue = try cuda.Module.load(gpu.d, kk.glm_glue);
     defer glm_glue.unload();
-    var glm_prompts = try @import("contract_glm_mm.zig").Prompts.init(gpu);
+    var glm_prompts = try @import("contract_glm_mm.zig").Prompts.init(gpu, mods[5]);
     defer glm_prompts.deinit();
     try glm_prompts.append(gpu, s, &kernels);
     var f32ws: [6]f32w_k.F32w = undefined;
