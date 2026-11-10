@@ -195,6 +195,7 @@ test "GLM FP8 KV: actual DSA dense and sparse passes retain the sequence-owned s
     inline for (@typeInfo(glue.Kernels).@"struct".field_names) |name| if (@FieldType(glue.Kernels, name) == cuda.Function) {
         @field(ks, name) = .{ .d = &d, .handle = @ptrFromInt(10) };
     };
+    ks.dense_prune = true;
     ks.lat_write_fp8.handle = @ptrFromInt(2);
     ks.chunks_16_fp8.handle = @ptrFromInt(4);
     ks.merge.handle = @ptrFromInt(7);
@@ -243,6 +244,7 @@ test "GLM KV host: a prompt MTP chunk's pooled keys take their own page stride, 
     inline for (@typeInfo(glue.Kernels).@"struct".field_names) |name| if (@FieldType(glue.Kernels, name) == cuda.Function) {
         @field(ks, name) = .{ .d = &d, .handle = @ptrFromInt(10) };
     };
+    ks.dense_prune = true;
     ks.lat_write.handle = @ptrFromInt(1);
     ks.pool_keys.handle = @ptrFromInt(8);
     ks.scores.handle = @ptrFromInt(9);

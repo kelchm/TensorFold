@@ -83,6 +83,7 @@ pub const Kernels = struct {
     latent_mma_nk: cuda.Function,
     hc_split: bool = true, // TF_GLM_HC_SPLIT: a decode window's hc_finish on the split schedule (the same bits)
     hc_part: bool = true, // TF_GLM_HC_PART: a decode window to hc_part_rows rows takes tf_glm_hc_partial8_o2 (the same bits)
+    dense_prune: bool = true, // TF_GLM_DENSE_PRUNE: dense attention skips the rows sparse attention writes (dsa_block)
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
@@ -93,6 +94,7 @@ pub const Kernels = struct {
         const env = @import("sys").environment;
         k.hc_split = env.read(bool, "TF_GLM_HC_SPLIT", true) catch true;
         k.hc_part = env.read(bool, "TF_GLM_HC_PART", true) catch true;
+        k.dense_prune = env.read(bool, "TF_GLM_DENSE_PRUNE", true) catch true;
         try k.bmm_tile.allowDynamicShared(bmm_tile_smem);
         try k.bmm_tile1.allowDynamicShared(bmm_tile1_smem[1]);
         try k.chunks_16.allowDynamicShared(chunksSmem(16));

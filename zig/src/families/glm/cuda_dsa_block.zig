@@ -101,6 +101,13 @@ pub fn sparseRows(l: Layer, host_pos: usize, rows: usize) bool {
     return host_pos + rows - 1 >= l.dense_limit;
 }
 
+/// Leading rows dense attention takes; `prune` (TF_GLM_DENSE_PRUNE): those before the limit (sparse writes the rest).
+pub fn denseRows(l: Layer, host_pos: usize, rows: usize, prune: bool) usize {
+    if (host_pos >= l.dense_limit) return 0;
+    if (!prune or l.dense_limit < sparse.width) return rows;
+    return @min(rows, l.dense_limit - host_pos);
+}
+
 /// The block's row-by-row part for a shared window: projections, norms, q_b, indexer, absorbed query, `qi`'s query.
 pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, qi: bool) !void {
     return prepareProfile(set, stream, l, s, x, x_stride, rows, qi, null);
@@ -138,13 +145,14 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
     try writeKeys(k, stream, l, c, v, rows, pos);
     const t, const tk = try tables(l, c);
     const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(l.qk), -0.5));
-    if (host_pos < l.dense_limit) {
+    const dense_rows = denseRows(l, host_pos, rows, k.set.glue.dense_prune);
+    if (dense_rows > 0) {
         const stamp = prof.span(k.prof, stream, .mla);
         var dc = c;
         if (c.pks != 0) if (kv_host.active) |*g| { // host rows: the visible ones, in order, into the slots
             dc = .{ .lc = try g.visible(k.ops, stream, c.lc, c.pt, t.page_rows, pos, rows, l.dense_limit + rows), .ik = c.ik, .ig = c.ig, .pk = c.pk, .pk_rows = c.pk_rows };
         };
-        try denseAttention(k, stream, l, dc, v, pos, rows, nch, part_rows, scale);
+        try denseAttention(k, stream, l, dc, v, pos, rows, dense_rows, nch, part_rows, scale);
         stamp.end();
     }
     if (sparseRows(l, host_pos, rows)) {
@@ -198,7 +206,7 @@ fn attendLastRow(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratc
         at = v.at;
     }
     const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(l.qk), -0.5));
-    if (host_pos < l.dense_limit) { // the same keys today's whole-chunk call read for this row
+    if (r0 < denseRows(l, host_pos, rows, k.set.glue.dense_prune)) { // the keys the whole-chunk call reads for it
         var stamp = prof.span(k.prof, stream, .mla);
         try latent.attentionFormat(k.set, stream, v.qa, c.lc, c.ls, .{ .pt = c.pt, .ps = c.ps }, at, v.partials, v.ol, v.dummy, 1, l.heads, l.lw, nch, scale, latent.headBlock(rows));
         stamp.end();
@@ -212,12 +220,12 @@ fn attendLastRow(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratc
     }
 }
 
-/// forward.dense_attention: latent.attention in `part_rows`-row blocks, each at its first row's position.
-fn denseAttention(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, pos: u64, rows: usize, nch: usize, part_rows: usize, scale: f32) !void {
+/// forward.dense_attention: the first `dense_rows` in `part_rows`-row blocks at their positions; `rows`' head block.
+pub fn denseAttention(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, pos: u64, rows: usize, dense_rows: usize, nch: usize, part_rows: usize, scale: f32) !void {
     const hb = latent.headBlock(rows);
     var r0: usize = 0;
-    while (r0 < rows) : (r0 += part_rows) {
-        const n = @min(part_rows, rows - r0);
+    while (r0 < dense_rows) : (r0 += part_rows) {
+        const n = @min(part_rows, dense_rows - r0);
         var at = pos;
         if (r0 > 0) {
             var a: cuda.Args = .{};
