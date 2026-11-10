@@ -337,3 +337,24 @@ pub const PoolKeys = struct {
         };
     }
 };
+
+/// The latent write and the pooled keys on the heap, so the kernels' contexts keep their address; registered in order.
+pub const Writes = struct {
+    lat: LatWrite,
+    pool: PoolKeys,
+
+    pub fn create(a: std.mem.Allocator, gpu: @import("check.zig").Gpu, s: cuda.Stream, lat_write: cuda.Function, pool_keys: cuda.Function, kernels: *std.ArrayList(g.Kernel)) !*Writes {
+        const self = try a.create(Writes);
+        errdefer a.destroy(self);
+        self.* = .{ .lat = .{ .rig = .{ .gpu = gpu, .s = s }, .f = lat_write }, .pool = .{ .rig = .{ .gpu = gpu, .s = s }, .f = pool_keys } };
+        try kernels.append(a, self.lat.kernel());
+        try kernels.append(a, self.pool.kernel());
+        return self;
+    }
+
+    pub fn destroy(self: *Writes, a: std.mem.Allocator) void {
+        self.pool.deinit();
+        self.lat.deinit();
+        a.destroy(self);
+    }
+};
