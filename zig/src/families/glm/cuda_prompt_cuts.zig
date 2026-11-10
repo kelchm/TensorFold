@@ -32,9 +32,9 @@ pub fn below(cuts: []const u32, at: u32) u64 {
     return if (grid) 0 else h.final() | 1;
 }
 
-/// Rank 0's step rows from `start` (Leader.chunk): a solo or paired step's if `wide`, else to the next cut.
-pub fn leaderRows(len: usize, cuts: []const u32, start: usize, wide: bool) usize {
-    return if (wide) state.solo_rows else nextCut(len, cuts, start) - start;
+/// Rank 0's step rows from `start` (Leader.chunk): a solo or paired step's `wide_rows` if above 0, else to the next cut.
+pub fn leaderRows(len: usize, cuts: []const u32, start: usize, wide_rows: usize) usize {
+    return if (wide_rows > 0) wide_rows else nextCut(len, cuts, start) - start;
 }
 
 /// A sequence's request chunk starts (TF_GLM_REQUEST_STARTS) into `list`: ascending and after 0, else error.BadCuts.
@@ -169,14 +169,16 @@ test "glm request starts: rank 0's step rows (Leader.chunk) are the rows each ot
         var steps: usize = 0;
         while (start < c.len) : (steps += 1) {
             const left = c.len - start;
-            const n = leaderRows(c.len, c.cuts, start, false);
-            try std.testing.expectEqual(@min(left, n), try stepRows(c.len, c.cuts, start, @min(left, n + 1)));
-            const w = leaderRows(c.len, c.cuts, start, true); // a solo or paired step: two grid steps left
-            if (start + prefill_rows + 1 < c.len) { // prompt_solo.takesTwo; with starts rank 0 never steps wide
-                const wide = stepRows(c.len, c.cuts, start, @min(left, w + 1));
-                if (c.cuts.len > 0) {
-                    try std.testing.expectError(error.BadChunk, wide);
-                } else try std.testing.expectEqual(@min(left, w), try wide);
+            const n = leaderRows(c.len, c.cuts, start, 0);
+            try std.testing.expectEqual(@min(left, n), try stepRows(c.len, c.cuts, start, @min(left, n + 1), 2 * prefill_rows));
+            for ([_]usize{ 2 * prefill_rows, 4 * prefill_rows }) |width| { // a paired or solo step's rows
+                const w = leaderRows(c.len, c.cuts, start, width);
+                if (start + prefill_rows + 1 < c.len) { // prompt_solo.takesChunks; with starts rank 0 never steps wide
+                    const wide = stepRows(c.len, c.cuts, start, @min(left, w + 1), width);
+                    if (c.cuts.len > 0) {
+                        try std.testing.expectError(error.BadChunk, wide);
+                    } else try std.testing.expectEqual(@min(left, w), try wide);
+                }
             }
             start += @min(left, n);
         }

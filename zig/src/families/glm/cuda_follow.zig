@@ -240,12 +240,13 @@ pub const Leader = struct {
         try x.send(.{ .kind = @backingInt(Kind.cuts) }, starts);
     }
 
-    /// One prompt step on every rank: to the next cut, or a wider solo or pair pass while `alone`.
+    /// One prompt step on every rank (Engine.prefillChunk): to the next cut, or a wider solo or pair pass while `alone`.
     pub fn chunk(x: Leader, ids: []const u32, start: usize, alone: bool, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !Chunk {
         if (start >= ids.len) return error.BadChunk;
         try x.flush();
         // a pair first: with TF_GLM_PROMPT_PAIR=solo it takes two solo chunks, else a solo chunk, else to the next cut
-        const n: usize = if (alone and prompt_pair.pairedAt(x.e, start, ids.len, from, marks)) 2 * x.e.pair.?.rows else if (alone and prompt_solo.at(x.e, start, ids.len, from, marks)) x.e.bp.rows else prompt_cuts.nextCut(ids.len, x.e.cur.cuts.items, start) - start;
+        const wide: usize = if (!alone) 0 else if (prompt_pair.pairedAt(x.e, start, ids.len, from, marks)) 2 * x.e.pair.?.rows else if (prompt_solo.at(x.e, start, ids.len, from, marks)) x.e.bp.rows else 0;
+        const n = prompt_cuts.leaderRows(ids.len, x.e.cur.cuts.items, start, wide);
         const part = ids[start..@min(ids.len, start + n + 1)];
         const split = sparse.splitAt(start, x.e.settings.index_split, x.e.share.world); // a paired step's chunks share it
         try x.send(.{ .kind = @backingInt(Kind.chunk), .flags = x.rows() | @as(u32, @intFromBool(split)) << 1, .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
