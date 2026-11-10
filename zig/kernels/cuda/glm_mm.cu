@@ -111,9 +111,20 @@ __device__ __forceinline__ void bpairs4_fast(const uint32_t* __restrict__ p, uin
     }
 }
 
-template <int BITS, int BM, int WM, int STAGES>
+// bpairs4_fast's pair i alone (SWAP: the control's): the wide kernels build a step's two pairs as they use them
+template <bool SWAP = false>
+__device__ __forceinline__ uint32_t pair4_fast(const uint32_t (&p)[2], int i) {
+    const uint32_t k136 = 0x43084308u, w = p[i >> 2], j = i & 3;
+    const uint32_t t = __byte_perm(w, w >> 4, SWAP ? (j + 4) | (j << 8) : j | ((j + 4) << 8));
+    const uint32_t a = (t & 0x000F000Fu) | 0x43004300u;
+    const __nv_bfloat162 d = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&a), *reinterpret_cast<const __nv_bfloat162*>(&k136));
+    return *reinterpret_cast<const uint32_t*>(&d);
+}
+
+// WN_ 2 (wide): 4 x 2 warps of 32 x 32, four column tiles a warp
+template <int BITS, int BM, int WM, int STAGES, int WN_ = 4>
 struct Tile {
-    static constexpr int WN = 4, BN = 64, NT = 2, MT = BM / WM / 16, THREADS = WM * WN * 32;
+    static constexpr int WN = WN_, BN = 64, NT = 8 / WN, MT = BM / WM / 16, THREADS = WM * WN * 32;
     static constexpr int WPC = BITS / 2;
     static constexpr int ROW = 128, CHUNKS = 8;               // a row's 64 inputs: 128 bytes, 8 chunks of 16
     static constexpr int X = BM * ROW;
@@ -124,11 +135,14 @@ struct Tile {
 };
 
 // ROWS_FIRST: row blocks fastest, so the blocks reading one weight tile run together and share it in L2 (prompts)
-template <int BITS, int BM, int WM, int STAGES, bool ROWS_FIRST = false, bool P2 = false, bool LD = false, int F4 = 0>
+template <int BITS, int BM, int WM, int STAGES, bool ROWS_FIRST = false, bool P2 = false, bool LD = false, int F4 = 0,
+          int WN = 4, bool SHB = false>  // WN 2: TF_GLM_MM_WIDE's 32 x 32 warp tiles; SHB: one decode a block
 __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, long long ldx,
         const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part,
         int f32, int M, int N, int K, int SK, long long ldo = 0) {
-    using T = Tile<BITS, BM, WM, STAGES>;
+    using T = Tile<BITS, BM, WM, STAGES, WN>;
+    constexpr bool WIDE = WN == 2;  // each output's same fragments, MMAs and scale FMAs; a warp's four column tiles
+    static_assert(!WIDE || (BITS == 4 && F4 != 0 && T::THREADS == 256), "wide: 4-bit fast pairs, a tile a warp");
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp / T::WN, wn = warp % T::WN;
@@ -261,6 +275,22 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
         const __half* ps = reinterpret_cast<const __half*>(p + T::X + T::W);
         uint32_t b[T::NT][8];
+        uint32_t pk[WIDE ? T::NT : 1][2];                     // wide, per warp: its tiles' packed words
+        uint2* db = reinterpret_cast<uint2*>(buf + T::SMEM);  // SHB: past the stages, [tile][step][lane] 8 KiB of pairs
+        if constexpr (WIDE && SHB) {                          // warp w: column tile w's pairs, then every warp reads them
+            uint32_t q[8];
+            bpairs4_fast<F4 == 2>(pw + tid * 2, q);
+#pragma unroll
+            for (int kt = 0; kt < 4; ++kt) db[(warp * 4 + kt) * 32 + lane] = make_uint2(q[2 * kt], q[2 * kt + 1]);
+            __syncthreads();
+        } else if constexpr (WIDE) {
+#pragma unroll
+            for (int j = 0; j < T::NT; ++j) {
+                const uint2 v = *reinterpret_cast<const uint2*>(pw + ((wn * T::NT + j) * 32 + lane) * 2);
+                pk[j][0] = v.x;
+                pk[j][1] = v.y;
+            }
+        } else
 #pragma unroll
         for (int j = 0; j < T::NT; ++j) {
             // F4 (4 bits): 1 takes bpairs4_fast's identical pairs, 2 their halves swapped (a planted control only)
@@ -278,6 +308,27 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
                 const int ch = kt * 2 + (lane >> 4);
                 ldmatrix4(a[i], p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
             }
+            if constexpr (WIDE) {                             // step kt's pairs 2 kt and 2 kt + 1, then bpairs' order
+                uint32_t bk[T::NT][2];
+#pragma unroll
+                for (int j = 0; j < T::NT; ++j) {
+                    if constexpr (SHB) {
+                        const uint2 v = db[((wn * T::NT + j) * 4 + kt) * 32 + lane];
+                        bk[j][0] = v.x;
+                        bk[j][1] = v.y;
+                    } else {
+                        bk[j][0] = pair4_fast<F4 == 2>(pk[j], 2 * kt);
+                        bk[j][1] = pair4_fast<F4 == 2>(pk[j], 2 * kt + 1);
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < T::NT; ++j)
+#pragma unroll
+                    for (int i = 0; i < T::MT; ++i) {
+                        if (kt == 0) mma0(d[i][j], a[i], bk[j][0], bk[j][1]);
+                        else mma(d[i][j], a[i], bk[j][0], bk[j][1]);
+                    }
+            } else
 #pragma unroll
             for (int j = 0; j < T::NT; ++j)
 #pragma unroll
@@ -401,6 +452,16 @@ extern "C" __global__ void __launch_bounds__(256, 2) glm_mm4_128s2f(const __nv_b
 extern "C" __global__ void __launch_bounds__(256, 2) glm_mm4_128s2f_ld(const __nv_bfloat16* __restrict__ x, long long ldx,
     const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part,
     int f32, int M, int N, int K, int SK, long long ldo) { mm_kernel<4, 128, 2, 2, false, true, true, 1>(x, ldx, w, s, out, part, f32, M, N, K, SK, ldo); }
+// TF_GLM_MM_WIDE: glm_mm4_128s2f's blocks and sums on 4 x 2 warps of 32 x 32; _128wb decodes once a block (SHB)
+#define GLM_MM_WIDE(NAME, SHB)                                                                                         \
+    extern "C" __global__ void __launch_bounds__(256, 2) NAME(const __nv_bfloat16* __restrict__ x, long long ldx,      \
+        const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part, \
+        int f32, int M, int N, int K, int SK) { mm_kernel<4, 128, 4, 2, false, true, false, 1, 2, SHB>(x, ldx, w, s, out, part, f32, M, N, K, SK); } \
+    extern "C" __global__ void __launch_bounds__(256, 2) NAME##_ld(const __nv_bfloat16* __restrict__ x, long long ldx,  \
+        const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part, \
+        int f32, int M, int N, int K, int SK, long long ldo) { mm_kernel<4, 128, 4, 2, false, true, true, 1, 2, SHB>(x, ldx, w, s, out, part, f32, M, N, K, SK, ldo); }
+GLM_MM_WIDE(glm_mm4_128w, false)
+GLM_MM_WIDE(glm_mm4_128wb, true)
 
 // -- tiling at load: ops.cu's packed rows and fp16 scales [N][K / 64] -> the tiled chunks and scales ---------------
 template <int BITS>

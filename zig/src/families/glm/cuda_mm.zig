@@ -62,11 +62,16 @@ pub const Chain = struct {
     }
 };
 
+/// TF_GLM_MM_WIDE (0, 1, block): 4-bit prompts on 32 x 32 warp tiles; .warp: glm_mm4_128w, .block: glm_mm4_128wb.
+pub const Wide = enum(u8) { off, warp, block };
+
 /// glm_mm's bf16 kernels by row bucket, the K-slice reduce and the tiling.
 pub const Kernels = struct {
     by_rows: [4]cuda.Function, // bf16: 16, 32, 64, 128 rows a block
     packed_rows: [3][4]cuda.Function, // 4, 6 and 8 bits, as by_rows
-    packed_prompt: [3]cuda.Function, // glm_mm4/6/8_128s2: two stages, the same sums (TF_GLM_MM_FAST4: glm_mm4_128s2f)
+    packed_prompt: [3]cuda.Function, // glm_mm4/6/8_128s2: two stages, the same sums (4 bits: promptSymbol's)
+    prompt_symbols: [3][:0]const u8 = .{ "glm_mm4_128s2", "glm_mm6_128s2", "glm_mm8_128s2" }, // packed_prompt's
+    wide: Wide = .off, // TF_GLM_MM_WIDE: packed_prompt[0] and its strided form are wide (promptShared)
     prompt: cuda.Function, // 128-row blocks, row blocks fastest: a prompt's blocks share each weight tile in L2
     reduce: cuda.Function,
     tile: cuda.Function,
@@ -79,7 +84,8 @@ pub const Kernels = struct {
     pub fn load(m: cuda.Module) !Kernels {
         const env = @import("sys").environment;
         const fast4 = env.read(bool, "TF_GLM_MM_FAST4", false) catch false;
-        var k: Kernels = .{ .by_rows = undefined, .packed_rows = undefined, .packed_prompt = undefined, .tile_packed = undefined, .prompt = try m.function("glm_mm16_rows"), .reduce = try m.function("glm_mm_reduce"), .tile = try m.function("glm_mm_tile16"), .pdl = true };
+        const wide: Wide = @fromBackingInt(@intCast(env.read(usize, "TF_GLM_MM_WIDE", 0) catch 0));
+        var k: Kernels = .{ .by_rows = undefined, .packed_rows = undefined, .packed_prompt = undefined, .tile_packed = undefined, .prompt = try m.function("glm_mm16_rows"), .reduce = try m.function("glm_mm_reduce"), .tile = try m.function("glm_mm_tile16"), .pdl = true, .wide = wide };
         inline for (.{ "glm_mm16_16", "glm_mm16_32", "glm_mm16_64", "glm_mm16_128" }, 0..) |name, i| {
             k.by_rows[i] = try m.function(name);
             try k.by_rows[i].allowDynamicShared(smem(bucket(i)));
@@ -90,21 +96,35 @@ pub const Kernels = struct {
                 try k.packed_rows[wi][i].allowDynamicShared(sharedBytes(b, bm));
             }
             k.tile_packed[wi] = try m.function(std.fmt.comptimePrint("glm_mm_tile{d}", .{b}));
-            k.packed_prompt[wi] = try m.function(promptSymbol(b, fast4, ""));
-            try k.packed_prompt[wi].allowDynamicShared(sharedBytesStages(b, 128, 2));
+            k.prompt_symbols[wi] = promptSymbol(b, fast4, wide, "");
+            k.packed_prompt[wi] = try m.function(k.prompt_symbols[wi]);
+            try k.packed_prompt[wi].allowDynamicShared(promptShared(b, wide));
         }
         try k.prompt.allowDynamicShared(smem(128));
         if (std.c.getenv("TF_GLM_PDL")) |v| k.pdl = !std.mem.eql(u8, std.mem.span(v), "0");
         k.chain = if (k.pdl) Chain.read() else .{}; // TF_GLM_PDL=0: none past glm_mm's either
-        if (env.read(bool, "TF_GLM_SHARED_SLOT", false) catch false) k.strided = try Strided.load(m, fast4);
+        if (env.read(bool, "TF_GLM_SHARED_SLOT", false) catch false) k.strided = try Strided.load(m, fast4, wide);
         return k;
     }
 };
 
-/// A packed prompt kernel's symbol: glm_mm{bits}_128s2{suffix}, 4 bits' with TF_GLM_MM_FAST4 glm_mm4_128s2f{suffix}.
-pub fn promptSymbol(comptime bits: u8, fast4: bool, comptime suffix: []const u8) [:0]const u8 {
+/// A packed prompt kernel's symbol: glm_mm{bits}_128s2{suffix}; 4 bits' TF_GLM_MM_WIDE's, else TF_GLM_MM_FAST4's.
+pub fn promptSymbol(comptime bits: u8, fast4: bool, wide: Wide, comptime suffix: []const u8) [:0]const u8 {
     const plain = std.fmt.comptimePrint("glm_mm{d}_128s2{s}", .{ bits, suffix });
-    return if (bits == 4 and fast4) "glm_mm4_128s2f" ++ suffix else plain;
+    if (bits != 4) return plain;
+    return switch (wide) {
+        .warp => "glm_mm4_128w" ++ suffix,
+        .block => "glm_mm4_128wb" ++ suffix,
+        .off => if (fast4) "glm_mm4_128s2f" ++ suffix else plain,
+    };
+}
+
+/// glm_mm4_128wb's decoded pairs past its stages: 8 column tiles, 4 steps of 32 lanes, two words each.
+const wide_block_bytes: u32 = 8 * 4 * 32 * 8;
+
+/// A packed prompt launch's shared memory: two stages, and glm_mm4_128wb's decoded pairs.
+pub fn promptShared(bits: u8, wide: Wide) u32 {
+    return sharedBytesStages(bits, 128, 2) + if (bits == 4 and wide == .block) wide_block_bytes else 0;
 }
 
 /// The prompt kernels into output rows `ldo` elements apart: glm_mm16_rows_ld and glm_mm4/6/8_128s2_ld.
@@ -112,12 +132,12 @@ pub const Strided = struct {
     prompt: cuda.Function,
     packed_prompt: [3]cuda.Function,
 
-    pub fn load(m: cuda.Module, fast4: bool) !Strided {
+    pub fn load(m: cuda.Module, fast4: bool, wide: Wide) !Strided {
         var st: Strided = .{ .prompt = try m.function("glm_mm16_rows_ld"), .packed_prompt = undefined };
         try st.prompt.allowDynamicShared(smem(128));
         inline for (widths[1..], 0..) |b, wi| {
-            st.packed_prompt[wi] = try m.function(promptSymbol(b, fast4, "_ld"));
-            try st.packed_prompt[wi].allowDynamicShared(sharedBytesStages(b, 128, 2));
+            st.packed_prompt[wi] = try m.function(promptSymbol(b, fast4, wide, "_ld"));
+            try st.packed_prompt[wi].allowDynamicShared(promptShared(b, wide));
         }
         return st;
     }
@@ -187,7 +207,7 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
         if (big and wi == 0) {
             try cuda.launch.launch(k.prompt, .{ .grid = .{ .x = row_blocks, .y = cols }, .block = .{ .x = 256 }, .shared = smem(128), .pdl = k.pdl }, s, &a);
         } else if (big) { // packed prompts: 128-row blocks in two stages, the three-stage kernel's sums
-            try cuda.launch.launch(k.packed_prompt[wi - 1], .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = 256 }, .shared = sharedBytesStages(w.bits, bm, 2), .pdl = k.pdl }, s, &a);
+            try cuda.launch.launch(k.packed_prompt[wi - 1], .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = 256 }, .shared = promptShared(w.bits, k.wide), .pdl = k.pdl }, s, &a);
         } else {
             const f = if (wi == 0) k.by_rows[i] else k.packed_rows[wi - 1][i];
             try cuda.launch.launch(f, .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = if (bm <= 32) 128 else 256 }, .shared = sharedBytes(w.bits, bm), .pdl = k.pdl }, s, &a);
@@ -228,7 +248,7 @@ pub fn matmulStrided(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: T
     if (wi == 0) {
         try cuda.launch.launch(st.prompt, .{ .grid = .{ .x = row_blocks, .y = cols }, .block = .{ .x = 256 }, .shared = smem(128), .pdl = k.pdl }, s, &a);
     } else {
-        try cuda.launch.launch(st.packed_prompt[wi - 1], .{ .grid = .{ .x = cols, .y = row_blocks }, .block = .{ .x = 256 }, .shared = sharedBytesStages(w.bits, 128, 2), .pdl = k.pdl }, s, &a);
+        try cuda.launch.launch(st.packed_prompt[wi - 1], .{ .grid = .{ .x = cols, .y = row_blocks }, .block = .{ .x = 256 }, .shared = promptShared(w.bits, k.wide), .pdl = k.pdl }, s, &a);
     }
     return true;
 }

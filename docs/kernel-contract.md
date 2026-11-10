@@ -448,6 +448,10 @@ Their launch records are pending with the two-stage ones.
 `glm_mm4_128s2f_ld` with the shared-slot cases (bf16 slots, parent `glm_mm4_128s2`). Its control,
 `tf_ctl_glm_mm4_128s2f_swap` in the controls image, swaps each B pair's halves and must fail the byte gate; the
 host checks every byte of codes against `codes16` and `bpairs<4>`, including +0 for code 8.
+`TF_GLM_MM_WIDE`'s `glm_mm4_128w` and `glm_mm4_128wb` register the same way in bf16 and fp32 as byte replacements
+of `glm_mm4_128s2`, and their `_ld` forms with the shared-slot cases (bf16 slots). Their controls in the controls
+image, `tf_ctl_glm_mm4_128w_swap` and `tf_ctl_glm_mm4_128wb_swap`, swap each B pair's halves, the per-step pairs of
+`pair4_fast` and the block's shared pairs, and must fail the byte gate.
 
 nvcc allocates registers differently from one release to the next, so the CUDA records are kept per release.
 `registry.cuda` holds what nvcc 13.0 compiles, the compiler of the release fatbins. `registry.cuda_sets` lists what

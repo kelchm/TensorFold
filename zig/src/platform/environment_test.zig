@@ -53,6 +53,8 @@ const valid = [_]Case{
     .{ .name = "TF_GLM_DENSE_PRUNE", .raw = "0", .n = 0 },
     .{ .name = "TF_GLM_SHARED_SLOT", .raw = "1", .n = 1 },
     .{ .name = "TF_GLM_MM_FAST4", .raw = "1", .n = 1 },
+    .{ .name = "TF_GLM_MM_WIDE", .raw = "1", .n = 1 },
+    .{ .name = "TF_GLM_MM_WIDE", .raw = "block", .n = 2 },
     .{ .name = "TF_GLM_KDA_STEP_WARPS", .raw = "auto", .n = 0 },
     .{ .name = "TF_GLM_KDA_STEP_WARPS", .raw = "2", .n = 3 },
     .{ .name = "TF_GLM_PDL_CHAIN", .raw = "1", .n = 8 },

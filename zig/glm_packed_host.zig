@@ -50,6 +50,14 @@ test "glm packed: two-stage prompt geometry is registered without claiming unmea
         try t.expectEqualStrings(if (symbol[0] == 't') "contract_controls" else "glm_mm", r.launch.image);
         try t.expectEqual(registry.none, registry.usageFor(r, .{ .major = 13, .minor = 3 }));
     }
+    for ([_][]const u8{ "glm_mm4_128w", "glm_mm4_128w_ld", "tf_ctl_glm_mm4_128w_swap", "glm_mm4_128wb", "glm_mm4_128wb_ld", "tf_ctl_glm_mm4_128wb_swap" }, 0..) |symbol, i| { // TF_GLM_MM_WIDE
+        const r = try record(symbol);
+        try t.expectEqual(glm.mm.promptShared(4, if (i < 3) .warp else .block), r.launch.dynamic);
+        try t.expectEqual(@as(u32, 256), r.launch.threads);
+        try t.expectEqualStrings(if (symbol[0] == 't') "contract_controls" else "glm_mm", r.launch.image);
+        try t.expect(r.launch.opt_in and !r.geometry_pending);
+        try t.expectEqual(registry.none, registry.usageFor(r, .{ .major = 13, .minor = 3 }));
+    }
     const ld = try record("glm_mm16_rows_ld"); // TF_GLM_SHARED_SLOT: glm_mm16_rows' launch, its usage pending
     const parent = try record("glm_mm16_rows");
     try t.expectEqual(parent.launch.dynamic, ld.launch.dynamic);

@@ -57,7 +57,8 @@ pub const Product = struct {
     bits: u8,
     wide: bool,
     drop_tail: bool = false,
-    plain: ?*const glm.mm.Kernels = null, // TF_GLM_MM_FAST4: `kernels` hold glm_mm4_128s2f (or a control), these its parent
+    plain: ?*const glm.mm.Kernels = null, // TF_GLM_MM_FAST4, _WIDE: `kernels` hold `symbol` (or a control), these its parent
+    symbol: []const u8 = "glm_mm4_128s2f", // with `plain`: the replacement glm_mm4_128s2 has
     swap: bool = false, // the control: B pairs' halves swapped
     d: ?Dense = null,
     x: u64 = 0,
@@ -74,7 +75,8 @@ pub const Product = struct {
 
     pub fn kernel(self: *Product) !g.Kernel {
         const lead = if (self.drop_tail) "control: dropped prompt row " else if (self.swap) "control: B pairs' halves swapped " else "cuda ";
-        const name = try std.fmt.bufPrint(&self.name, "{s}glm_mm{d}_128s2{s} {s}", .{ lead, self.bits, if (self.plain != null) "f" else "", if (self.wide) "fp32" else "bf16" });
+        const out = if (self.wide) "fp32" else "bf16";
+        const name = if (self.plain != null) try std.fmt.bufPrint(&self.name, "{s}{s} {s}", .{ lead, self.symbol, out }) else try std.fmt.bufPrint(&self.name, "{s}glm_mm{d}_128s2 {s}", .{ lead, self.bits, out });
         const parent = try std.fmt.bufPrint(&self.parent, "glm_mm{d}_128{s}", .{ self.bits, if (self.plain != null) "s2" else "" });
         return .{ .spec = .{
             .name = name,
@@ -177,7 +179,7 @@ pub const Product = struct {
     }
 
     pub fn replaced(self: *Product) ![]const u8 {
-        if (self.plain) |k| { // glm_mm4_128s2f: its two-stage parent
+        if (self.plain) |k| { // glm_mm4_128s2f, _128w, _128wb: their two-stage parent
             try self.launch(k.packed_prompt[(self.bits - 4) / 2], self.base, self.d.?.shape.rows, 2);
             return self.rig.bytes(self.base, self.count() * @as(usize, if (self.wide) 4 else 2));
         }
@@ -204,9 +206,12 @@ pub const Prompts = struct {
     kernels: glm.mm.Kernels, // the parents, and TF_GLM_SHARED_SLOT's kernels, whatever the environment says
     fast: glm.mm.Kernels, // TF_GLM_MM_FAST4's: glm_mm4_128s2f and glm_mm4_128s2f_ld
     swapped: glm.mm.Kernels, // the fast decode's planted control, tf_ctl_glm_mm4_128s2f_swap
+    wides: [2]glm.mm.Kernels, // TF_GLM_MM_WIDE's: glm_mm4_128w and glm_mm4_128wb, with their _ld forms
+    wide_controls: [2]glm.mm.Kernels, // their planted controls, tf_ctl_glm_mm4_128w_swap and tf_ctl_glm_mm4_128wb_swap
     cases: [12]Product = undefined,
     fasts: [3]Product = undefined,
-    slots: [11]slot_k.Slot = undefined,
+    wide_cases: [6]Product = undefined,
+    slots: [13]slot_k.Slot = undefined,
 
     /// `controls`: the planted-controls image (fatbin_contract_controls).
     pub fn init(gpu: check.Gpu, controls: cuda.Module) !Prompts {
@@ -216,17 +221,29 @@ pub const Prompts = struct {
         errdefer ops.unload();
         const smem = glm.mm.sharedBytesStages(4, 128, 2);
         var k = try glm.mm.Kernels.load(m);
+        k.wide = .off;
         k.packed_prompt[0] = try m.function("glm_mm4_128s2");
         try k.packed_prompt[0].allowDynamicShared(smem);
-        k.strided = try glm.mm.Strided.load(m, false);
+        k.strided = try glm.mm.Strided.load(m, false, .off);
         var fast = k;
         fast.packed_prompt[0] = try m.function("glm_mm4_128s2f");
         try fast.packed_prompt[0].allowDynamicShared(smem);
-        fast.strided = try glm.mm.Strided.load(m, true);
+        fast.strided = try glm.mm.Strided.load(m, true, .off);
         var swapped = k;
         swapped.packed_prompt[0] = try controls.function("tf_ctl_glm_mm4_128s2f_swap");
         try swapped.packed_prompt[0].allowDynamicShared(smem);
-        return .{ .module = m, .ops = ops, .kernels = k, .fast = fast, .swapped = swapped };
+        var wides: [2]glm.mm.Kernels = .{ k, k };
+        var wide_controls: [2]glm.mm.Kernels = .{ k, k };
+        for ([_]glm.mm.Wide{ .warp, .block }, &wides, &wide_controls, [_][:0]const u8{ "tf_ctl_glm_mm4_128w_swap", "tf_ctl_glm_mm4_128wb_swap" }) |v, *wk, *ck, control| {
+            wk.wide = v;
+            wk.packed_prompt[0] = try m.function(glm.mm.promptSymbol(4, false, v, ""));
+            try wk.packed_prompt[0].allowDynamicShared(glm.mm.promptShared(4, v));
+            wk.strided = try glm.mm.Strided.load(m, false, v);
+            ck.* = wk.*;
+            ck.packed_prompt[0] = try controls.function(control);
+            try ck.packed_prompt[0].allowDynamicShared(glm.mm.promptShared(4, v));
+        }
+        return .{ .module = m, .ops = ops, .kernels = k, .fast = fast, .swapped = swapped, .wides = wides, .wide_controls = wide_controls };
     }
 
     pub fn append(self: *Prompts, gpu: check.Gpu, s: cuda.Stream, kernels: *std.ArrayList(g.Kernel)) !void {
@@ -234,13 +251,19 @@ pub const Prompts = struct {
         for (&self.cases) |*p| try kernels.append(gpu.gpa, try p.kernel());
         for (&self.fasts, 0..) |*p, i| p.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kernels = if (i == 2) &self.swapped else &self.fast, .plain = &self.kernels, .bits = 4, .wide = i == 1, .swap = i == 2 };
         for (&self.fasts) |*p| try kernels.append(gpu.gpa, try p.kernel());
-        slot_k.cases(&self.slots, .{ .gpu = gpu, .s = s }, &self.kernels, &self.fast, try self.ops.function("tf_glm_put_slot"));
+        for (&self.wide_cases, 0..) |*p, i| { // each wide kernel in bf16 and fp32, then its control (bf16)
+            const v = i / 3;
+            p.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kernels = if (i % 3 == 2) &self.wide_controls[v] else &self.wides[v], .plain = &self.kernels, .symbol = if (v == 0) "glm_mm4_128w" else "glm_mm4_128wb", .bits = 4, .wide = i % 3 == 1, .swap = i % 3 == 2 };
+            try kernels.append(gpu.gpa, try p.kernel());
+        }
+        slot_k.cases(&self.slots, .{ .gpu = gpu, .s = s }, &self.kernels, &self.fast, &self.wides, try self.ops.function("tf_glm_put_slot"));
         for (&self.slots) |*p| try kernels.append(gpu.gpa, try p.kernel());
     }
 
     pub fn deinit(self: *Prompts) void {
         for (&self.cases) |*p| p.deinit();
         for (&self.fasts) |*p| p.deinit();
+        for (&self.wide_cases) |*p| p.deinit();
         for (&self.slots) |*p| p.deinit();
         self.ops.unload();
         self.module.unload();

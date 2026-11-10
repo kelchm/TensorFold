@@ -110,9 +110,35 @@ test "TF_GLM_SHARED_SLOT: a one-launch call takes its strided kernel and grid wi
 }
 
 test "TF_GLM_MM_FAST4: 4-bit prompt kernels take the f symbols, every other width its own" {
-    try std.testing.expectEqualStrings("glm_mm4_128s2f", mm.promptSymbol(4, true, ""));
-    try std.testing.expectEqualStrings("glm_mm4_128s2f_ld", mm.promptSymbol(4, true, "_ld"));
-    try std.testing.expectEqualStrings("glm_mm4_128s2", mm.promptSymbol(4, false, ""));
-    try std.testing.expectEqualStrings("glm_mm6_128s2_ld", mm.promptSymbol(6, true, "_ld"));
-    try std.testing.expectEqualStrings("glm_mm8_128s2", mm.promptSymbol(8, true, ""));
+    try std.testing.expectEqualStrings("glm_mm4_128s2f", mm.promptSymbol(4, true, .off, ""));
+    try std.testing.expectEqualStrings("glm_mm4_128s2f_ld", mm.promptSymbol(4, true, .off, "_ld"));
+    try std.testing.expectEqualStrings("glm_mm4_128s2", mm.promptSymbol(4, false, .off, ""));
+    try std.testing.expectEqualStrings("glm_mm6_128s2_ld", mm.promptSymbol(6, true, .off, "_ld"));
+    try std.testing.expectEqualStrings("glm_mm8_128s2", mm.promptSymbol(8, true, .off, ""));
+}
+
+test "TF_GLM_MM_WIDE: 4-bit prompts take glm_mm4_128w or _128wb over the f symbols, with _128wb's decoded pairs" {
+    for ([_]bool{ false, true }) |fast4| {
+        try std.testing.expectEqualStrings("glm_mm4_128w", mm.promptSymbol(4, fast4, .warp, ""));
+        try std.testing.expectEqualStrings("glm_mm4_128w_ld", mm.promptSymbol(4, fast4, .warp, "_ld"));
+        try std.testing.expectEqualStrings("glm_mm4_128wb", mm.promptSymbol(4, fast4, .block, ""));
+        try std.testing.expectEqualStrings("glm_mm4_128wb_ld", mm.promptSymbol(4, fast4, .block, "_ld"));
+        try std.testing.expectEqualStrings("glm_mm6_128s2", mm.promptSymbol(6, fast4, .block, ""));
+        try std.testing.expectEqualStrings("glm_mm8_128s2_ld", mm.promptSymbol(8, fast4, .warp, "_ld"));
+    }
+    try std.testing.expectEqual(mm.sharedBytesStages(4, 128, 2), mm.promptShared(4, .warp));
+    try std.testing.expectEqual(mm.sharedBytesStages(4, 128, 2) + 8192, mm.promptShared(4, .block));
+    try std.testing.expectEqual(mm.sharedBytesStages(6, 128, 2), mm.promptShared(6, .block));
+    var k = kernels;
+    for ([_]mm.Wide{ .warp, .block }) |wide| { // the launch: glm_mm4_128s2's grid and threads, its own shared memory
+        k.wide = wide;
+        cuda.count = 0;
+        try mm.matmul(&k, .{}, 4096, 2048, .{ .w = 8192, .s = 12288, .n = 4096, .k = 2048, .bits = 4 }, 16384, 32768, 2048, false, true);
+        try std.testing.expectEqual(@as(usize, 1), cuda.count);
+        try std.testing.expectEqual(kernels.packed_prompt[0].id, cuda.symbols[0]);
+        try std.testing.expectEqual(@as(u32, 64), cuda.configs[0].grid.x);
+        try std.testing.expectEqual(@as(u32, 16), cuda.configs[0].grid.y);
+        try std.testing.expectEqual(@as(u32, 256), cuda.configs[0].block.x);
+        try std.testing.expectEqual(mm.promptShared(4, wide), cuda.configs[0].shared);
+    }
 }

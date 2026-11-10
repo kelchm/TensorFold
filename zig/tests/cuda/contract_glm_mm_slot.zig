@@ -40,7 +40,7 @@ pub const Slot = struct {
     }
 
     fn symbol(self: *Slot) []const u8 {
-        if (self.p.plain != null) return "glm_mm4_128s2f"; // TF_GLM_MM_FAST4's, its parent glm_mm4_128s2
+        if (self.p.plain != null) return self.p.symbol; // TF_GLM_MM_FAST4's or _WIDE's, its parent glm_mm4_128s2
         return switch (self.p.bits) {
             16 => "glm_mm16_rows",
             4 => "glm_mm4_128s2",
@@ -151,11 +151,12 @@ pub const Slot = struct {
     }
 };
 
-/// Every width in fp32 and bf16 slots, fast 4 bits, two controls: 4-bit bf16 rows a slot short, bf16 weights in slot 7.
-pub fn cases(out: *[11]Slot, rig: Rig, kernels: *const glm.mm.Kernels, fast: *const glm.mm.Kernels, put: cuda.Function) void {
-    const bits = [11]u8{ 16, 4, 6, 8, 16, 4, 6, 8, 4, 16, 4 };
+/// Every width in fp32 and bf16 slots, two controls (a slot short; slot 7), then fast and wide 4 bits in bf16 slots.
+pub fn cases(out: *[13]Slot, rig: Rig, kernels: *const glm.mm.Kernels, fast: *const glm.mm.Kernels, wides: *const [2]glm.mm.Kernels, put: cuda.Function) void {
+    const bits = [13]u8{ 16, 4, 6, 8, 16, 4, 6, 8, 4, 16, 4, 4, 4 };
+    const symbols = [3][]const u8{ "glm_mm4_128s2f", "glm_mm4_128w", "glm_mm4_128wb" };
     for (out, bits, 0..) |*x, b, i| x.* = .{
-        .p = .{ .rig = rig, .kernels = if (i == 10) fast else kernels, .plain = if (i == 10) kernels else null, .bits = b, .wide = i >= 4 and i != 8 and i != 10 },
+        .p = .{ .rig = rig, .kernels = if (i == 10) fast else if (i > 10) &wides[i - 11] else kernels, .plain = if (i >= 10) kernels else null, .symbol = symbols[if (i >= 10) i - 10 else 0], .bits = b, .wide = i >= 4 and i != 8 and i < 10 },
         .put = put,
         .fault = if (i == 8) .short else if (i == 9) .seventh else .none,
     };
