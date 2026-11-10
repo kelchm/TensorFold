@@ -33,8 +33,9 @@ test "glm packed: every loaded matmul bucket and tiler has a measured resource r
 }
 
 test "glm packed: two-stage prompt geometry is registered without claiming unmeasured resources" {
-    inline for (.{ 4, 6, 8 }) |bits| {
-        const r = try record(std.fmt.comptimePrint("glm_mm{d}_128s2", .{bits}));
+    inline for (.{ "glm_mm4_128s2", "glm_mm6_128s2", "glm_mm8_128s2", "glm_mm4_128s2_ld", "glm_mm6_128s2_ld", "glm_mm8_128s2_ld" }, 0..) |symbol, i| {
+        const bits: u8 = @intCast(4 + 2 * (i % 3));
+        const r = try record(symbol);
         try t.expectEqualStrings("glm_mm", r.launch.image);
         try t.expectEqual(@as(u32, 256), r.launch.threads);
         try t.expectEqual(glm.mm.sharedBytesStages(bits, 128, 2), r.launch.dynamic);
@@ -42,4 +43,9 @@ test "glm packed: two-stage prompt geometry is registered without claiming unmea
         try t.expectEqual(@as(usize, 5), try registry.checkCuda(t.allocator, &.{r}, true));
         try t.expectEqual(registry.none, registry.usageFor(r, .{ .major = 13, .minor = 3 }));
     }
+    const ld = try record("glm_mm16_rows_ld"); // TF_GLM_SHARED_SLOT: glm_mm16_rows' launch, its usage pending
+    const parent = try record("glm_mm16_rows");
+    try t.expectEqual(parent.launch.dynamic, ld.launch.dynamic);
+    try t.expectEqual(parent.launch.threads, ld.launch.threads);
+    try t.expectEqual(registry.none, registry.usageFor(ld, .{ .major = 13, .minor = 3 }));
 }

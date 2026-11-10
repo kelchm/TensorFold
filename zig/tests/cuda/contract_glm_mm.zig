@@ -8,6 +8,7 @@ const g = contract.gates;
 const Dense = contract.dense.Dense;
 const Rig = @import("contract_rig.zig").Rig;
 const check = @import("check.zig");
+const slot_k = @import("contract_glm_mm_slot.zig");
 pub const Gpu = check.Gpu;
 
 const served = [_]c.Shape{
@@ -86,6 +87,15 @@ pub const Product = struct {
     const vt = g.hooks(Product);
 
     pub fn prepare(self: *Product, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
+        if (!try self.inputs(shape, fill, seed)) return false;
+        const bytes = shape.rows * shape.n * @as(usize, if (self.wide) 4 else 2);
+        self.out = try self.rig.output(bytes);
+        self.base = try self.rig.scratch(bytes);
+        return true;
+    }
+
+    /// The call's x (strided, NaN between rows) and tiled weights, with their float64 copies in `d`.
+    pub fn inputs(self: *Product, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
         if (shape.rows == 0 or shape.n == 0 or shape.n % 8 != 0 or shape.k == 0 or shape.k % 64 != 0) return false;
         if (self.d) |d| d.deinit();
         self.d = null;
@@ -102,9 +112,6 @@ pub const Product = struct {
         for (0..shape.rows) |r| @memcpy(hx[(r + 7) * stride ..][0..shape.k], d.x[r * shape.k ..][0..shape.k]);
         self.x = try self.rig.input(std.mem.sliceAsBytes(hx)) + 7 * stride * 2;
         try self.weights(fill, seed);
-        const bytes = shape.rows * shape.n * @as(usize, if (self.wide) 4 else 2);
-        self.out = try self.rig.output(bytes);
-        self.base = try self.rig.scratch(bytes);
         return true;
     }
 
@@ -130,6 +137,12 @@ pub const Product = struct {
                     const j = v % 4;
                     const k = group * 64 + (v / 4) * 16 + 2 * (lane % 4) + j % 2 + (j / 2) * 8;
                     const small: i32 = @intCast(1 + ((k % (sh.k / 2)) * 5 + col) % 7);
+                    if (self.bits == 16) { // glm_mm_tile16's pairs: bf16 values, no scales
+                        const f: f32 = if (fill == .stress) @floatFromInt(if (k < sh.k / 2) small else -small) else c.fromBf16(c.toBf16(random.float(f32) * 2 - 1));
+                        q.* = c.toBf16(f);
+                        d.w[col * sh.k + k] = f;
+                        continue;
+                    }
                     const signed: i32 = if (fill == .stress) (if (k < sh.k / 2) small else -small) else @as(i32, random.uintLessThan(u16, @intCast(half * 2))) - half;
                     q.* = @intCast(signed + half);
                     d.w[col * sh.k + k] = @as(f64, @floatFromInt(signed)) * scale;
@@ -180,22 +193,32 @@ pub const Product = struct {
 
 pub const Prompts = struct {
     module: cuda.Module,
+    ops: cuda.Module, // glm_ops: tf_glm_put_slot, the shared slot's parent copy
     kernels: glm.mm.Kernels,
     cases: [12]Product = undefined,
+    slots: [10]slot_k.Slot = undefined,
 
     pub fn init(gpu: check.Gpu) !Prompts {
         var m = try cuda.Module.load(gpu.d, cuda.kernels.glm_mm);
         errdefer m.unload();
-        return .{ .module = m, .kernels = try glm.mm.Kernels.load(m) };
+        var ops = try cuda.Module.load(gpu.d, cuda.kernels.glm_ops);
+        errdefer ops.unload();
+        var k = try glm.mm.Kernels.load(m);
+        k.strided = try glm.mm.Strided.load(m); // TF_GLM_SHARED_SLOT's kernels, whatever the environment says
+        return .{ .module = m, .ops = ops, .kernels = k };
     }
 
     pub fn append(self: *Prompts, gpu: check.Gpu, s: cuda.Stream, kernels: *std.ArrayList(g.Kernel)) !void {
         for (&self.cases, 0..) |*p, i| p.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kernels = &self.kernels, .bits = @intCast(4 + 2 * (i % 3)), .wide = i % 6 >= 3, .drop_tail = i >= 6 };
         for (&self.cases) |*p| try kernels.append(gpu.gpa, try p.kernel());
+        slot_k.cases(&self.slots, .{ .gpu = gpu, .s = s }, &self.kernels, try self.ops.function("tf_glm_put_slot"));
+        for (&self.slots) |*p| try kernels.append(gpu.gpa, try p.kernel());
     }
 
     pub fn deinit(self: *Prompts) void {
         for (&self.cases) |*p| p.deinit();
+        for (&self.slots) |*p| p.deinit();
+        self.ops.unload();
         self.module.unload();
     }
 };

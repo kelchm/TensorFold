@@ -75,3 +75,36 @@ test "TF_GLM_PDL_CHAIN: a K-sliced call's reduce launches as the matmul's depend
     try std.testing.expectEqual(mm.Chain.all, mm.Chain.parse("reduce,hc,moe").?);
     for ([_][]const u8{ "reduce,hc,x", "moe,hc", "p2p", "", "2" }) |bad| try std.testing.expect(mm.Chain.parse(bad) == null);
 }
+
+test "TF_GLM_SHARED_SLOT: a one-launch call takes its strided kernel and grid with the row stride, others none" {
+    var k = kernels;
+    const w: mm.Tiled = .{ .w = 8192, .s = 12288, .n = 4096, .k = 2048, .bits = 4 };
+    cuda.count = 0;
+    try std.testing.expect(!try mm.matmulStrided(&k, .{}, 4096, 2048, w, 16384, 9 * 4096, 2048, false, true)); // none loaded
+    k.strided = .{ .prompt = .{ .id = 4096 }, .packed_prompt = .{ .{ .id = 4097 }, .{ .id = 4098 }, .{ .id = 4099 } } };
+    for ([_]u8{ 16, 4, 6, 8 }, 0..) |bits, wi| for ([_]usize{ 1, 3, 127, 128, 129, 2048 }) |rows| for ([_]bool{ false, true }) |one| {
+        var t = w;
+        t.bits = bits;
+        cuda.count = 0;
+        const took = try mm.matmulStrided(&k, .{}, 4096, 2048, t, 16384, 9 * 4096, rows, bits == 8, one);
+        try std.testing.expectEqual(one or rows >= 128, took);
+        if (!took) {
+            try std.testing.expectEqual(@as(usize, 0), cuda.count);
+            continue;
+        }
+        try std.testing.expectEqual(@as(usize, 1), cuda.count);
+        try std.testing.expectEqual(@as(u32, 4096 + @as(u32, @intCast(wi))), cuda.symbols[0]);
+        try std.testing.expectEqual(@as(c_longlong, 9 * 4096), cuda.last_ll);
+        const strided = cuda.configs[0];
+        const args = cuda.nargs[0];
+        try mm.matmul(&k, .{}, 4096, 2048, t, 16384, 32768, rows, bits == 8, one); // the call it stands for
+        try std.testing.expectEqual(@as(usize, 2), cuda.count);
+        try std.testing.expectEqual(cuda.configs[1], strided);
+        try std.testing.expectEqual(cuda.nargs[1] + 1, args);
+    };
+    k.prompt_fixed_k = true; // its prompt calls take K slices: put_slot keeps them
+    try std.testing.expect(!try mm.matmulStrided(&k, .{}, 4096, 2048, w, 16384, 9 * 4096, 2048, false, true));
+    k.prompt_fixed_k = false;
+    try std.testing.expectError(error.BadShape, mm.matmulStrided(&k, .{}, 4096, 2048, w, 16384, 4095, 2048, false, true));
+    try std.testing.expectError(error.BadShape, mm.matmulStrided(&k, .{}, 4096, 2048, w, 16386, 9 * 4096, 2048, false, true));
+}

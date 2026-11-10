@@ -11,13 +11,20 @@ pub const Module = struct {
     }
 };
 pub const Args = struct {
-    pub fn add(_: *Args, _: anytype) void {}
+    n: usize = 0,
+    pub fn add(a: *Args, v: anytype) void {
+        a.n += 1;
+        if (@TypeOf(v) == c_longlong) last_ll = v;
+    }
 };
+pub var last_ll: c_longlong = 0; // the last c_longlong argument added (ldx, or a strided call's ldo)
+pub var nargs: [128]usize = undefined;
 pub var configs: [128]Config = undefined;
 pub var symbols: [128]u32 = undefined;
 pub var count: usize = 0;
 pub const launch = struct {
-    pub fn launch(f: Function, c: Config, _: Stream, _: *Args) !void {
+    pub fn launch(f: Function, c: Config, _: Stream, a: *Args) !void {
+        nargs[count] = a.n;
         configs[count] = c;
         symbols[count] = f.id;
         count += 1;

@@ -95,6 +95,13 @@ pub fn matmul(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u6
     if (sk > 1) try glue.sliceSum(set, stream, part, out, m * n, sk, wide);
 }
 
+/// matmul's glm_mm call into out rows `ldo` apart when one launch takes it (TF_GLM_SHARED_SLOT); false: none launched.
+pub fn matmulStrided(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, ldo: usize, m: usize, n: usize, k: usize, wide: bool) !bool {
+    const mk = set.mm orelse return false;
+    const t: mm.Tiled = if (set.packs) |p| p.tiled(w, n, k) else .{ .w = w, .n = n, .k = k };
+    return mm.matmulStrided(mk, stream, x, x_stride, t, out, ldo, m, wide, set.prompt);
+}
+
 /// qmm.group_sums: (m, k) bf16 rows (stride `x_stride`) -> (m, k / 64) fp32 sums of each 64 inputs.
 pub fn groupSums(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, xs: u64, m: usize, k: usize) !void {
     var a: cuda.Args = .{};

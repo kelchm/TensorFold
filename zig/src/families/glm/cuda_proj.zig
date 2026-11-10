@@ -24,6 +24,14 @@ pub fn matmul(set: glue.Set, stream: cuda.Stream, w: Proj, x: u64, x_stride: usi
     }
 }
 
+/// matmul into out rows `ldo` elements apart, for a bf16 weight glm_mm takes in one launch; false: none launched.
+pub fn matmulStrided(set: glue.Set, stream: cuda.Stream, w: Proj, x: u64, x_stride: usize, out: u64, ldo: usize, m: usize, n: usize, k: usize, wide: bool) !bool {
+    return switch (w) {
+        .bf16 => |p| b16.matmulStrided(set, stream, x, x_stride, p, out, ldo, m, n, k, wide),
+        .fp8g, .mxfp8 => false,
+    };
+}
+
 /// error.SlicePartialsNotHeld when `matmul` would refuse `w` on `lane` at some row count: the loader's check.
 pub fn fits(lane: *const cuda.qmmf.Lane, w: cuda.qmmf.Weight) error{SlicePartialsNotHeld}!void {
     // one row stands for all: under qmmf.fused_rows the plan is the same for every row count, and over it none reduces

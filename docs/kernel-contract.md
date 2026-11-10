@@ -439,6 +439,11 @@ FP32 output, as byte replacements of their three-stage `glm_mm{4,6,8}_128` paren
 TP=2 projection shapes, strided inputs, partial row/column tiles, nonfinite classes and FP32 accumulator stress.
 Each output kind and bit width has a dropped-last-row control. `glm_prompt_records.zig` records the two-stage
 launch geometry; compiled resources and device gates remain pending on every served SM.
+`TF_GLM_SHARED_SLOT`'s `glm_mm16_rows_ld` and `glm_mm{4,6,8}_128s2_ld` register, for fp32 and bf16 slots, as byte
+replacements of their parent prompt kernel's fp32 rows put into slot 8 of nine by `tf_glm_put_slot`, over the whole
+slot buffer (the other slots must stay zero), with NaN and infinities checked byte for byte. Two controls must fail:
+rows a slot short of the slot stride (4-bit, bf16) and the shared expert written to slot 7 (bf16 weights, fp32).
+Their launch records are pending with the two-stage ones.
 
 nvcc allocates registers differently from one release to the next, so the CUDA records are kept per release.
 `registry.cuda` holds what nvcc 13.0 compiles, the compiler of the release fatbins. `registry.cuda_sets` lists what
