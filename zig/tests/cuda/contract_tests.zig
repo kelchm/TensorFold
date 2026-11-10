@@ -542,6 +542,8 @@ fn registered(gpu: check.Gpu, only: []const []const u8, t0: *i96) !g.Tally {
     defer glm_fused.destroy(a);
     const glm_hc_fuse = try @import("contract_glm_hc_fuse.zig").Group.create(a, gpu, s, &glm_fns, mods[5], &kernels);
     defer glm_hc_fuse.destroy(a);
+    const glm_router_fuse = try @import("contract_glm_router_fuse.zig").Group.create(a, gpu, s, &glm_fns, mods[5], &kernels);
+    defer glm_router_fuse.destroy(a);
     const glm_writes = try glm_pages_k.Writes.create(a, gpu, s, glm_fns.lat_write, glm_fns.pool_keys, &kernels);
     defer glm_writes.destroy(a);
     var glm_index = glm_index_k.Index.init(gpu, s, glm_fns);

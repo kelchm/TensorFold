@@ -3,4 +3,5 @@
 #include "contract_controls.cu"
 #include "contract_js_controls.cuh"
 #include "contract_glm_hc_controls.cuh"
+#include "contract_glm_router_controls.cuh"
 #include "contract_glm_mm_controls.cuh"

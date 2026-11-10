@@ -373,7 +373,9 @@ sparse). Its prompt indexer (`tf_glm_index_scores`, `tf_glm_index_pools`) is bit
 positive NaN. The sparse chunks with their merge in the kernel (`tf_glm_chunks_{16,32}{,_fp8}_fused`) are bit-equal
 to the chunk kernels then `tf_glm_merge`. `TF_GLM_HC_FUSE`'s `tf_glm_hc_post_partial` is bit-equal to
 `tf_glm_hc_post` then the next site's `tf_glm_hc_partial` (the streams in place, and the partials), with a wrong
-square-sum order and a dropped row as controls; its compile usage is pending.
+square-sum order and a dropped row as controls; its compile usage is pending. `TF_GLM_ROUTER_FUSE`'s
+`tf_glm_router_fused` is bit-equal to `tf_glm_router_tile` then `tf_glm_slice_sum` at the MoE router's and index gate's
+served shapes and tile edges, with one unbroken K chain (`tf_ctl_glm_router_chain`) as its control.
 CUDA also checks `TF_GLM_KV_HOST`'s gather (`tf_glm_kvh_*` in `glm_ops.cu`, launched by `cuda_kv_host.zig`): the
 marks (a slot for each distinct pick; past its slots, the call flagged and no row left marked), the picked rows into
 their slots from host pages or the layer's row cache, the token lists' slots, the marks cleared, the dense rows through

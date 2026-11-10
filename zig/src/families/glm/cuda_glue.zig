@@ -46,6 +46,7 @@ pub const Kernels = struct {
     topk: cuda.Function,
     router_part: cuda.Function,
     router_tile: cuda.Function,
+    router_fused: cuda.Function, // TF_GLM_ROUTER_FUSE: router_tile's slices added in the block, slice_sum's bytes
     hc_partial: cuda.Function,
     hc_partial8: cuda.Function,
     hc_partial8_o2: cuda.Function, // its bytes from 13 blocks of two dots a K block (hc_part)
@@ -84,6 +85,7 @@ pub const Kernels = struct {
     hc_split: bool = true, // TF_GLM_HC_SPLIT: a decode window's hc_finish on the split schedule (the same bits)
     hc_part: bool = true, // TF_GLM_HC_PART: a decode window to hc_part_rows rows takes tf_glm_hc_partial8_o2 (the same bits)
     dense_prune: bool = true, // TF_GLM_DENSE_PRUNE: dense attention skips the rows sparse attention writes (dsa_block)
+    router_fuse: bool = false, // TF_GLM_ROUTER_FUSE: a prompt call's router in one launch (routerFused; the same bits)
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
@@ -95,6 +97,7 @@ pub const Kernels = struct {
         k.hc_split = env.read(bool, "TF_GLM_HC_SPLIT", true) catch true;
         k.hc_part = env.read(bool, "TF_GLM_HC_PART", true) catch true;
         k.dense_prune = env.read(bool, "TF_GLM_DENSE_PRUNE", true) catch true;
+        k.router_fuse = env.read(bool, "TF_GLM_ROUTER_FUSE", false) catch false;
         try k.bmm_tile.allowDynamicShared(bmm_tile_smem);
         try k.bmm_tile1.allowDynamicShared(bmm_tile1_smem[1]);
         try k.chunks_16.allowDynamicShared(chunksSmem(16));
@@ -201,11 +204,23 @@ pub fn chunksSmem(comptime hb: u32) u32 {
 /// K slices of the router's dot (glue.ROUTER_KS): fixed by the shape, as the sliced and the single pass differ in bits.
 pub const router_ks = 8;
 
+/// The fewest 64 x 32 tiles a fused router call takes: three blocks on each of the GB10's 48 SMs, one full wave.
+pub const router_fuse_blocks = 144;
+
+/// Whether glue.router takes tf_glm_router_fused: TF_GLM_ROUTER_FUSE, a prompt call, aligned rows, a wave of tiles.
+pub fn routerFused(set: Set, x: u64, x_stride: usize, m: usize, ne: usize) bool {
+    if (!set.prompt or !set.glue.router_fuse or x % 16 != 0 or x_stride % 8 != 0) return false;
+    return @as(usize, cdiv(m, 64)) * cdiv(ne, 32) >= router_fuse_blocks;
+}
+
 /// glue.router: out [m][ne] fp32 = x . w rows; d a multiple of router_ks x 64: K slices in `part`, added in order.
 pub fn router(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, part: u64, m: usize, d: usize, ne: usize) !void {
     if (d % (router_ks * 64) != 0) return error.RouterWidth; // the Python family's single-pass _router: no GLM width
+    const fused = routerFused(set, x, x_stride, m, ne);
     var a: cuda.Args = .{};
-    inline for (.{ x, w, part, i64of(m), i64of(x_stride), i64of(d), i64of(ne), @as(c_int, router_ks) }) |v| a.add(v);
+    inline for (.{ x, w, if (fused) out else part, i64of(m), i64of(x_stride), i64of(d), i64of(ne), @as(c_int, router_ks) }) |v| a.add(v);
+    // the slices in order in each block, straight into out; expert tiles along x, so a row tile's blocks run together
+    if (fused) return cuda.launch.launch(set.glue.router_fused, .{ .grid = .{ .x = cdiv(ne, 32), .y = cdiv(m, 64) }, .block = .{ .x = 128 } }, stream, &a);
     if (x % 16 == 0 and x_stride % 8 == 0) // rows on 16 bytes: 64-row tiles staged by cp.async (decode's rows past m load as zeros)
         try cuda.launch.launch(set.glue.router_tile, .{ .grid = .{ .x = cdiv(m, 64), .y = cdiv(ne, 32), .z = router_ks }, .block = .{ .x = 128 } }, stream, &a)
     else

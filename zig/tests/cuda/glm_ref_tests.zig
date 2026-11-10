@@ -178,6 +178,29 @@ fn routers(r: *Rig, set: glue.Set) !void {
     check.pass("select top-{d} of {d}: picks follow the float64 ranking (near ties aside), weights within float64 tolerance", .{ top_k, ne });
 }
 
+/// TF_GLM_ROUTER_FUSE: a prompt call of a wave of tiles, fused, gives the K slices' bytes (MoE router, index gate).
+fn routerFused(r: *Rig, set: glue.Set) !void {
+    const d = 4096;
+    var fused = set.glue.*;
+    fused.router_fuse = true;
+    const on: glue.Set = .{ .glue = &fused, .prompt = true };
+    var name: [128]u8 = undefined;
+    for ([_][2]usize{ .{ 1200, 288 }, .{ 4096, 128 } }) |shape| {
+        const m = shape[0];
+        const ne = shape[1];
+        const x = try r.dev(std.mem.sliceAsBytes(try r.bfs(m * d, 1.0)));
+        const w = try r.dev(std.mem.sliceAsBytes(try r.bfs(ne * d, 0.02)));
+        try check.expect(glue.routerFused(on, x, d, m, ne) and !glue.routerFused(set, x, d, m, ne), "router {d} x [{d}, {d}]: fused only on", .{ m, ne, d });
+        const part = try r.zeros(glue.router_ks * m * ne * 4);
+        const want = try r.zeros(m * ne * 4);
+        const got = try r.zeros(m * ne * 4);
+        try glue.router(set, r.s, x, d, w, want, part, m, d, ne);
+        try glue.router(on, r.s, x, d, w, got, part, m, d, ne);
+        try sameRows(r, try std.fmt.bufPrint(&name, "router fused {d} rows x [{d}, {d}]: the K slices' bytes", .{ m, ne, d }), want, got, m * ne * 4);
+    }
+    check.pass("router fused: tf_glm_router_fused gives tf_glm_router_tile then tf_glm_slice_sum's bytes", .{});
+}
+
 /// `glm-ref`: the checks above on synthetic inputs (seeded), no checkpoint and no golden.
 pub fn run(gpu: Gpu) !void {
     var arena: std.heap.ArenaAllocator = .init(gpu.gpa);
@@ -208,5 +231,6 @@ pub fn run(gpu: Gpu) !void {
     try @import("glm_ref_hc.zig").gammas(&r, set); // last: its draws from r.rng follow every check above
     try @import("glm_ref_hc.zig").fused(&r, set); // after gammas, so every draw above is unchanged
     try @import("glm_ref_prune.zig").run(&r, set, ops); // last: its draws follow every check above
+    try routerFused(&r, set); // after prune, so every draw above is unchanged
     check.pass("glm-ref: every projection within {e:.3} of its float64 tolerance", .{r.worst});
 }

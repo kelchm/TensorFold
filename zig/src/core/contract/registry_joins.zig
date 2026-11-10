@@ -37,6 +37,7 @@ pub const nvcc_133_after = @import("flashnext_tile_records.zig").cuda_133 ++
 pub const cuda_pending = @import("exl3_prompt_glm_records.zig").records ++
     @import("glm_mla_records.zig").records ++
     @import("glm_hc_fuse_records.zig").records ++
+    @import("glm_router_fuse_records.zig").records ++
     @import("qwen_whole_records.zig").records ++
     @import("glm_prompt_records.zig").records ++
     @import("glm_hc_split_records.zig").records ++

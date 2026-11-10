@@ -38,6 +38,7 @@ pub const rules = [_]Rule{
     .{ .name = "TF_GLM_DENSE_PRUNE", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_SHARED_SLOT", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_MM_FAST4", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_GLM_ROUTER_FUSE", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_KDA_STEP_WARPS", .scope = .glm, .kind = .word, .trim = " \t", .words = &.{ "auto", "8", "4", "2" }, .forms = "auto, 8, 4 or 2" },
     .{ .name = "TF_GLM_PDL_CHAIN", .scope = .glm, .kind = .word, .trim = " \t", .words = &.{ "0", "reduce", "hc", "reduce,hc", "moe", "reduce,moe", "hc,moe", "reduce,hc,moe", "1" }, .forms = "0, 1, or reduce, hc and moe in that order, comma-separated" },
     .{ .name = "TENSORFOLD_VIDEO_TOKENS", .scope = .common, .kind = .u64, .forms = "a nonnegative whole video-token budget (default 16384; unsigned 64-bit count)" },

@@ -36,6 +36,7 @@ pub const Record = struct {
         }
         fns.hc_split = false;
         fns.hc_part = false;
+        fns.router_fuse = false;
         count = 0;
     }
 };

@@ -91,6 +91,9 @@ A chunk that starts before the dense limit (2,051 positions) runs dense attentio
 
 `TF_GLM_MM_FAST4` accepts `0` or `1` with the same checks and scope; unset or blank keeps it off.
 `1` has 4-bit packed prompt matmuls (`TF_GLM_DENSE_BITS=4`) take `glm_mm4_128s2f` (and `glm_mm4_128s2f_ld` under `TF_GLM_SHARED_SLOT`): each weight pair is built as BF16 `0x4300 | u` (128 + u) for its two nibbles and one BF16 pair subtraction of 136, exactly u - 8 and +0 for code 8, the bits the int-to-float-to-BF16 conversions give. The MMAs, scales and their order are unchanged, so every byte is the same; registered as identical. It stays off until the new kernels compile and pass their device gates.
+
+`TF_GLM_ROUTER_FUSE` accepts `0` or `1` with the same checks and scope; unset or blank keeps it off.
+`1` has a prompt call's MoE router and index gate projection (aligned rows, at least 144 of its 64 x 32 tiles) take `tf_glm_router_fused`: each block computes its tile's eight K slices in turn, each MMA chain from zero as `tf_glm_router_tile` does, and adds them in slice order as `tf_glm_slice_sum` does, then writes the fp32 logits. The eight slices never go to memory (at 4,096 rows and 288 experts, 37.7 MB written and read back a call) and the `tf_glm_slice_sum` launch goes. Decode windows and smaller calls keep both launches. Every byte stays the same, so it is registered as identical and the ranks need not agree; device qualification is pending.
 ## GLM CUDA decode launches
 
 These switches change only how a decode window's kernels are scheduled; every output keeps its bytes. GLM checks each before rank placement, NCCL or weights, and other CUDA families do not check this scope. They stay out of the ranks' fingerprint: each rank's own launches, no collective among them.
