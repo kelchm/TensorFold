@@ -123,8 +123,7 @@ fn attempt(s: *pc.Store, prompt: []const u32, born: u32, starts: []const u32, sp
     const choice = if (before.*) |at| select.shorter(s, prompt, starts, spans, have, at) else select.choose(s, prompt, starts, spans, have);
     const chosen = choice.restore orelse return have;
     const candidate = r.states.items[chosen];
-    if (s.image_frame != 0 or !@import("cache_images.zig").diskSafe(candidate.tokens) or
-        !@import("cache_images.zig").equal(&.{}, s.image_query orelse &.{}, @intCast(candidate.tokens.len))) return have;
+    if (s.salt != null or !rows_store.images.matches(candidate.images, candidate.image_frame, candidate.tokens.len, s.image_query, s.image_frame)) return have;
     const name = candidate.name;
     const bytes = r.blankBytes(candidate.at);
     if (bytes > s.budget or s.most == 0) return have;
@@ -142,15 +141,17 @@ fn attempt(s: *pc.Store, prompt: []const u32, born: u32, starts: []const u32, sp
     const i = r.find(name) orelse return have; // a spill that made room went past the disk cap and took it
     const st = r.states.items[i];
     const e = s.gpa.create(pc.Entry) catch return have;
-    e.* = .{ .tokens = &.{}, .at = st.at, .saved = undefined, .bytes = bytes, .born = born, .used = s.clock, .last = &.{}, .shared = st.shared };
+    e.* = .{ .tokens = &.{}, .images = &.{}, .image_frame = st.image_frame, .at = st.at, .saved = undefined, .bytes = bytes, .born = born, .used = s.clock, .last = &.{}, .shared = st.shared };
     var ok = false;
     defer if (!ok) {
         s.gpa.free(e.tokens);
+        s.gpa.free(e.images);
         s.gpa.free(e.decode_spans);
         s.gpa.free(e.last);
         s.gpa.destroy(e);
     };
     e.tokens = s.gpa.dupe(u32, st.tokens) catch return have;
+    e.images = s.gpa.dupe(rows_store.images.Identity, st.images) catch return have;
     e.decode_spans = s.gpa.dupe(modes.Span, st.spans) catch return have;
     e.last = s.gpa.dupe(u32, prompt) catch return have;
     e.saved = read(r, i) catch |err| return failed(before, candidate.at, err, have);

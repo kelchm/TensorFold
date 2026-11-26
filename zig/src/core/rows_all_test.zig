@@ -26,5 +26,5 @@ test {
     _ = @import("rows_drop_test.zig");
     _ = @import("cache_salt_key.zig"); // and its disk test
     _ = @import("rows_restore_burst_test.zig");
-    _ = @import("rows_image_note_test.zig");
+    _ = @import("rows_image_disk_test.zig");
 }

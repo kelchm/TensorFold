@@ -58,7 +58,7 @@ pub const Plan = struct {
         defer a.free(parts);
         var wants: std.ArrayList(write.Want) = .empty;
         defer wants.deinit(a);
-        try r.blockNames(a, parts, s.tokens, s.spans, s.starts, s.at, &wants);
+        try r.blockNamesImages(a, parts, s.tokens, s.spans, s.starts, s.images, s.image_frame, s.at, &wants);
         var pieces: std.ArrayList(Piece) = .empty;
         errdefer pieces.deinit(a);
         var ranges: std.ArrayList(image.Range) = .empty;
@@ -397,6 +397,7 @@ pub fn make(r: *Rows, _: std.Io, limits: Limits) !*Prefetch {
 
 /// A compatible staged save is not readable until the engine publishes its complete files and state index.
 pub fn writing(s: *pc.Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span) ?Name {
+    if (s.salt != null) return null;
     const r = s.disk orelse return null;
     const w = r.worker orelse return null;
     const have = s.find(prompt, starts, spans);
@@ -407,8 +408,8 @@ pub fn writing(s: *pc.Store, prompt: []const u32, starts: []const u32, spans: []
     for (jobs) |job| if (job) |j| {
         if (j.generation != w.generation.load(.acquire) or j.at <= at) continue;
         if (s.most == 0 or r.blankBytes(j.at) > s.budget) continue;
-        const state: rows_store.State = .{ .name = j.name, .at = j.at, .tokens = j.tokens, .spans = j.spans, .starts = j.starts, .own = 0, .rows = 0, .used = 0, .shared = j.shared };
-        if (!r.matches(&state, prompt, starts, spans)) continue;
+        const state: rows_store.State = .{ .name = j.name, .at = j.at, .tokens = j.tokens, .spans = j.spans, .starts = j.starts, .images = @constCast(j.images), .image_frame = j.image_frame, .own = 0, .rows = 0, .used = 0, .shared = j.shared };
+        if (!r.matchesImages(&state, prompt, starts, spans, s.image_query orelse &.{}, s.image_frame)) continue;
         name = j.name;
         at = j.at;
     };

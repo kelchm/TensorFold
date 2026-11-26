@@ -24,6 +24,8 @@ pub const Fake = struct {
     prompt: []const u32 = &.{},
     spans: []const Span = &.{},
     starts: []const u32 = &.{},
+    images: []const @import("lanes").stream.Image = &.{},
+    image_frame: u32 = 0,
     planned: bool = false,
     at: u32 = 0,
     sum: u64 = 0,
@@ -76,26 +78,36 @@ pub const Fake = struct {
         return x;
     }
 
+    fn imageMix(f: *const Fake, upto: u32) u64 {
+        var h: u64 = if (f.image_frame != 0) std.hash.Wyhash.hash(0x1f00, std.mem.asBytes(&f.image_frame)) else 0;
+        for (f.images) |img| if (img.at < upto) {
+            const fields = [5]u64{ img.at, img.tokens, img.gh, img.gw, img.hash };
+            h ^= std.hash.Wyhash.hash(0x1f01, std.mem.sliceAsBytes(&fields));
+        };
+        return h;
+    }
+
     /// The image a fresh pass leaves at `at` (the MTP rows read one token on).
     pub fn build(f: *const Fake, at: u32, out: []u8) void {
         @memset(out, 0);
         const p_ = f.prompt;
         var sum: u64 = 0;
         for (p_[0..at]) |t| sum = sum *% 31 +% t;
+        sum ^= f.imageMix(at);
         std.mem.writeInt(u64, out[0..8], at, .little);
         std.mem.writeInt(u64, out[8..16], sum, .little);
         var off: usize = 16;
-        for (0..at) |p| std.mem.writeInt(u64, out[off + p * key_row ..][0..8], std.hash.Wyhash.hash(1, std.mem.sliceAsBytes(p_[0 .. p + 1])) ^ f.arithmetic(@intCast(p)), .little);
+        for (0..at) |p| std.mem.writeInt(u64, out[off + p * key_row ..][0..8], std.hash.Wyhash.hash(1, std.mem.sliceAsBytes(p_[0 .. p + 1])) ^ f.arithmetic(@intCast(p)) ^ f.imageMix(@intCast(p + 1)), .little);
         off += at * key_row;
         for (0..at / 4 + 1) |u| {
             const end = @min((u + 1) * 4, at);
-            const h = std.hash.Wyhash.hash(2, std.mem.sliceAsBytes(p_[0..end])) ^ f.arithmetic(@intCast(end -| 1));
+            const h = std.hash.Wyhash.hash(2, std.mem.sliceAsBytes(p_[0..end])) ^ f.arithmetic(@intCast(end -| 1)) ^ f.imageMix(@intCast(end));
             @memcpy(out[off + u * pool_row ..][0..pool_row], std.mem.asBytes(&h)[0..pool_row]);
         }
         off += (at / 4 + 1) * pool_row;
-        for (0..at) |p| std.mem.writeInt(u32, out[off + p * mtp_row ..][0..4], @truncate(std.hash.Wyhash.hash(3, std.mem.sliceAsBytes(p_[0 .. p + 2]))), .little);
+        for (0..at) |p| std.mem.writeInt(u32, out[off + p * mtp_row ..][0..4], @truncate(std.hash.Wyhash.hash(3, std.mem.sliceAsBytes(p_[0 .. p + 2])) ^ f.imageMix(@intCast(p + 2))), .little);
         off += at * mtp_row;
-        for (at -| window..at) |p| std.mem.writeInt(u32, out[off + (p % window) * ring_row ..][0..4], p_[p] *% 7 +% @as(u32, @intCast(p)), .little);
+        for (at -| window..at) |p| std.mem.writeInt(u32, out[off + (p % window) * ring_row ..][0..4], (p_[p] *% 7 +% @as(u32, @intCast(p))) ^ @as(u32, @truncate(f.imageMix(@intCast(p + 1)))), .little);
         off += @as(usize, @min(at, window)) * ring_row;
         @memcpy(out[off..][0..12], "family words");
     }
@@ -182,7 +194,12 @@ pub const Fake = struct {
             f.sum = f.sum *% 31 +% t;
             f.at += 1;
             while (mi < plan.marks.len and plan.marks[mi] < f.at) mi += 1;
-            if (mi < plan.marks.len and plan.marks[mi] == f.at) _ = s.keep(f.prompt, f.at, null, f.starts, f.spans);
+            if (mi < plan.marks.len and plan.marks[mi] == f.at) {
+                if (f.images.len > 0 or f.image_frame != 0)
+                    _ = s.keepBornFrame(f.prompt, @intCast(f.prompt.len), f.at, null, f.starts, f.spans, f.images, f.image_frame)
+                else
+                    _ = s.keep(f.prompt, f.at, null, f.starts, f.spans);
+            }
         }
         return f.sum;
     }

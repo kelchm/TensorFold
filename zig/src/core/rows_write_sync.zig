@@ -146,7 +146,7 @@ pub fn prepare(r: *Rows, q: Queued) !?*Job {
     const gpa = r.gpa;
     errdefer gpa.free(q.starts);
     const e = q.entry;
-    const name = chain.state(r.keying, e.tokens, e.decode_spans, q.starts, e.at);
+    const name = chain.stateImages(r.keying, e.tokens, e.decode_spans, q.starts, e.images, e.image_frame, e.at);
     if (r.find(name)) |i| {
         r.touch(i);
         gpa.free(q.starts);
@@ -157,7 +157,7 @@ pub fn prepare(r: *Rows, q: Queued) !?*Job {
     errdefer gpa.free(parts);
     var wants: std.ArrayList(Want) = .empty;
     errdefer wants.deinit(gpa);
-    try r.blockNames(gpa, parts, e.tokens, e.decode_spans, q.starts, e.at, &wants);
+    try r.blockNamesImages(gpa, parts, e.tokens, e.decode_spans, q.starts, e.images, e.image_frame, e.at, &wants);
     var own: std.ArrayList(image.Range) = .empty;
     errdefer own.deinit(gpa);
     try image.ownRanges(parts, e.at, r.keying.block, &own, gpa);
@@ -181,7 +181,7 @@ fn admit(r: *Rows, j: *Job) !void {
     for (j.wants) |w| if (!r.blocks.contains(chain.stem(w.name))) {
         j.bytes += w.bytes;
     };
-    j.bytes += image.total(j.own) + 4 * (3 + e.tokens.len + 2 * e.decode_spans.len + j.starts.len) + @sizeOf(file.Trailer);
+    j.bytes += image.total(j.own) + 4 * (3 + e.tokens.len + 2 * e.decode_spans.len + j.starts.len) + rows_store.images.metaBytes(e.images, e.image_frame) + @sizeOf(file.Trailer);
     if (!r.budget(j.bytes)) return error.DailyBudgetSpent;
     if (!r.room(j.bytes)) return error.OverCap;
     switch (r.admission.reserve(r.dir, j.bytes)) {
@@ -240,20 +240,25 @@ fn unit(r: *Rows, j: *Job) !void {
     }
     const e = j.entry;
     const counts = [3]u32{ @intCast(e.tokens.len), @intCast(e.decode_spans.len), @intCast(j.starts.len) };
-    const meta = [_][]const u8{ std.mem.sliceAsBytes(&counts), std.mem.sliceAsBytes(e.tokens), std.mem.sliceAsBytes(e.decode_spans), std.mem.sliceAsBytes(j.starts) };
-    const bytes = try j.writer.?.finish(.{ .kind = @backingInt(file.Kind.state), .payload = 0, .payload_hash = 0, .name = j.name, .at = e.at, .block = r.keying.block, .flags = @intFromBool(e.shared) }, &meta, true);
+    const img_meta = try rows_store.images.encode(r.gpa, e.images, e.image_frame);
+    defer r.gpa.free(img_meta);
+    const meta_all = [_][]const u8{ std.mem.sliceAsBytes(&counts), std.mem.sliceAsBytes(e.tokens), std.mem.sliceAsBytes(e.decode_spans), std.mem.sliceAsBytes(j.starts), img_meta };
+    const meta = meta_all[0..if (img_meta.len > 0) @as(usize, 5) else 4];
+    const bytes = try j.writer.?.finish(.{ .kind = @backingInt(file.Kind.state), .payload = 0, .payload_hash = 0, .name = j.name, .at = e.at, .block = r.keying.block, .flags = rows_store.images.flags(e.shared, e.images, e.image_frame) }, meta, true);
     j.writer = null;
     r.spent(bytes);
-    var s: rows_store.State = .{ .name = j.name, .at = e.at, .tokens = &.{}, .spans = &.{}, .starts = &.{}, .own = bytes, .rows = 0, .used = 0, .shared = e.shared };
+    var s: rows_store.State = .{ .name = j.name, .at = e.at, .tokens = &.{}, .spans = &.{}, .starts = &.{}, .images = &.{}, .image_frame = e.image_frame, .own = bytes, .rows = 0, .used = 0, .shared = e.shared };
     s.tokens = try r.gpa.dupe(u32, e.tokens);
-    s.spans = r.gpa.dupe(Span, e.decode_spans) catch |err| {
-        r.gpa.free(s.tokens);
-        return err;
-    };
+    errdefer r.gpa.free(s.tokens);
+    s.spans = try r.gpa.dupe(Span, e.decode_spans);
+    errdefer r.gpa.free(s.spans);
+    s.images = try r.gpa.dupe(rows_store.images.Identity, e.images);
+    errdefer r.gpa.free(s.images);
+    try r.states.ensureUnusedCapacity(r.gpa, 1);
     s.starts = j.starts;
     j.starts = &.{};
     for (j.wants) |w| s.rows += w.bytes;
-    try r.states.append(r.gpa, s);
+    r.states.appendAssumeCapacity(s);
     r.ref(j.wants, 1);
     r.touch(r.states.items.len - 1);
     r.counts.writes += 1;

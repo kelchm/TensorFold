@@ -20,6 +20,7 @@ pub fn shorter(s: *const pc.Store, prompt: []const u32, starts: []const u32, spa
 }
 
 fn chooseAt(s: *const pc.Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span, have: ?*pc.Entry, before: ?u32) Choice {
+    if (s.salt != null) return .{};
     const r = s.disk orelse return .{};
     const room = capacity(s, have) orelse return .{};
     const from = if (have) |e| e.at else 0;
@@ -28,7 +29,7 @@ fn chooseAt(s: *const pc.Store, prompt: []const u32, starts: []const u32, spans:
     for (r.states.items, 0..) |*state, i| {
         if (before) |at| if (state.at >= at) continue;
         if (r.blankBytes(state.at) > room) continue;
-        if (!r.matches(state, prompt, starts, spans)) continue;
+        if (!r.matchesImages(state, prompt, starts, spans, s.image_query orelse &.{}, s.image_frame)) continue;
         if (out.disk == null or state.at > r.states.items[out.disk.?].at) out.disk = i;
         if (state.at <= from) continue;
         if (before != null) {

@@ -26,20 +26,8 @@ pub const Failures = struct {
     }
 };
 
-/// Carry the notice along an exact image prefix before keeping its extension can evict it.
-pub fn imageNoted(s: *const pc.Store, tokens: []const u32) bool {
-    for (s.entries.items) |e| if (e.image_noted and std.mem.startsWith(u32, tokens, e.tokens) and
-        @import("cache_images.zig").matches(s, e)) return true;
-    return false;
-}
-
 pub fn queued(r: *Rows, e: *pc.Entry, starts: []const u32) void {
-    if (r.stopped) return;
-    if (e.image_frame != 0 or e.images.len != 0 or !@import("cache_images.zig").diskSafe(e.tokens)) {
-        if (!e.image_noted) pc.note("imprint: {d} tokens kept RAM-only (ImageConversation); image states are not written to disk", .{e.at});
-        e.image_noted = true;
-        return;
-    }
+    if (r.stopped or !store.images.diskEligible(e)) return;
     sync.queued(r, e, starts);
     if (r.img.transient) |mutable| if (mutable(r.family.ptr, e.saved)) preserve(r, e, true);
 }
@@ -50,7 +38,7 @@ pub fn dropped(r: *Rows, e: *pc.Entry) void {
     for (r.queue.items) |q| if (q.entry == e) {
         if (q.waited and !r.stopped) {
             r.next_job +%= 1; // the id a save staged now would take, so no job in flight shares it
-            skip(r, chain.state(r.keying, e.tokens, e.decode_spans, q.starts, e.at), e.at, error.StagingFull);
+            skip(r, chain.stateImages(r.keying, e.tokens, e.decode_spans, q.starts, e.images, e.image_frame, e.at), e.at, error.StagingFull);
         }
         break;
     };
@@ -220,13 +208,15 @@ pub fn reap(r: *Rows) void {
 fn publish(r: *Rows, j: *io.Job) !void {
     if (r.find(j.name)) |_| return;
     if (!complete(r, j)) return error.MissingBlock;
-    var s: store.State = .{ .name = j.name, .at = j.at, .tokens = &.{}, .spans = &.{}, .starts = &.{}, .own = j.files[j.files.len - 1].bytes, .rows = 0, .used = 0, .shared = j.shared };
+    var s: store.State = .{ .name = j.name, .at = j.at, .tokens = &.{}, .spans = &.{}, .starts = &.{}, .images = &.{}, .image_frame = j.image_frame, .own = j.files[j.files.len - 1].bytes, .rows = 0, .used = 0, .shared = j.shared };
     s.tokens = try r.gpa.dupe(u32, j.tokens);
     errdefer r.gpa.free(s.tokens);
     s.spans = try r.gpa.dupe(@import("cache_modes.zig").Span, j.spans);
     errdefer r.gpa.free(s.spans);
     s.starts = try r.gpa.dupe(u32, j.starts);
     errdefer r.gpa.free(s.starts);
+    s.images = try r.gpa.dupe(store.images.Identity, j.images);
+    errdefer r.gpa.free(s.images);
     try r.states.ensureUnusedCapacity(r.gpa, 1);
     try r.blocks.ensureUnusedCapacity(r.gpa, @intCast(j.files.len - 1));
     for (j.files[0 .. j.files.len - 1]) |*f| {
@@ -264,7 +254,7 @@ const Stage = enum { done, waiting, oversized };
 fn stage(r: *Rows, q: Queued, may_wait: bool, borrowed: bool) Stage {
     const at = q.entry.at;
     r.next_job +%= 1;
-    const name = chain.state(r.keying, q.entry.tokens, q.entry.decode_spans, q.starts, at);
+    const name = chain.stateImages(r.keying, q.entry.tokens, q.entry.decode_spans, q.starts, q.entry.images, q.entry.image_frame, at);
     const j = sync.prepare(r, q) catch |err| {
         skip(r, name, at, err);
         return .done;
@@ -308,7 +298,7 @@ fn stageJob(r: *Rows, prepared: *const Job, may_wait: bool) !void {
     const w = r.worker.?;
     if (w.names(prepared.name)) return;
     const e = prepared.entry;
-    const metadata = 4 * (3 + e.tokens.len + 2 * e.decode_spans.len + prepared.starts.len);
+    const metadata = 4 * (3 + e.tokens.len + 2 * e.decode_spans.len + prepared.starts.len) + store.images.metaBytes(e.images, e.image_frame);
     var promised: io.Promised = .empty;
     defer promised.deinit(r.gpa);
     var count: usize = 0;
@@ -316,7 +306,7 @@ fn stageJob(r: *Rows, prepared: *const Job, may_wait: bool) !void {
     var bytes = newBytes(r, &promised, prepared, metadata, &count);
     var charge: u64 = 0;
     while (true) {
-        charge = charged(bytes, count, prepared.wants.len);
+        charge = charged(bytes, count, prepared.wants.len, e.images.len);
         if (!w.fits(charge)) return if (may_wait and w.busy(charge)) error.StagingBusy else error.StagingFull;
         const reserved = w.reserved();
         if (!r.budget(bytes + reserved)) return error.DailyBudgetSpent;
@@ -346,25 +336,30 @@ fn stageJob(r: *Rows, prepared: *const Job, may_wait: bool) !void {
         built += 1;
     };
     const own = &files[built];
-    own.* = .{ .trailer = .{ .kind = @backingInt(file.Kind.state), .payload = 0, .payload_hash = 0, .name = prepared.name, .at = e.at, .block = r.keying.block, .flags = @intFromBool(e.shared) }, .payload = try a.alloc(u8, @intCast(image.total(prepared.own))) };
+    own.* = .{ .trailer = .{ .kind = @backingInt(file.Kind.state), .payload = 0, .payload_hash = 0, .name = prepared.name, .at = e.at, .block = r.keying.block, .flags = store.images.flags(e.shared, e.images, e.image_frame) }, .payload = try a.alloc(u8, @intCast(image.total(prepared.own))) };
     if (own.payload.len > 0) try r.img.gather(r.family.ptr, e.saved, prepared.own, own.payload);
     const tokens = try a.dupe(u32, e.tokens);
     const spans = try a.dupe(@import("cache_modes.zig").Span, e.decode_spans);
     const starts = try a.dupe(u32, prepared.starts);
+    const img_ids = try a.dupe(store.images.Identity, e.images);
+    const img_meta = try store.images.encode(a, img_ids, e.image_frame);
     const counts = try a.create([3]u32);
     counts.* = .{ @intCast(tokens.len), @intCast(spans.len), @intCast(starts.len) };
-    own.meta = try a.dupe([]const u8, &.{ std.mem.asBytes(counts), std.mem.sliceAsBytes(tokens), std.mem.sliceAsBytes(spans), std.mem.sliceAsBytes(starts) });
+    own.meta = if (img_meta.len > 0)
+        try a.dupe([]const u8, &.{ std.mem.asBytes(counts), std.mem.sliceAsBytes(tokens), std.mem.sliceAsBytes(spans), std.mem.sliceAsBytes(starts), img_meta })
+    else
+        try a.dupe([]const u8, &.{ std.mem.asBytes(counts), std.mem.sliceAsBytes(tokens), std.mem.sliceAsBytes(spans), std.mem.sliceAsBytes(starts) });
     const wants = try a.dupe(Want, prepared.wants);
-    j.* = .{ .arena = arena, .id = r.next_job, .generation = w.generation.load(.acquire), .name = prepared.name, .at = e.at, .shared = e.shared, .tokens = tokens, .spans = spans, .starts = starts, .wants = wants, .files = files, .bytes = bytes, .staged = charge, .verify = r.verify, .began = prepared.began };
+    j.* = .{ .arena = arena, .id = r.next_job, .generation = w.generation.load(.acquire), .name = prepared.name, .at = e.at, .shared = e.shared, .tokens = tokens, .spans = spans, .starts = starts, .images = img_ids, .image_frame = e.image_frame, .wants = wants, .files = files, .bytes = bytes, .staged = charge, .verify = r.verify, .began = prepared.began };
     w.submit(j);
 }
 
 /// A staged job's charge: its files' bytes and the bookkeeping the worker holds beside them.
-fn charged(bytes: u64, files: usize, wants: usize) u64 {
-    return bytes + @sizeOf(io.Job) + files * @sizeOf(io.File) + wants * @sizeOf(Want) + 4 * @sizeOf([]const u8);
+fn charged(bytes: u64, files: usize, wants: usize, image_count: usize) u64 {
+    return bytes + @sizeOf(io.Job) + files * @sizeOf(io.File) + wants * @sizeOf(Want) + 5 * @sizeOf([]const u8) + image_count * @sizeOf(store.images.Identity);
 }
 
-/// The most staging a state of `at` tokens charges: none of its blocks on disk, spans and starts at most one a token.
+/// The most staging a state of `at` tokens charges: none of its blocks on disk, metadata and images bounded by tokens.
 pub fn coldCharge(r: *const Rows, at: u32) !u64 {
     if (at == 0) return 0;
     const ps = try r.parts(r.gpa, at);
@@ -375,8 +370,9 @@ pub fn coldCharge(r: *const Rows, at: u32) !u64 {
         const w = image.wholeBlocks(at, r.keying.block, g);
         blocks += w.end - w.first;
     }
-    const metadata = 4 * (4 + 4 * @as(u64, at));
-    return charged(image.imageBytes(ps) + metadata + (blocks + 1) * @sizeOf(file.Trailer), blocks + 1, blocks);
+    const nt: usize = @as(usize, at) + r.keying.lookahead;
+    const metadata = store.images.maxMetaBytes(at, r.keying.lookahead, store.images.flag);
+    return charged(image.imageBytes(ps) + metadata + (blocks + 1) * @sizeOf(file.Trailer), blocks + 1, blocks, nt);
 }
 
 /// Whether the state's block is for this job to write: the disk lacks it and no job in flight is writing it.

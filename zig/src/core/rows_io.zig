@@ -4,6 +4,7 @@ const platform = @import("sys");
 const file = @import("rows_file.zig");
 const chain = @import("rows_chain.zig");
 const Span = @import("cache_modes.zig").Span;
+const Identity = @import("cache_images.zig").Identity;
 const Want = @import("rows_write_sync.zig").Want;
 pub const allocator = std.heap.page_allocator;
 pub const max_jobs = 8;
@@ -26,6 +27,8 @@ pub const Job = struct {
     tokens: []u32,
     spans: []Span,
     starts: []u32,
+    images: []const Identity = &.{},
+    image_frame: u32 = 0,
     wants: []Want,
     files: []File,
     bytes: u64,

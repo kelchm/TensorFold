@@ -21,13 +21,17 @@ pub const Seen = struct {
 
     /// A new entry's times, and its disk-tier name (no tier: an empty identity); hashed only for the dashboard.
     pub fn of(s: *const pc.Store, tokens: []const u32, spans: []const [2]u32, starts: []const u32, at: u32) Seen {
+        return ofImages(s, tokens, spans, starts, &.{}, 0, at);
+    }
+
+    pub fn ofImages(s: *const pc.Store, tokens: []const u32, spans: []const [2]u32, starts: []const u32, imgs: []const @import("cache_images.zig").Identity, frame: u32, at: u32) Seen {
         var out = now();
         if (!named.load(.monotonic)) return out;
         out.id = chain.stem(if (s.disk) |r| named: {
-            const below = pc.rows.startsBelow(r, s.gpa, starts, at) catch break :named chain.state(r.keying, tokens, spans, &.{}, at);
+            const below = pc.rows.startsBelow(r, s.gpa, starts, at) catch break :named chain.stateImages(r.keying, tokens, spans, &.{}, imgs, frame, at);
             defer s.gpa.free(below);
-            break :named chain.state(r.keying, tokens, spans, below, at);
-        } else chain.state(.{ .identity = 0, .block = 0 }, tokens, spans, &.{}, at));
+            break :named chain.stateImages(r.keying, tokens, spans, below, imgs, frame, at);
+        } else chain.stateImages(.{ .identity = 0, .block = 0 }, tokens, spans, &.{}, imgs, frame, at));
         return out;
     }
 

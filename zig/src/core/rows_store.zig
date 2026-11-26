@@ -4,6 +4,7 @@ const platform = @import("sys");
 const pc = @import("prompt_cache.zig");
 const modes = @import("cache_modes.zig");
 pub const image = @import("rows_image.zig");
+pub const images = @import("rows_images.zig");
 pub const chain = @import("rows_chain.zig");
 pub const file = @import("rows_file.zig");
 pub const write = @import("rows_write.zig");
@@ -42,6 +43,8 @@ pub const State = struct {
     tokens: []u32, // position plus lookahead
     spans: []Span, // decoded spans through `at`
     starts: []u32, // a planned family's chunk starts below `at`
+    images: []images.Identity = &.{}, // exact image identities through `tokens.len`
+    image_frame: u32 = 0,
     own: u64,
     rows: u64,
     used: u64,
@@ -172,6 +175,7 @@ pub const Rows = struct {
         gpa.free(s.tokens);
         gpa.free(s.spans);
         gpa.free(s.starts);
+        gpa.free(s.images);
     }
 
     /// A disk restore can need more storage than saving a resident state whose rows stay in the live pool.
@@ -217,7 +221,7 @@ pub const Rows = struct {
     pub fn wantsOf(r: *const Rows, a: Allocator, s: *const State, out: *std.ArrayList(write.Want)) !void {
         const ps = try r.parts(a, s.at);
         defer a.free(ps);
-        try r.blockNames(a, ps, s.tokens, s.spans, s.starts, s.at, out);
+        try r.blockNamesImages(a, ps, s.tokens, s.spans, s.starts, s.images, s.image_frame, s.at, out);
     }
 
     pub fn find(r: *const Rows, name: Name) ?usize {
@@ -227,6 +231,10 @@ pub const Rows = struct {
 
     /// The names of a state's whole blocks, every group, in `out` (a's memory).
     pub fn blockNames(r: *const Rows, a: Allocator, layout: []const image.Part, tokens: []const u32, spans: []const Span, starts: []const u32, at: u32, out: *std.ArrayList(write.Want)) !void {
+        return r.blockNamesImages(a, layout, tokens, spans, starts, &.{}, 0, at, out);
+    }
+
+    pub fn blockNamesImages(r: *const Rows, a: Allocator, layout: []const image.Part, tokens: []const u32, spans: []const Span, starts: []const u32, img_ids: []const images.Identity, image_frame: u32, at: u32, out: *std.ArrayList(write.Want)) !void {
         var gbuf: [8]u32 = undefined;
         for (try image.groups(layout, &gbuf)) |g| {
             const w = image.wholeBlocks(at, r.keying.block, g);
@@ -235,7 +243,7 @@ pub const Rows = struct {
             defer a.free(names);
             const planned_starts = try withAt(a, starts, at, r.keying.planned);
             defer a.free(planned_starts);
-            chain.blocks(r.keying, tokens, spans, planned_starts, at, g, w.end, names);
+            chain.blocksImages(r.keying, tokens, spans, planned_starts, img_ids, image_frame, at, g, w.end, names);
             for (names[w.first..w.end], w.first..) |n, k| try out.append(a, .{ .name = n, .window = g, .k = @intCast(k), .bytes = image.blockBytes(layout, r.keying.block, g) + @sizeOf(file.Trailer) });
         }
     }
@@ -286,8 +294,13 @@ pub const Rows = struct {
     }
 
     pub fn matches(r: *const Rows, s: *const State, prompt: []const u32, starts: []const u32, spans: []const Span) bool {
+        return r.matchesImages(s, prompt, starts, spans, &.{}, 0);
+    }
+
+    pub fn matchesImages(r: *const Rows, s: *const State, prompt: []const u32, starts: []const u32, spans: []const Span, query: []const @import("lanes").stream.Image, frame: u32) bool {
         if (s.tokens.len > prompt.len or s.at >= prompt.len) return false;
         if (!std.mem.eql(u32, prompt[0..s.tokens.len], s.tokens) or !modes.equal(s.spans, spans, s.at)) return false;
+        if (!images.matches(s.images, s.image_frame, s.tokens.len, query, frame)) return false;
         if (r.keying.planned and starts.len == 0 and r.grid > 0) return s.at % r.grid == 0 and onGrid(s.starts, s.at, r.grid);
         return !r.keying.planned or sameBelow(starts, s.starts, s.at);
     }
@@ -447,21 +460,13 @@ pub const Rows = struct {
     fn readState(r: *Rows, p: [:0]const u8) !void {
         var o = try file.open(p, .state, null);
         defer o.close();
+        if (o.trailer.flags & ~images.flag_mask != 0 or o.trailer.at == 0 or o.trailer.block != r.keying.block or o.trailer.meta > images.maxMetaBytes(o.trailer.at, r.keying.lookahead, o.trailer.flags)) return error.RowsRead;
         const m = try file.meta(&o, r.gpa);
         defer r.gpa.free(m);
-        if (m.len < 12) return error.RowsRead;
-        const counts = std.mem.bytesAsSlice(u32, m[0..12]);
-        const nt: usize = counts[0];
-        const ns: usize = counts[1];
-        const nst: usize = counts[2];
-        if (m.len != 12 + 4 * (nt + 2 * ns + nst) or nt == 0) return error.RowsRead;
-        var s: State = .{ .name = o.trailer.name, .at = o.trailer.at, .tokens = &.{}, .spans = &.{}, .starts = &.{}, .own = o.trailer.payload + o.trailer.meta + @sizeOf(file.Trailer), .rows = 0, .used = 0, .shared = o.trailer.flags & 1 != 0 };
+        const parsed = try images.parseMeta(r.gpa, m, o.trailer.flags);
+        var s: State = .{ .name = o.trailer.name, .at = o.trailer.at, .tokens = parsed.tokens, .spans = parsed.spans, .starts = parsed.starts, .images = parsed.images, .image_frame = parsed.image_frame, .own = o.trailer.payload + o.trailer.meta + @sizeOf(file.Trailer), .rows = 0, .used = 0, .shared = o.trailer.flags & 1 != 0 };
         errdefer freeState(r.gpa, &s);
-        s.tokens = try r.gpa.dupe(u32, @alignCast(std.mem.bytesAsSlice(u32, m[12..][0 .. 4 * nt])));
-        s.spans = try r.gpa.dupe(Span, @alignCast(std.mem.bytesAsSlice(Span, m[12 + 4 * nt ..][0 .. 8 * ns])));
-        s.starts = try r.gpa.dupe(u32, @alignCast(std.mem.bytesAsSlice(u32, m[12 + 4 * nt + 8 * ns ..][0 .. 4 * nst])));
-        if (s.at == 0 or s.tokens.len != @as(usize, s.at) + r.keying.lookahead or o.trailer.block != r.keying.block) return error.RowsRead;
-        if (!std.mem.eql(u8, &chain.state(r.keying, s.tokens, s.spans, s.starts, s.at), &s.name)) return error.RowsRead;
+        if (s.tokens.len != @as(usize, s.at) + r.keying.lookahead or !std.mem.eql(u8, &chain.stateImages(r.keying, s.tokens, s.spans, s.starts, s.images, s.image_frame, s.at), &s.name)) return error.RowsRead;
         modes.validate(s.spans) catch return error.RowsRead;
         r.clock += 1;
         s.used = r.clock;

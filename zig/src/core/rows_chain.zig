@@ -2,6 +2,7 @@
 const std = @import("std");
 const Sha = std.crypto.hash.sha2.Sha256;
 const Span = [2]u32;
+const Identity = @import("cache_images.zig").Identity;
 
 pub const Name = [32]u8;
 
@@ -57,9 +58,25 @@ fn nextStart(starts: []const u32, at: u32, end: u32) u32 {
     return best;
 }
 
+fn hashImage(h: *Sha, img: Identity) void {
+    words(h, &.{ img.at, img.tokens, img.gh, img.gw, @truncate(img.hash), @truncate(img.hash >> 32) });
+}
+
 /// Names of blocks [0, n) of group `window` for a state at `at` (`tokens` holds at + lookahead), into `out`.
 pub fn blocks(k: Keying, tokens: []const u32, spans: []const Span, starts: []const u32, at: u32, window: u32, n: u32, out: []Name) void {
+    blocksImages(k, tokens, spans, starts, &.{}, 0, at, window, n, out);
+}
+
+/// Names of blocks [0, n), folding image_frame (all blocks) and image identities entering each block or its lookahead.
+pub fn blocksImages(k: Keying, tokens: []const u32, spans: []const Span, starts: []const u32, images: []const Identity, image_frame: u32, at: u32, window: u32, n: u32, out: []Name) void {
     var d = k.seed();
+    if (image_frame != 0) {
+        var fh = Sha.init(.{});
+        fh.update(&d);
+        fh.update("image frame 1");
+        words(&fh, &.{image_frame});
+        d = fh.finalResult();
+    }
     var i: u32 = 0;
     while (i < n) : (i += 1) {
         const lo = i * k.block;
@@ -68,23 +85,50 @@ pub fn blocks(k: Keying, tokens: []const u32, spans: []const Span, starts: []con
         h.update(&d);
         h.update(std.mem.sliceAsBytes(tokens[lo..hi]));
         edges(&h, spans, starts, lo, hi, k.planned);
+        var n_in: u32 = 0;
+        for (images) |img| n_in += @intFromBool(img.at >= lo and img.at < hi);
+        if (n_in > 0) {
+            h.update("images 1");
+            words(&h, &.{n_in});
+            for (images) |img| if (img.at >= lo and img.at < hi) hashImage(&h, img);
+        }
         d = h.finalResult();
         var b = Sha.init(.{});
         b.update(&d);
         words(&b, &.{ window, k.lookahead });
         b.update(std.mem.sliceAsBytes(tokens[hi..][0..k.lookahead]));
         if (k.planned) words(&b, &.{nextStart(starts, hi, at)});
+        if (k.lookahead > 0) {
+            const la_end = hi + k.lookahead;
+            var n_la: u32 = 0;
+            for (images) |img| n_la += @intFromBool(img.at >= hi and img.at < la_end);
+            if (n_la > 0) {
+                b.update("images lookahead 1");
+                words(&b, &.{n_la});
+                for (images) |img| if (img.at >= hi and img.at < la_end) hashImage(&b, img);
+            }
+        }
         out[i] = b.finalResult();
     }
 }
 
 /// A state's name: its position, every token it read, its decoded spans and (planned) its chunk starts below it.
 pub fn state(k: Keying, tokens: []const u32, spans: []const Span, starts: []const u32, at: u32) Name {
+    return stateImages(k, tokens, spans, starts, &.{}, 0, at);
+}
+
+/// A state's name including optional image frame and image identities (identical to `state` when both are absent).
+pub fn stateImages(k: Keying, tokens: []const u32, spans: []const Span, starts: []const u32, images: []const Identity, image_frame: u32, at: u32) Name {
     var h = Sha.init(.{});
     h.update(&k.seed());
     words(&h, &.{ at, @intCast(tokens.len) });
     h.update(std.mem.sliceAsBytes(tokens));
     edges(&h, spans, starts, 0, at, k.planned);
+    if (image_frame != 0 or images.len > 0) {
+        h.update("images 1");
+        words(&h, &.{ image_frame, @intCast(images.len) });
+        for (images) |img| hashImage(&h, img);
+    }
     return h.finalResult();
 }
 
@@ -142,6 +186,37 @@ test "an unplanned family's names ignore chunk starts" {
     blocks(k, &t, &.{}, &.{ 2, 5 }, 8, 0, 2, &b);
     try std.testing.expectEqualSlices(Name, &a, &b);
     try std.testing.expectEqual(state(k, &t, &.{}, &.{3}, 8), state(k, &t, &.{}, &.{ 2, 5 }, 8));
+}
+
+test "image identities share pre-image blocks, separate on image fields, lookahead boundaries and frame" {
+    const k: Keying = .{ .identity = 9, .block = 4, .lookahead = 1 };
+    const t = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    const img_a = [_]Identity{.{ .at = 5, .tokens = 2, .gh = 2, .gw = 2, .hash = 101 }};
+    const img_b = [_]Identity{.{ .at = 5, .tokens = 2, .gh = 2, .gw = 2, .hash = 102 }};
+    var plain: [2]Name = undefined;
+    var a: [2]Name = undefined;
+    var b: [2]Name = undefined;
+    blocks(k, &t, &.{}, &.{}, 8, 0, 2, &plain);
+    blocksImages(k, &t, &.{}, &.{}, &.{}, 0, 8, 0, 2, &a);
+    try std.testing.expectEqualSlices(Name, &plain, &a);
+    try std.testing.expectEqual(state(k, &t, &.{}, &.{}, 8), stateImages(k, &t, &.{}, &.{}, &.{}, 0, 8));
+    // Image in block 1 shares block 0 and separates block 1 and state name.
+    blocksImages(k, &t, &.{}, &.{}, &img_a, 0, 8, 0, 2, &a);
+    blocksImages(k, &t, &.{}, &.{}, &img_b, 0, 8, 0, 2, &b);
+    try std.testing.expectEqual(plain[0], a[0]);
+    try std.testing.expectEqual(a[0], b[0]);
+    try std.testing.expect(!std.mem.eql(u8, &a[1], &b[1]));
+    try std.testing.expect(!std.mem.eql(u8, &stateImages(k, &t, &.{}, &.{}, &img_a, 0, 8), &stateImages(k, &t, &.{}, &.{}, &img_b, 0, 8)));
+    // Image at block 0's lookahead boundary (at = 4) separates block 0 as well as block 1.
+    const la_a = [_]Identity{.{ .at = 4, .tokens = 1, .gh = 2, .gw = 2, .hash = 101 }};
+    const la_b = [_]Identity{.{ .at = 4, .tokens = 1, .gh = 2, .gw = 2, .hash = 102 }};
+    blocksImages(k, &t, &.{}, &.{}, &la_a, 0, 8, 0, 2, &a);
+    blocksImages(k, &t, &.{}, &.{}, &la_b, 0, 8, 0, 2, &b);
+    try std.testing.expect(!std.mem.eql(u8, &a[0], &b[0]) and !std.mem.eql(u8, &a[1], &b[1]));
+    // Nonzero image_frame separates every block from block 0 onward.
+    blocksImages(k, &t, &.{}, &.{}, &.{}, 7, 8, 0, 2, &a);
+    blocksImages(k, &t, &.{}, &.{}, &.{}, 8, 8, 0, 2, &b);
+    try std.testing.expect(!std.mem.eql(u8, &plain[0], &a[0]) and !std.mem.eql(u8, &a[0], &b[0]));
 }
 
 /// A planned state's starts with its own position last: its blocks' last chunk ends by it.
