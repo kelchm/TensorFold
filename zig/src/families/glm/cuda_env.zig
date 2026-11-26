@@ -15,6 +15,29 @@ pub fn requestStartsAlone(learn_conversations: bool) !void {
     if (on and try kp.sharing() > 0) return error.GlmRequestStartsWithSharedKv;
 }
 
+/// The draft tail is private to the external DFlash2 model and to copied snapshots.
+pub fn draftSnapshotMode(enabled: bool, shared: usize, drafts: bool, external: bool) !void {
+    if (!enabled) return;
+    if (shared != 0) return error.GlmDraftSnapshotWithSharedKv;
+    if (!drafts or !external) return error.GlmDraftSnapshotWithoutDrafter;
+}
+
+test "startup switches: a draft snapshot requires an external drafter and copied KV only when enabled" {
+    for ([_]usize{ 0, 1, 8 }) |shared| {
+        for ([_]bool{ false, true }) |drafts| {
+            for ([_]bool{ false, true }) |external| {
+                try draftSnapshotMode(false, shared, drafts, external);
+                const expected = draftSnapshotMode(true, shared, drafts, external);
+                if (shared > 0) {
+                    try std.testing.expectError(error.GlmDraftSnapshotWithSharedKv, expected);
+                } else if (!drafts or !external) {
+                    try std.testing.expectError(error.GlmDraftSnapshotWithoutDrafter, expected);
+                } else try expected;
+            }
+        }
+    }
+}
+
 /// TF_GLM_CONTEXT_CEILING: --context past config.json's window, as the attention has no rotary positions to stretch.
 pub const ceiling_switch = "TF_GLM_CONTEXT_CEILING";
 

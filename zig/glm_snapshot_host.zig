@@ -43,6 +43,9 @@ test "GLM snapshots: a short prefix fits 4 GiB even with a 524288-token configur
     e.cur = &seq;
     e.c = w.config;
     e.mtp = true;
+    e.settings = .{};
+    e.share_pages = false;
+    e.drafter = null;
     e.capacity = seq.st.capacity;
     for ([_]u32{ 2048, 34816, 266240 }) |at| {
         std.debug.print("GLM snapshot sizing rank=0 world=2 at={d} bytes={d} arena={d}\n", .{ at, glm.native.snap_bytes(&e, at), seq.st.arena.buf.len });
@@ -427,6 +430,9 @@ test "GLM snapshots: 0.3 GiB fits the first default TP2 prefix at 256K but not a
     e.cur = &seq;
     e.c = w.config;
     e.mtp = true;
+    e.settings = .{};
+    e.share_pages = false;
+    e.drafter = null;
     e.capacity = seq.st.capacity;
     const minimum = glm.native.snap_min_bytes(&e);
     const budget: u64 = 322122547;
@@ -737,4 +743,236 @@ test "GLM snapshots: an E4M3 state kept on one paged stream restores into anothe
         f.e.dropped.clearRetainingCapacity();
     }
     f.e.cur = &f.seq;
+}
+
+test "GLM snapshots: copied draft KV keeps a wrapped initialized tail across slots on each rank" {
+    const snap = glm.dflash.snapshot;
+    for (0..2) |rank| {
+        var d = rec.init();
+        var f: Fixture = undefined;
+        try f.init(&d, rank, 2, false);
+        defer f.deinit();
+        var dr: glm.dflash.Drafter = undefined;
+        dr.d = &d;
+        dr.gpa = t.allocator;
+        dr.slots = .empty;
+        defer {
+            for (dr.slots.items) |*sl| if (sl.ring) |*r| r.free();
+            dr.slots.deinit(t.allocator);
+        }
+        f.e.drafter = &dr;
+        try dr.restart(0, 0);
+        try dr.restart(1, 0);
+        const src = dr.slots.items[0].ring.?;
+        const dst = dr.slots.items[1].ring.?;
+        const at = 2100;
+        try f.mark(at, 0, 11);
+        const target = try t.allocator.dupe(u8, rec.bytes(f.seq.st.arena.buf.ptr, f.seq.st.arena.buf.len));
+        defer t.allocator.free(target);
+        const source = rec.bytes(src.ptr, src.len);
+        for (0..snap.bands * snap.window) |i| {
+            const byte: u8 = @intCast((i * 31 + rank + 1) % 239);
+            @memset(source[i * snap.stride ..][0..snap.stride], byte);
+        }
+        const dest = rec.bytes(dst.ptr, dst.len);
+        @memset(dest, 255);
+        const valid = &dr.slots.items[0].prompt_history;
+        valid.append(200, 100);
+        valid.append(1350, 500); // a hole; only the new extent can be attributed to this prompt
+        try t.expectEqual(@as(usize, 0), valid.rows(at));
+        valid.append(1850, 250);
+        try t.expectEqual(@as(usize, snap.cap), valid.rows(at));
+        const baseline = f.e.stateBytes(at);
+        f.e.settings.dflash_snap_context = true;
+        f.e.drafter = null;
+        try t.expectEqual(baseline, f.e.stateBytes(at));
+        f.e.drafter = &dr;
+        const budget = f.e.stateBytes(at);
+        try t.expect(budget >= baseline + snap.bytes(snap.cap) - (2 << 20));
+        try f.e.prepareSnapshots(budget);
+        try f.e.keepAs(1);
+        const saved = f.e.snaps.get(1).?;
+        try t.expectEqual(@as(usize, at), saved.draft.end);
+        try t.expectEqual(@as(usize, snap.cap), saved.draft.count);
+        try t.expectEqual(snap.bytes(snap.cap), saved.packed_len - saved.len);
+        try t.expectEqual(budget, saved.lease.ids.items.len * (2 << 20));
+        const original_copies = rec.copies;
+        f.e.slot = 1;
+        try f.mark(3999, 0, 77);
+        dr.slots.items[1].v_rows = 4;
+        rec.fail_copy = rec.copies + original_copies; // failure in the last tail range
+        try t.expectError(error.NotReady, f.e.restoreState(1));
+        try t.expectEqual(@as(usize, 0), dr.slots.items[1].prompt_history.rows(at));
+        try t.expectEqual(@as(usize, 0), dr.slots.items[1].v_rows);
+        rec.fail_copy = null;
+        try f.e.restoreState(1);
+        try f.expectPrefix(target, at, 0);
+        try t.expectEqual(@as(i64, at - snap.cap), dr.slots.items[1].from);
+        try t.expectEqual(@as(usize, snap.cap), dr.slots.items[1].prompt_history.rows(at));
+        for (0..snap.bands * snap.window) |i| {
+            const slot = i % snap.window;
+            const in_tail = slot >= at - snap.cap or slot < at % snap.window;
+            const want: u8 = if (in_tail) @intCast((i * 31 + rank + 1) % 239) else 255;
+            try t.expectEqual(want, dest[i * snap.stride]);
+            try t.expectEqual(want, dest[(i + 1) * snap.stride - 1]);
+        }
+        f.e.snaps.getPtr(1).?.draft.end -= 1;
+        @memset(dest, 253);
+        try f.e.restoreState(1);
+        try t.expectEqual(@as(i64, at), dr.slots.items[1].from);
+        try t.expectEqual(@as(usize, 0), dr.slots.items[1].prompt_history.rows(at));
+        try t.expectEqual(@as(u8, 253), dest[0]);
+        f.e.dropState(1);
+        try t.expectEqual(budget, f.e.snap_pages.?.spare());
+        f.e.slot = 0;
+        try f.mark(at, 0, 11);
+        rec.fail_copy = rec.copies + original_copies;
+        try t.expectError(error.NotReady, f.e.keepAs(2));
+        try t.expect(!f.e.holds(2));
+        try t.expectEqual(budget, f.e.snap_pages.?.spare());
+        rec.fail_copy = null;
+        try f.e.keepAs(2);
+        try t.expectEqual(@as(usize, snap.cap), f.e.snaps.get(2).?.draft.count);
+        f.e.dropState(2);
+    }
+}
+
+// Run the actual prompt ingestion and range bookkeeping with a CPU stand-in for the
+// projection kernels. Each ring row is independently identifiable by band and position.
+const DraftPrompt = struct {
+    dr: *glm.dflash.Drafter,
+    taps_prefill: u64 = 0,
+    tap_rows: usize = glm.dflash.MAX_CTX,
+
+    pub fn slot(p: *@This(), i: u32) !*glm.dflash.Slot {
+        return p.dr.slot(i);
+    }
+
+    fn value(pos: usize, band: usize) u8 {
+        return @intCast((pos * 11 + 29 * band) % 239);
+    }
+
+    pub fn ingest(_: *@This(), _: void, runs: []const glm.dflash.Run) !void {
+        const sn = glm.dflash.snapshot;
+        for (runs) |r| {
+            const start: usize = @intCast(r.pos0);
+            for (start..start + r.n) |pos| {
+                for (0..sn.bands) |band| {
+                    const offset = (band * sn.window + pos % sn.window) * sn.stride;
+                    @memset(rec.bytes(r.ring + offset, sn.stride), value(pos, band));
+                }
+            }
+        }
+    }
+
+    fn expectRange(ring: cuda.DeviceBuffer, end: usize, count: usize) !void {
+        const sn = glm.dflash.snapshot;
+        for (0..sn.bands) |band| {
+            for (0..sn.window) |row| {
+                // Distance backwards from the last committed row, including that row.
+                const distance = (end + sn.window - 1 - row) % sn.window;
+                const byte = if (distance < count) value(end - 1 - distance, band) else 255;
+                const data = rec.bytes(ring.ptr + (band * sn.window + row) * sn.stride, sn.stride);
+                try t.expectEqual(byte, data[0]);
+                try t.expectEqual(byte, data[data.len - 1]);
+            }
+        }
+    }
+};
+
+test "GLM snapshots: admission ignores the bound slot and chained prompt keeps charge only realized rows" {
+    const sn = glm.dflash.snapshot;
+    var d = rec.init();
+    var f: Fixture = undefined;
+    try f.init(&d, 0, 1, false);
+    defer f.deinit();
+    var dr: glm.dflash.Drafter = undefined;
+    dr.d = &d;
+    dr.gpa = t.allocator;
+    dr.slots = .empty;
+    defer {
+        for (dr.slots.items) |*sl| if (sl.ring) |*r| r.free();
+        dr.slots.deinit(t.allocator);
+    }
+    f.e.drafter = &dr;
+    try dr.restart(0, 0);
+    try dr.restart(1, 0);
+    const src = dr.slots.items[0].ring.?;
+    const dst = dr.slots.items[1].ring.?;
+    var prompt: DraftPrompt = .{ .dr = &dr };
+    f.e.settings.dflash_snap_context = true;
+    try f.e.prepareSnapshots(3 * f.e.stateBytes(3000));
+
+    for ([_]usize{ 63, 2048, 2049 }, [_]usize{ 17, 640, 411 }) |at, rows| {
+        try dr.restart(0, at - rows);
+        try dr.restart(1, 0);
+        @memset(rec.bytes(src.ptr, src.len), 254);
+        @memset(rec.bytes(dst.ptr, dst.len), 255);
+        try glm.dflash.ingestPrompt(&prompt, {}, 0, at - rows, rows, at, 0);
+        try f.mark(at, 0, 17);
+
+        // A's initialized history, B's empty history, and an uncreated slot yield the same promise.
+        f.e.slot = 0;
+        const promised = f.e.stateBytes(at);
+        for ([_]u32{ 1, 5 }) |other| {
+            f.e.slot = other;
+            try t.expectEqual(promised, f.e.stateBytes(at));
+        }
+        f.e.slot = 1;
+        try f.e.keepAs(10);
+        const empty = f.e.snaps.get(10).?;
+        try t.expectEqual(@as(usize, 0), empty.draft.count);
+        try t.expectEqual(try glm.snapshots.pages.rounded(empty.len), empty.lease.ids.items.len * glm.snapshots.pages.page);
+        try t.expectEqual(try glm.snapshots.pages.rounded(empty.len + sn.bytes(@min(at, sn.cap))), promised);
+        f.e.dropState(10);
+
+        f.e.slot = 0;
+        try f.e.keepAs(11);
+        const first = f.e.snaps.get(11).?;
+        try t.expectEqual(rows, first.draft.count);
+        try t.expectEqual(try glm.snapshots.pages.rounded(first.len + sn.bytes(rows)), first.lease.ids.items.len * glm.snapshots.pages.page);
+        f.e.slot = 1;
+        try f.e.restoreState(11);
+        try DraftPrompt.expectRange(dst, at, rows);
+        try t.expectEqual(@as(i64, @intCast(at - rows)), dr.slots.items[1].from);
+        try glm.dflash.ingestPrompt(&prompt, {}, 1, at, 5, at + 5, 0);
+        try f.mark(at + 5, 0, 47);
+        try f.e.keepAs(12);
+        const extended = @min(sn.cap, rows + 5);
+        try t.expectEqual(extended, f.e.snaps.get(12).?.draft.count);
+        @memset(rec.bytes(src.ptr, src.len), 255);
+        f.e.slot = 0;
+        try f.e.restoreState(12);
+        try DraftPrompt.expectRange(src, at + 5, extended);
+        try t.expectEqual(@as(i64, @intCast(at + 5 - extended)), dr.slots.items[0].from);
+        f.e.dropState(11);
+        f.e.dropState(12);
+    }
+
+    // Disable the feature with a live drafter and fully valid input. The target-only
+    // copy, rounded charge and ordinary cold draft restart match the stock path.
+    const at = 63; // fewer than one 512-row shared page, legal for the recording window
+    try f.mark(at, 0, 14);
+    try dr.restart(0, 0);
+    try glm.dflash.ingestPrompt(&prompt, {}, 0, 0, at, at, 0);
+    f.e.slot = 0;
+    f.e.settings.dflash_snap_context = false;
+    const baseline = f.e.stateBytes(at);
+    for ([_]bool{ false, true }) |shared| {
+        f.e.settings.dflash_snap_context = shared; // direct shared-engine defense, in addition to startup denial
+        f.e.share_pages = shared;
+        f.e.slot = 0;
+        try t.expectEqual(baseline, f.e.stateBytes(at));
+        try f.e.keepAs(20);
+        const s = f.e.snaps.get(20).?;
+        try t.expectEqual(s.len, s.packed_len);
+        try t.expectEqual(@as(usize, 0), s.draft.count);
+        try t.expectEqual(baseline, s.lease.ids.items.len * glm.snapshots.pages.page);
+        f.e.slot = 1;
+        @memset(rec.bytes(dst.ptr, dst.len), 255);
+        try f.e.restoreState(20);
+        try DraftPrompt.expectRange(dst, at, 0);
+        try t.expectEqual(@as(i64, at), dr.slots.items[1].from);
+        f.e.dropState(20);
+    }
 }

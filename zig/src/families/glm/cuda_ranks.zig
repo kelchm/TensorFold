@@ -14,6 +14,7 @@ pub const Settings = struct {
     absorb_mma: bool = false,
     prompt_s2: bool = false,
     dflash_q4_down: bool = false,
+    dflash_snap_context: bool = false,
     verify_tiles: @import("cuda_verify_tiles.zig").Options = .{},
     kv8: bool = false, // --kv-cache fp8, supplied by the native options rather than an environment override
     pages: bool = false, // TF_KV_PAGES as `open` resolves it (with the world and --kv-cache): every sequence on pages
@@ -86,7 +87,7 @@ pub const Settings = struct {
                 return error.BadSetting;
             }
         }
-        inline for (.{ .{ "TF_GLM_PACKED_PROMPT_S2", "prompt_s2" }, .{ "TF_GLM_ABSORB_MMA", "absorb_mma" }, .{ "TF_GLM_KV_POW2", "kv_pow2" }, .{ "TF_GLM_DFLASH_ONLY", "dflash_only" }, .{ "TF_GLM_DFLASH_Q4_DOWN", "dflash_q4_down" } }) |flag| {
+        inline for (.{ .{ "TF_GLM_PACKED_PROMPT_S2", "prompt_s2" }, .{ "TF_GLM_ABSORB_MMA", "absorb_mma" }, .{ "TF_GLM_KV_POW2", "kv_pow2" }, .{ "TF_GLM_DFLASH_ONLY", "dflash_only" }, .{ "TF_GLM_DFLASH_Q4_DOWN", "dflash_q4_down" }, .{ "TF_GLM_DFLASH_SNAP_CONTEXT", "dflash_snap_context" } }) |flag| {
             if (get(flag[0])) |v| {
                 if (std.mem.eql(u8, v, "1")) @field(s, flag[1]) = true else if (!std.mem.eql(u8, v, "0")) {
                     problem.* = flag[0] ++ ": 0 or 1";
@@ -266,7 +267,7 @@ fn wireOpens(get: *const fn ([:0]const u8) ?[]const u8) bool {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 35, // MTP also carries the DFlash2 single-stream pricing mode
+    layout: u32 = 36, // bit 5 of mtp enables copied DFlash2 context
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -365,7 +366,7 @@ pub const Fingerprint = extern struct {
             .pair = @intFromBool(s.pair),
             .pair_experts = @as(u32, @intFromBool(s.pair_experts)) | (@as(u32, @intFromBool(s.exl3_decode)) << 1) | (@as(u32, @intFromBool(s.exl3_nmajor)) << 2),
             .layers = s.layers,
-            .mtp = @as(u32, @intFromBool(mtp)) | (@as(u32, @intFromBool(s.dflash_only)) << 2) | (@as(u32, s.dflash_live_prices) << 3),
+            .mtp = @as(u32, @intFromBool(mtp)) | (@as(u32, @intFromBool(s.dflash_only)) << 2) | (@as(u32, s.dflash_live_prices) << 3) | (@as(u32, @intFromBool(s.dflash_snap_context)) << 5),
             .roce_multi = @intFromBool(s.roce_multi),
             .roce_wide = @intFromBool(s.roce_wide and world >= 3), // two ranks ask by default, so a lone TF_ROCE=1 there is no difference
             .draft_split = @intFromBool(s.draft_split and world >= 3), // two ranks split whatever it says
@@ -532,7 +533,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .pair => "TF_GLM_PROMPT_PAIR",
         .pair_experts => "TF_GLM_PAIR_EXPERTS / TF_GLM_EXL3_DECODE / TF_GLM_EXL3_N_MAJOR",
         .layers => "TF_GLM_LAYERS",
-        .mtp => "--no-drafts, --drafter, TF_GLM_DFLASH_ONLY or TF_GLM_DFLASH_LIVE_PRICES differs across ranks",
+        .mtp => "--no-drafts, --drafter, TF_GLM_DFLASH_ONLY, TF_GLM_DFLASH_LIVE_PRICES or TF_GLM_DFLASH_SNAP_CONTEXT differs across ranks",
         .vision => "--vision (or its image tokens) given to some ranks and not others",
         .video_tokens => "--vision-video-tokens",
         .max_images => "the image count limit",
@@ -591,4 +592,30 @@ test "TF_GLM_PAIR_EXPERTS: off by default, 0 or 1, and every rank must agree" {
     try std.testing.expectEqualStrings("TF_GLM_PAIR_EXPERTS: 0 or 1", problem);
     const all = [_]Fingerprint{ Fingerprint.of(2, 0, on, 8192, true, @splat(0), @splat(0), @splat(0)), Fingerprint.of(2, 1, .{}, 8192, true, @splat(0), @splat(0), @splat(0)) };
     try std.testing.expectEqual(Mismatch{ .field = .pair_experts, .rank = 1 }, mismatch(&all).?);
+}
+
+test "TF_GLM_DFLASH_SNAP_CONTEXT: startup switches are off by default, 0 or 1, and every rank must agree" {
+    const Reader = struct {
+        fn absent(_: [:0]const u8) ?[]const u8 {
+            return null;
+        }
+        fn on(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_DFLASH_SNAP_CONTEXT")) "1" else null;
+        }
+        fn off(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_DFLASH_SNAP_CONTEXT")) "0" else null;
+        }
+        fn bad(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_DFLASH_SNAP_CONTEXT")) "2" else null;
+        }
+    };
+    var problem: []const u8 = "";
+    try std.testing.expect(!(try Settings.read(Reader.absent, &problem)).dflash_snap_context);
+    const on = try Settings.read(Reader.on, &problem);
+    try std.testing.expect(on.dflash_snap_context);
+    try std.testing.expect(!(try Settings.read(Reader.off, &problem)).dflash_snap_context);
+    try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
+    try std.testing.expectEqualStrings("TF_GLM_DFLASH_SNAP_CONTEXT: 0 or 1", problem);
+    const all = [_]Fingerprint{ Fingerprint.of(2, 0, on, 8192, true, @splat(0), @splat(0), @splat(0)), Fingerprint.of(2, 1, .{}, 8192, true, @splat(0), @splat(0), @splat(0)) };
+    try std.testing.expectEqual(Mismatch{ .field = .mtp, .rank = 1 }, mismatch(&all).?);
 }

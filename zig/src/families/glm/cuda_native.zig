@@ -222,6 +222,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     }
     if (share_mod.moved((@import("sys").environment.Process{}).get("TF_GLM_KV_SHARE") orelse "")) return error.GlmKvShareMoved; // before any rank opens
     const share_snaps = try kp.sharing();
+    try @import("cuda_env.zig").draftSnapshotMode(set.dflash_snap_context, share_snaps, o.drafts, o.drafter != null);
     if (share_mod.tooMany(share_snaps)) {
         std.log.err("TF_KV_SHARE={d} asks more kept states than the {d} it keeps: set {d} or fewer", .{ share_snaps, kv.most_snaps, kv.most_snaps });
         return error.GlmShareTooMany;
@@ -536,6 +537,8 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.GlmKvShareMoved => "TF_GLM_KV_SHARE is now TF_KV_SHARE, the prompt store every family on the KV pool shares: set that instead",
         error.GlmRequestStartsWithSharedKv => "TF_GLM_REQUEST_STARTS=1 cannot be used with TF_KV_SHARE above 0: unset request starts or disable shared KV",
         error.GlmRequestStartsWithLearnConversations => "TF_GLM_REQUEST_STARTS=1 cannot be used with --learn-conversations: unset request starts or serve without it",
+        error.GlmDraftSnapshotWithSharedKv => "TF_GLM_DFLASH_SNAP_CONTEXT=1 requires copied snapshots: set TF_KV_SHARE=0",
+        error.GlmDraftSnapshotWithoutDrafter => "TF_GLM_DFLASH_SNAP_CONTEXT=1 requires enabled drafts and --drafter",
         error.GlmShareNeedsPages => "TF_KV_SHARE keeps prompts as KV pool pages: set TF_KV_PAGES=on as well",
         error.GlmShareTooMany => std.fmt.comptimePrint("TF_KV_SHARE keeps at most {d} states: set {d} or fewer", .{ kv.most_snaps, kv.most_snaps }),
         error.BadCopyPolicy => "TF_GLM_COPIES: expected 0 or 1 for verified root/context copies",

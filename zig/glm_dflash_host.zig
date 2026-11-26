@@ -51,7 +51,7 @@ test "glm dflash: each optional decode switch has its own rank fingerprint acros
     for (0..8) |i| {
         const s: ranks.Settings = .{ .dflash_only = i & 1 != 0, .l2pf = .{ .shared_first = i & 2 != 0 }, .exl3_decode = true, .exl3_nmajor = i & 4 != 0 };
         const f = ranks.Fingerprint.of(2, 0, s, 8192, true, h, h, h);
-        try t.expectEqual(@as(u32, 35), f.layout);
+        try t.expectEqual(@as(u32, 36), f.layout);
         try t.expectEqual(@as(u32, 1 | (@as(u32, @intFromBool(s.dflash_only)) << 2)), f.mtp);
         try t.expectEqual(@as(u32, 1 | (@as(u32, @intFromBool(s.l2pf.shared_first)) << 1)), f.l2pf[0]);
         try t.expectEqual(@as(u32, 2 | (@as(u32, @intFromBool(s.exl3_nmajor)) << 2)) | @intFromBool(s.pair_experts), f.pair_experts);
