@@ -244,15 +244,16 @@ can still refuse startup. The line is printed again when an idle engine reloads.
 
 | `TF_KV_PAGES` | BF16, one rank | BF16, two or more ranks | `--kv-cache fp8`, any rank count |
 | --- | --- | --- | --- |
-| Unset or exactly `auto` | Window per stream | Pool pages | Window per stream |
+| Unset, empty, whitespace, or `auto` | Window per stream | Pool pages | Window per stream |
 | Exactly `off` or `0` | Window per stream | Window per stream | Window per stream |
-| Every other value | Pool pages | Pool pages | Refused with `Fp8OnPages` |
+| Exactly `on`, `1`, or `all` | Pool pages | Pool pages | Pool pages |
+| Every other value | Refused with `BadKvPages` | Refused with `BadKvPages` | Refused with `BadKvPages` |
 
-These are the existing parser rules, including empty text, `all`, `false`, uppercase spellings and whitespace counting
-as `on`. Prefer `auto`, `off` or `on` explicitly. The family line normalizes these choices and never echoes arbitrary
-input; the registry line shows bounded, escaped raw overrides. FP8 refusals keep their existing error and peer
-notification behavior, and do not print a resolved selection. No paging or FP8 qualification is added by this report;
-the existing BF16 paging evidence is [#1322](https://github.com/ashhart/TensorFold/pull/1322).
+Prefer `auto`, `off`, or `on` explicitly. Empty or whitespace-only text resolves as unset (`auto`), while unrecognized
+values are refused with `BadKvPages` on every rank instead of counting as `on`. The family line normalizes these choices
+and never echoes arbitrary input; the registry line shows bounded, escaped raw overrides. Refusals keep their existing
+error and peer notification behavior, and do not print a resolved selection. No paging or FP8 qualification is added by
+this report; the existing BF16 paging evidence is [#1322](https://github.com/ashhart/TensorFold/pull/1322).
 
 ## Further profile work
 

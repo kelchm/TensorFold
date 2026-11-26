@@ -39,6 +39,10 @@ pub const H = struct {
         @memset(bytes(p, n), v);
         return 0;
     }
+    fn set32(p: u64, v: c_uint, n: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+        @memset(@as([*]u32, @ptrFromInt(p))[0..n], v);
+        return 0;
+    }
     fn dtod(dst: u64, src: u64, n: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
         @memcpy(bytes(dst, n), bytes(src, n));
         return 0;
@@ -67,6 +71,7 @@ pub const H = struct {
         d.api.cuMemAlloc_v2 = alloc;
         d.api.cuMemFree_v2 = free;
         d.api.cuMemsetD8_v2 = set;
+        d.api.cuMemsetD32Async = set32;
         d.api.cuMemcpyDtoDAsync_v2 = dtod;
         d.api.cuMemcpyDtoH_v2 = dtoh;
         d.api.cuMemcpyHtoD_v2 = htod;
@@ -408,4 +413,104 @@ test "GLM disk image: the probe's hash leaves out what a prompt pass does not wr
         image.clear(loose.items, 0, changed);
         try expect(!std.mem.eql(u8, before, changed));
     }
+}
+
+fn pagedRow(st: *const State, x: @import("cuda_dsa_block.zig").Caches, base: u64, r: usize, width: usize, per: usize) u64 {
+    return base + @as(u64, st.pages[r / per]) * x.ps + (r % per) * width;
+}
+
+test "GLM disk image: paged FP8 and BF16 round-trip across disjoint shuffled pages with and without MTP head" {
+    const state = @import("cuda_state.zig");
+    const snaps = @import("cuda_snapshots.zig");
+    var m: Model = undefined;
+    try m.init();
+    var d = H.driver();
+    const a = std.testing.allocator;
+    const c = &m.w.config;
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    const at: u32 = 2048;
+    const table_len = (capacity + state.page_rows - 1) / state.page_rows;
+    const ids_a = [_]u32{ 11, 2, 15, 6, 0, 9, 4, 13, 7, 1, 14, 3 };
+    const ids_b = [_]u32{ 5, 18, 8, 21, 10, 19, 12, 23, 16, 20, 17, 22 };
+    for ([_]bool{ false, true }) |kv8| for ([_]bool{ false, true }) |head| {
+        const page = state.pageBytesOf(&m.w, kv8, head);
+        var kv = try cuda.DeviceBuffer.alloc(&d, 24 * page);
+        defer kv.free();
+        const layout: state.Paged = .{ .kv = kv.ptr, .pages = table_len, .page_bytes = page };
+        var sa = try State.initPagedFormat(a, &d, &m.w, capacity, layout, kv8, head);
+        defer sa.deinit();
+        var sb = try State.initPagedFormat(a, &d, &m.w, capacity, layout, kv8, head);
+        defer sb.deinit();
+        sa.pages = &ids_a;
+        sa.capacity = capacity;
+        sb.pages = &ids_b;
+        sb.capacity = capacity;
+        for (H.bytes(sa.arena.buf.ptr, sa.arena.buf.len), 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+        for (ids_a) |pid| for (H.bytes(kv.ptr + pid * page, page), 0..) |*b, i| {
+            b.* = @truncate(i *% 17 +% pid +% @as(usize, @intFromBool(kv8)));
+        };
+        @memset(H.bytes(sa.table, table_len * 4), 0x77);
+        @memset(H.bytes(sb.table, table_len * 4), 0x88);
+        const sh = try image.Shape.of(&sa, c, capacity, head);
+        try expectEqual(kv8, sh.scales);
+        try expectEqual(head, sh.head);
+        const mtp: u64 = if (head) at - 1 else 0;
+        try sa.restoreHost(stream, at, @intCast(mtp), &.{ 0, 1 }, .{ 0, 0 });
+        const plan_a = try Plan.init(&sa, c, at, if (head) mtp else null, 0);
+        try expectEqual(@as(u64, plan_a.len), image.leaseBytes(sh, at, mtp));
+        var pool = try pages.Pool.init(a, &d, 64 << 20, false);
+        defer pool.deinit();
+        var kept = try pool.take(plan_a.len);
+        defer pool.give(&kept);
+        try pool.move(stream, &kept, &plan_a, true);
+        var segs: std.ArrayList(image.Seg) = .empty;
+        defer segs.deinit(a);
+        try image.segments(sh, at, mtp, &segs, a);
+        const last = segs.items[segs.items.len - 1];
+        const img = try a.alloc(u8, @intCast(last.img + last.len));
+        defer a.free(img);
+        var words = (image.Words{ .at = at, .mtp_len = mtp, .base = 0, .mtp_base = 0, .cur = 0b10, .world = 2 }).encode();
+        const out: image.Copy = .{ .d = &d, .pool = &pool, .lease = &kept, .segs = segs.items, .words = &words };
+        const cuts = [_]u64{ 0, 999, plan_a.len / 2, img.len };
+        for (cuts[0..3], cuts[1..]) |lo, hi| try out.run(lo, img[@intCast(lo)..@intCast(hi)], true);
+        // Restore via blankAs -> Copy in -> seal -> restore into sb on disjoint physical pages.
+        @memset(H.bytes(sb.arena.buf.ptr, sb.arena.buf.len), 0xE9);
+        @memset(H.bytes(sb.table, table_len * 4), 0x88);
+        for (ids_b) |pid| @memset(H.bytes(kv.ptr + pid * page, page), 0xE9);
+        const saved_a = try a.dupe(u8, H.bytes(kv.ptr, kv.len));
+        defer a.free(saved_a);
+        var e: Fake = .{ .gpa = a, .d = &d, .stream = stream, .c = c.*, .cur = .{ .st = sb }, .mtp = head };
+        e.snap_pages = try pages.Pool.init(a, &d, 64 << 20, false);
+        defer e.snap_pages.?.deinit();
+        try e.snaps.ensureTotalCapacity(a, 4);
+        defer e.snaps.deinit(a);
+        try snaps.blankAs(&e, 1, at);
+        defer {
+            var s = e.snaps.get(1).?;
+            snaps.free(&e, &s);
+        }
+        var back: [image.Words.count]u64 = undefined;
+        const in: image.Copy = .{ .d = &d, .pool = &e.snap_pages.?, .lease = &e.snaps.getPtr(1).?.lease, .segs = segs.items, .words = &back };
+        try in.run(0, img, false);
+        const w = try image.Words.decode(back, at, 2, .unsplit);
+        try snaps.seal(&e, 1, w.mtp_len, .{ w.base, w.mtp_base }, w.cur);
+        try snaps.restore(&e, 1);
+        try std.testing.expectEqualSlices(u8, H.bytes(sa.arena.buf.ptr, @intCast(sh.prefix)), H.bytes(e.cur.st.arena.buf.ptr, @intCast(sh.prefix)));
+        try std.testing.expectEqualSlices(u8, H.bytes(sa.mtp_pos_dev, @intCast(sh.tail)), H.bytes(e.cur.st.mtp_pos_dev, @intCast(sh.tail)));
+        const lat_w = c.kv_lora * @as(usize, if (kv8) 1 else 2);
+        for (0..sa.caches.len + @as(usize, @intFromBool(head))) |j| {
+            const rows: usize = if (j < sa.caches.len) at else @intCast(mtp);
+            const x = if (j < sa.caches.len) sa.caches[j] else sa.mtp_caches;
+            const y = if (j < e.cur.st.caches.len) e.cur.st.caches[j] else e.cur.st.mtp_caches;
+            for (0..rows) |r| {
+                try std.testing.expectEqualSlices(u8, H.bytes(pagedRow(&sa, x, x.lc, r, lat_w, 512), lat_w), H.bytes(pagedRow(&e.cur.st, y, y.lc, r, lat_w, 512), lat_w));
+                if (kv8) try std.testing.expectEqualSlices(u8, H.bytes(pagedRow(&sa, x, x.ls, r, 4, 512), 4), H.bytes(pagedRow(&e.cur.st, y, y.ls, r, 4, 512), 4));
+            }
+            for (0..2) |k| try std.testing.expectEqualSlices(u8, H.bytes(sa.rings[2 * j + k], @min(rows, sa.ring_rows) * sa.ring_row), H.bytes(e.cur.st.rings[2 * j + k], @min(rows, sa.ring_rows) * sa.ring_row));
+            for (0..@min(rows / 4 + 2, x.pk_rows)) |p| try std.testing.expectEqualSlices(u8, H.bytes(pagedRow(&sa, x, x.pk, p, c.i_dim * 2, 128), c.i_dim * 2), H.bytes(pagedRow(&e.cur.st, y, y.pk, p, c.i_dim * 2, 128), c.i_dim * 2));
+        }
+        for (ids_a) |pid| try std.testing.expectEqualSlices(u8, saved_a[pid * page ..][0..page], H.bytes(kv.ptr + pid * page, page));
+        for (H.bytes(sa.table, table_len * 4)) |b| try expectEqual(@as(u8, 0x77), b);
+        for (H.bytes(e.cur.st.table, table_len * 4)) |b| try expectEqual(@as(u8, 0x88), b);
+    };
 }

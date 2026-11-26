@@ -91,17 +91,21 @@ pub fn cacheBytes(capacity: usize, lw: usize, kv8: bool) !usize {
     return std.math.mul(usize, capacity, row);
 }
 
-/// On pages: the stream's table (i32 page ids) and the step from page to page in bytes and latent rows; 0: in order.
-pub const Table = struct { pt: u64 = 0, ps: u64 = 0, page_rows: u64 = 0 };
+/// Page table `pt` (`ps`, `page_rows`), or 0 in order; `logical` keeps sparse lists as positions (paged E4M3).
+pub const Table = struct { pt: u64 = 0, ps: u64 = 0, page_rows: u64 = 0, logical: bool = false };
 
-/// BF16 rows through `t`, or E4M3 rows and their scales (scales nonzero), which take no pages.
+/// BF16 rows through `t`, or E4M3 rows and their scales (scales nonzero), in order or on pages through `t`.
 pub fn latentWriteFormat(set: glue.Set, stream: cuda.Stream, lat: u64, lat_stride: usize, cache: u64, scales: u64, t: Table, pos: u64, rows: usize, lw: usize) !void {
     if (scales == 0) return latentWrite(set, stream, lat, lat_stride, cache, t, pos, rows, lw);
     if (lw != 512) return error.LatentShape;
-    if (t.pt != 0) return error.Fp8OnPages;
     var a: cuda.Args = .{};
     inline for (.{ lat, @as(i64, @intCast(lat_stride)), cache, scales, pos }) |v| a.add(v);
-    try cuda_pdl.launch(set.glue.lat_write_fp8, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 512 } }, stream, &a);
+    if (t.pt != 0) {
+        a.add(t.pt);
+        a.add(@as(i64, @intCast(t.ps)));
+    }
+    const f = if (t.pt != 0) set.glue.lat_write_fp8_paged else set.glue.lat_write_fp8;
+    try cuda_pdl.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 512 } }, stream, &a);
 }
 
 /// latent.latent_write: rows of `lat` (stride `lat_stride`) into slots pos .. pos + rows - 1 (pos an i32 on device).
@@ -127,24 +131,27 @@ pub fn attentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, 
 /// latent._dense_chunks (keys through pos + r) and _sparse_chunks (row r's `counts` of `tokens`); `lw` 512 or 576.
 fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, pos: u64, tokens: u64, counts: u64, p: Partials, rows: usize, heads: usize, lw: usize, nch: usize, w: usize, scale: f32, hb: usize, sparse: bool) !void {
     const rope_cols = try ropeOf(lw);
-    if (scales != 0 and t.pt != 0) return error.Fp8OnPages;
     if (rope_cols != 0) {
         if (scales != 0) return error.LatentShape; // the E4M3 cache holds the latent alone
         if (hb != heads_tile) return error.HeadBlock;
         const on: cuda.mla.On = .{ .pt = t.pt, .ps = t.ps, .tokens = tokens, .counts = counts, .w = w, .sparse = sparse };
         return (try roped(set)).chunksOn(stream, qa, cache, pos, on, .{ .po = p.po, .pm = p.pm, .pl = p.pl }, rows, heads, nch, scale);
     }
+    const kv8 = scales != 0;
+    const paged8 = kv8 and t.pt != 0;
+    // a paged sparse list's units are the kernel's: positions for E4M3 (Table.logical), the BF16 rows otherwise
+    if (sparse and t.pt != 0 and t.logical != paged8) return error.TokenUnits;
     const f = switch (hb) {
-        heads_tile => if (scales == 0) set.glue.chunks_16 else set.glue.chunks_16_fp8,
-        heads_tile_wide => if (scales == 0) set.glue.chunks_32 else set.glue.chunks_32_fp8,
+        heads_tile => if (!kv8) set.glue.chunks_16 else if (paged8) set.glue.chunks_16_fp8_paged else set.glue.chunks_16_fp8,
+        heads_tile_wide => if (!kv8) set.glue.chunks_32 else if (paged8) set.glue.chunks_32_fp8_paged else set.glue.chunks_32_fp8,
         else => return error.HeadBlock,
     };
     var a: cuda.Args = .{};
     a.add(qa);
     a.add(cache);
-    if (scales != 0) a.add(scales);
+    if (kv8) a.add(scales);
     inline for (.{ pos, tokens, counts, p.po, p.pm, p.pl, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(i64, @intCast(w)), scale, @as(c_int, @intFromBool(sparse)) }) |v| a.add(v);
-    if (scales == 0) {
+    if (!kv8 or paged8) {
         a.add(t.pt);
         a.add(@as(i64, @intCast(t.ps)));
     }

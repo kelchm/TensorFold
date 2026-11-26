@@ -59,6 +59,9 @@ const Fixture = struct {
         f.e.pages = f.p;
     }
     fn prepare(f: *Fixture) !void {
+        return f.prepareWith(true);
+    }
+    fn prepareWith(f: *Fixture, mtp: bool) !void {
         F.allocs = 0;
         F.frees = 0;
         F.context_waits = 0;
@@ -80,6 +83,7 @@ const Fixture = struct {
         f.e.stream = .{ .d = &f.d, .handle = null };
         f.e.capacity = 4096;
         f.e.settings = .{};
+        f.e.mtp = mtp;
         f.e.seqs = .empty;
         f.e.local = &.{};
         f.e.images = null;
@@ -115,9 +119,8 @@ const Fixture = struct {
 
 test "GLM pages: TF_KV_SHARE's slot, counted before the pool is made, is the state's bytes at the last mark after it" {
     var f: Fixture = undefined;
-    try f.prepare();
+    try f.prepareWith(false);
     f.e.c = f.e.w.config;
-    f.e.mtp = false;
     f.e.share_pages = true;
     const slot = glm.pages.shareSlot(&f.e);
     f.p = try f.make(1);

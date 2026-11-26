@@ -71,7 +71,7 @@ pub const Shape = struct {
         const end = if (st.table != 0) st.table else base + st.arena.buf.len;
         if (first < base or st.mtp_pos_dev < first or end < st.mtp_pos_dev) return error.SnapshotShape;
         if (st.proj < base or first < st.proj or st.prompt_hidden < st.mtp_pos_dev or end < st.prompt_hidden) return error.SnapshotShape;
-        const fp8 = st.mtp_caches.ls != 0;
+        const fp8 = st.kv8 or (if (st.caches.len > 0) st.caches[0].ls != 0 else st.mtp_caches.ls != 0);
         return .{
             .window = st.proj - base,
             .draft = st.prompt_hidden - st.mtp_pos_dev,

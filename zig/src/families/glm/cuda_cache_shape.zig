@@ -10,13 +10,19 @@ pub const Shape = struct {
     row: usize, // kv_lora + qk_rope: 512 on GLM-5.3-Flash
     i_dim: usize,
     pool: usize, // rows a pooled key sums: 4 on GLM-5.3-Flash
+    kv8: bool = false,
     keys: usize, // index key and gate rows a cache holds: a ring of index_ring, or maxInt for a whole sequence's
     shared: std.StaticBitSet(config.max_layers) = .empty, // caches whose layer keeps no index keys (full GLM-5.3's)
 
     /// `caches` caches: the loaded layers' (full GLM-5.3: all DSA, cache j is layer j's), then the MTP layer's.
     pub fn of(c: anytype, caches: usize) Shape {
-        var s: Shape = .{ .caches = caches, .row = c.latentRow(), .i_dim = c.i_dim, .pool = c.kpool, .keys = @import("cuda_state.zig").index_ring };
-        if (c.dsa) for (0..caches -| 1) |j| if (c.shared.isSet(j)) s.shared.set(j);
+        return ofFormat(c, caches -| 1, false, caches > 0);
+    }
+
+    /// `nd` DSA layers' caches and an optional MTP cache, in BF16 or E4M3 (`kv8`).
+    pub fn ofFormat(c: anytype, nd: usize, kv8: bool, head: bool) Shape {
+        var s: Shape = .{ .caches = nd + @intFromBool(head), .row = c.latentRow(), .i_dim = c.i_dim, .pool = c.kpool, .kv8 = kv8, .keys = @import("cuda_state.zig").index_ring };
+        if (c.dsa) for (0..nd) |j| if (c.shared.isSet(j)) s.shared.set(j);
         return s;
     }
 
@@ -32,23 +38,27 @@ pub const Shape = struct {
         return n;
     }
 
-    /// One cache's latent rows on a page, and their pooled keys.
+    /// One cache's latent rows on a page, optional E4M3 scales, and their pooled keys.
     pub fn latentBytes(s: Shape) usize {
-        return page_rows * s.row * 2;
+        return page_rows * s.row * @as(usize, if (s.kv8) 1 else 2);
+    }
+
+    pub fn scalesBytes(s: Shape) usize {
+        return if (s.kv8) page_rows * @sizeOf(f32) else 0;
     }
 
     pub fn pkBytes(s: Shape) usize {
         return page_rows / s.pool * s.i_dim * 2;
     }
 
-    /// One keyed cache's part of a page: its latent rows, then their pools' keys.
+    /// One keyed cache's part of a page: its latent rows, optional FP32 scales, then their pools' keys.
     pub fn cacheBytes(s: Shape) usize {
-        return s.latentBytes() + s.pkBytes();
+        return s.latentBytes() + s.scalesBytes() + s.pkBytes();
     }
 
     /// Cache `j`'s part of a page from its start: the parts before it (a shared layer's has no keys).
     pub fn cacheAt(s: Shape, j: usize) usize {
-        return j * s.latentBytes() + s.pooledBefore(j) * s.pkBytes();
+        return j * (s.latentBytes() + s.scalesBytes()) + s.pooledBefore(j) * s.pkBytes();
     }
 
     /// A page's bytes: every cache's part, padded to whole latent rows (page_rows a page) and whole token bytes.

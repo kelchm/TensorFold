@@ -53,15 +53,20 @@ fn gather(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.i
     var pieces: std.ArrayList(img.Piece) = .empty;
     defer pieces.deinit(e.gpa);
     const sh = try ranks.shape(e);
+    var loose: std.ArrayList(img.Span) = .empty;
+    defer loose.deinit(e.gpa);
+    try img.unwritten(sh, prefixes, window_buf[0..prefixes.len], k.at, (try ranks.wordsOf(e, k.id)).mtp_len, &loose, e.gpa);
     var o: usize = 0;
     for (ranges) |g| {
         pieces.clearRetainingCapacity();
         try img.route(sh, prefixes, k.at, g.off, g.len, &pieces, e.gpa);
+        const start = o;
         for (pieces.items) |p| {
             const n: usize = @intCast(p.len);
             try ranks.take(e, p.rank, k.id, p.off, out[o..][0..n]);
             o += n;
         }
+        img.clear(loose.items, g.off, out[start..o]);
     }
 }
 
@@ -259,6 +264,151 @@ test "CUDA disk open: GLM's store takes the shared attach's staging floor, so a 
             try std.testing.expectEqual(try rows.write.coldCharge(r, window), r.staging_bytes); // the longest, whole
         } else try std.testing.expectEqual(default, r.staging_bytes);
     }
+}
+
+test "CUDA disk open: GLM gather zeros unwritten pooled-key tail and scratch spans for BF16 and paged FP8" {
+    const gpa = std.testing.allocator;
+    const Host = struct {
+        var held: [16]struct { ptr: u64 = 0, len: usize = 0 } = @splat(.{});
+        fn bytes(p: u64, n: usize) []u8 {
+            return @as([*]u8, @ptrFromInt(p))[0..n];
+        }
+        fn alloc(out: *u64, n: usize) callconv(.c) cuda.abi.Result {
+            const m = std.heap.page_allocator.alloc(u8, n) catch return 2;
+            for (&held) |*h| if (h.ptr == 0) {
+                h.* = .{ .ptr = @intFromPtr(m.ptr), .len = n };
+                out.* = h.ptr;
+                return 0;
+            };
+            std.heap.page_allocator.free(m);
+            return 2;
+        }
+        fn free(p: u64) callconv(.c) cuda.abi.Result {
+            for (&held) |*h| if (h.ptr == p) {
+                std.heap.page_allocator.free(bytes(h.ptr, h.len));
+                h.* = .{};
+                return 0;
+            };
+            return 1;
+        }
+        fn set(p: u64, v: u8, n: usize) callconv(.c) cuda.abi.Result {
+            @memset(bytes(p, n), v);
+            return 0;
+        }
+        fn dtoh(dst: ?*anyopaque, src: u64, n: usize) callconv(.c) cuda.abi.Result {
+            @memcpy(@as([*]u8, @ptrCast(dst.?))[0..n], bytes(src, n));
+            return 0;
+        }
+        fn htod(dst: u64, src: ?*const anyopaque, n: usize) callconv(.c) cuda.abi.Result {
+            @memcpy(bytes(dst, n), @as([*]const u8, @ptrCast(src.?))[0..n]);
+            return 0;
+        }
+        fn ctxDev(out: *cuda.abi.Device) callconv(.c) cuda.abi.Result {
+            out.* = 0;
+            return 0;
+        }
+        fn devAttr(out: *c_int, _: cuda.abi.DeviceAttribute, _: cuda.abi.Device) callconv(.c) cuda.abi.Result {
+            out.* = 0;
+            return 0;
+        }
+        fn driver() cuda.Driver {
+            var d: cuda.Driver = undefined;
+            d.api.cuMemAlloc_v2 = alloc;
+            d.api.cuMemFree_v2 = free;
+            d.api.cuMemsetD8_v2 = set;
+            d.api.cuMemcpyDtoH_v2 = dtoh;
+            d.api.cuMemcpyHtoD_v2 = htod;
+            d.api.cuCtxGetDevice = ctxDev;
+            d.api.cuDeviceGetAttribute = devAttr;
+            return d;
+        }
+    };
+    const saved_prefixes = prefixes;
+    const saved_link = ranks.link;
+    defer {
+        prefixes = saved_prefixes;
+        ranks.link = saved_link;
+    }
+    ranks.link = null;
+    var layers: [4]glm.weights.Layer = undefined;
+    for (&layers, [_]bool{ false, true, false, true }) |*l, mla| l.mixer = if (mla) .{ .mla = undefined } else .{ .kda = undefined };
+    var w: glm.weights.Weights = undefined;
+    w.config = .{};
+    w.share = try glm.shard.Share.of(&w.config, 0, 1);
+    w.layers = &layers;
+    var d = Host.driver();
+    const cap: usize = 2048;
+    const at: u32 = 1024;
+    const table_len = (cap + glm.state.page_rows - 1) / glm.state.page_rows;
+    for ([_]bool{ false, true }) |kv8| for ([_]bool{ false, true }) |head| {
+        const page = glm.state.pageBytesOf(&w, kv8, head);
+        var kv = try cuda.DeviceBuffer.alloc(&d, table_len * page);
+        defer kv.free();
+        const layout: glm.state.Paged = .{ .kv = kv.ptr, .pages = table_len, .page_bytes = page };
+        const Seq = @typeInfo(@FieldType(Engine, "cur")).pointer.child;
+        var seq: Seq = .{ .st = try glm.state.State.initPagedFormat(gpa, &d, &w, cap, layout, kv8, head) };
+        defer seq.st.deinit();
+        const e = try gpa.create(Engine);
+        defer gpa.destroy(e);
+        e.gpa = gpa;
+        e.d = &d;
+        e.c = w.config;
+        e.share = w.share;
+        e.capacity = cap;
+        e.mtp = head;
+        e.cur = &seq;
+        e.share_pages = false;
+        e.announce = 0;
+        e.dropped = .empty;
+        e.snaps = .empty;
+        try e.snaps.ensureTotalCapacity(gpa, 4);
+        defer e.snaps.deinit(gpa);
+        e.next_snap = 1;
+        e.snap_pages = try glm.snapshots.pages.Pool.init(gpa, &d, 128 << 20, false);
+        defer e.snap_pages.?.deinit();
+        const sh = try ranks.shape(e);
+        try std.testing.expectEqual(kv8, sh.scales);
+        prefix_buf[0] = sh.prefix;
+        window_buf[0] = sh.window;
+        prefixes = prefix_buf[0..1];
+        const mtp: u64 = if (head) at else 0;
+        const id_a = try ranks.blank(e, at);
+        defer glm.snapshots.drop(e, id_a);
+        const id_b = try ranks.blank(e, at);
+        defer glm.snapshots.drop(e, id_b);
+        const words: img.Words = .{ .at = at, .mtp_len = mtp, .base = 0, .mtp_base = 0, .cur = 0b10, .world = 1 };
+        try ranks.seal(e, id_a, words);
+        try ranks.seal(e, id_b, words);
+        const total = img.imageBytes(sh, at);
+        const seed_a = try gpa.alloc(u8, @intCast(total));
+        defer gpa.free(seed_a);
+        for (seed_a, 0..) |*b, i| b.* = @intCast(1 + i % 251);
+        const seed_b = try gpa.dupe(u8, seed_a);
+        defer gpa.free(seed_b);
+        var loose: std.ArrayList(img.Span) = .empty;
+        defer loose.deinit(gpa);
+        try img.unwritten(sh, prefixes, window_buf[0..1], at, mtp, &loose, gpa);
+        try std.testing.expect(loose.items.len >= 4);
+        for (loose.items) |sp| {
+            @memset(seed_a[@intCast(sp.off)..][0..@intCast(sp.len)], 0xaa);
+            @memset(seed_b[@intCast(sp.off)..][0..@intCast(sp.len)], 0x55);
+        }
+        try ranks.copy(e, id_a, img.Words.bytes, seed_a[img.Words.bytes..], false);
+        try ranks.copy(e, id_b, img.Words.bytes, seed_b[img.Words.bytes..], false);
+        var ka: Kept = .{ .id = id_a, .at = at };
+        var kb: Kept = .{ .id = id_b, .at = at };
+        const out_a = try gpa.alloc(u8, @intCast(total));
+        defer gpa.free(out_a);
+        const out_b = try gpa.alloc(u8, @intCast(total));
+        defer gpa.free(out_b);
+        const mid = total / 2 + 13;
+        const ranges = [_]rows.image.Range{ .{ .off = 0, .len = mid }, .{ .off = mid, .len = total - mid } };
+        try gather(e, @ptrCast(&ka), &ranges, out_a);
+        try gather(e, @ptrCast(&kb), &ranges, out_b);
+        try std.testing.expectEqualSlices(u8, out_a, out_b);
+        for (loose.items) |sp| for (out_a[@intCast(sp.off)..][0..@intCast(sp.len)]) |b| try std.testing.expectEqual(@as(u8, 0), b);
+        try std.testing.expectEqualSlices(u8, seed_a[img.Words.bytes .. img.Words.bytes + sh.window], out_a[img.Words.bytes .. img.Words.bytes + sh.window]);
+    };
 }
 
 test {

@@ -211,7 +211,7 @@ pub fn selectTokensProfile(set: glue.Set, ops: cuda.Module, stream: cuda.Stream,
     args.add(@as(c_int, @intCast(g.topk)));
     args.add(tokens);
     args.add(counts);
-    args.add(t.pt);
+    args.add(if (t.logical) @as(u64, 0) else t.pt); // an E4M3 cache's lists stay positions; its chunks take the table
     args.add(@as(i64, @intCast(t.page_rows)));
     args.add(@as(c_int, @intCast(g.pool)));
     try cuda_pdl.launch(assemble, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &args);
