@@ -17,6 +17,12 @@ fn position(r: *Rig, value: usize) !u64 {
     return r.dev(std.mem.asBytes(&p));
 }
 pub fn run(r: *Rig, set: glm.glue.Set) !void {
+    try runFormat(r, set);
+    var power = set;
+    power.kv_pow2 = true;
+    try runFormat(r, power);
+}
+fn runFormat(r: *Rig, set: glm.glue.Set) !void {
     for ([_]usize{ 3, 513 }) |keys| {
         const capacity = keys + 17;
         const stride = lw + 8;
@@ -34,7 +40,7 @@ pub fn run(r: *Rig, set: glm.glue.Set) !void {
         const cd = try r.a.alloc(f64, keys * lw);
         for (0..keys) |row| {
             const codes = want_codes[row * lw ..][0..lw];
-            want_scales[row] = try codec.pack(x[row * stride ..][0..lw], codes);
+            want_scales[row] = try codec.packFormat(x[row * stride ..][0..lw], codes, set.kv_pow2);
             for (codes, 0..) |code, col| {
                 const at = row * lw + col;
                 decoded[at] = codec.decoded(code, want_scales[row]);

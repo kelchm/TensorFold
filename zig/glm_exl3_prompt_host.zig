@@ -6,6 +6,9 @@ const t = std.testing;
 const source = @embedFile("kernels/cuda/exl3_experts.cu");
 
 const Record = struct {
+    var gate_layout: usize = 0;
+    var result: u64 = 0;
+    var partials: u64 = 0;
     var copies: usize = 0;
     var up: usize = 0;
     var down: usize = 0;
@@ -23,6 +26,9 @@ const Record = struct {
 
     fn reset() void {
         copies = 0;
+        gate_layout = 0;
+        result = 0;
+        partials = 0;
         up = 0;
         down = 0;
         decode = 0;
@@ -63,6 +69,11 @@ const Record = struct {
                 item_pairs[item_calls] = arg(i32, args, 6);
                 item_calls += 1;
             },
+            30, 31 => {
+                gate_layout = @intFromPtr(f);
+                partials = arg(u64, args, 6);
+            },
+            32 => result = arg(u64, args, 8),
             9 => decode += 1,
             else => {},
         }
@@ -189,4 +200,39 @@ test "GLM EXL3 prompt: shared-id guards precede payload loads and late-guard con
     try t.expectEqual(@as(usize, 2), std.mem.count(u8, bad, "if (e == skip) return;"));
     try t.expect(!guarded(bad, "void prompt_gu(", "tgateup<"));
     try t.expect(!guarded(bad, "void prompt_down(", "members[first"));
+}
+
+test "GLM EXL3 prompt: specialized verification uses the native slot stride and keeps flat picks outside scratch" {
+    var d: cuda.Driver = undefined;
+    d.api.cuLaunchKernel = Record.launch;
+    var router: cuda.grouped.Router = undefined;
+    inline for (.{ "plan_small", "plan_rows", "plan_rank", "plan_offsets", "plan_scatter", "plan_rank_rows", "plan_scatter_rows" }, .{ 1, 18, 2, 3, 4, 19, 20 }) |field, id| @field(router, field) = Record.function(&d, id);
+    var k: glm.exl3.Kernels = undefined;
+    k.prompt.rotate = Record.function(&d, 6);
+    k.glm_gateup = Record.function(&d, 30);
+    k.glm_gateup_flat = Record.function(&d, 31);
+    k.glm_down = Record.function(&d, 32);
+    k.gateup = Record.function(&d, 13);
+    const w: glm.exl3.Experts = .{ .banks = .{ 101, 102, 103 }, .gt = 104, .ut = 105, .dt = 106, .k2 = 107, .suh_g = 108, .suh_u = 109, .svh_g = 110, .svh_u = 111, .suh_d = 112, .svh_d = 113, .shx = true };
+    const x3: glm.exl3.Scratch = .{ .picks = 0x100000000, .xg = 0, .xu = 0, .z = 0 };
+    const plan: cuda.grouped.Plan = .{ .members = 201, .items = 202, .counts = 203, .rank = 204, .hist = 205 };
+    for ([_]usize{ 2, 3, 4, 6, 8, 12, 16 }) |rows| for ([_]usize{ 8, 9 }) |slots| {
+        Record.reset();
+        try t.expect(glm.exl3.eligibleDecode(w, rows, 288, 4096, 1024, false));
+        const flat = slots == 8;
+        const arena = if (flat) x3.picks + glm.exl3.picksBytes(rows) else x3.picks;
+        const out: u64 = if (flat) try glm.exl3.directOut(w, x3, rows, 288, 4096, 1024, 7) else 0x700000000;
+        try glm.exl3.runDecode(&k, router, .{ .d = &d, .handle = null }, w, arena, plan, 0x200000000, 4096, if (flat) x3.picks else 0x300000000, slots, rows, 288, 7, out, 0x400000000);
+        try t.expectEqual(@as(usize, if (flat) 31 else 30), Record.gate_layout);
+        try t.expectEqual(rows * slots, @as(usize, @intCast(Record.pairs[0])));
+        try t.expectEqual(arena + rows * 4096 * 2, Record.partials);
+        const end = Record.partials + 2 * 4 * rows * slots * 1024 * 4;
+        try t.expect(end <= x3.picks + glm.exl3.scratchFor(rows, 4096, 1024, false, w)[0]);
+        if (flat) try t.expect(end <= out);
+        try t.expectEqual(out, Record.result);
+        try t.expectEqual(@as(usize, 0), Record.copies);
+    };
+    try t.expect(!glm.exl3.eligibleDecode(w, 1, 288, 4096, 1024, false));
+    try t.expect(!glm.exl3.eligibleDecode(w, 17, 288, 4096, 1024, false));
+    try t.expect(!glm.exl3.eligibleDecode(w, 8, 288, 4096, 1024, true));
 }

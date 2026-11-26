@@ -17,6 +17,9 @@ pub fn decoded(bits: u8, scale: f32) u16 {
     return bfBits(value * scale);
 }
 pub fn pack(row: []const u16, out: []u8) !f32 {
+    return packFormat(row, out, false);
+}
+pub fn packFormat(row: []const u16, out: []u8, pow2: bool) !f32 {
     if (row.len == 0 or row.len != out.len) return error.BadRow;
     var amax: f32 = 0;
     for (row) |x| {
@@ -26,7 +29,12 @@ pub fn pack(row: []const u16, out: []u8) !f32 {
     }
     var inv: f32 = if (amax > 0) 448 / amax else 1;
     var scale: f32 = if (amax > 0) amax / 448 else 1;
-    if (scale < 0x1p-126) {
+    if (pow2) {
+        const b: u32 = @bitCast(amax);
+        const e = std.math.clamp(((b >> 23) + @intFromBool((b & 0x7fffff) != 0)) -| 8, 1, 254);
+        scale = @bitCast(e << 23);
+        inv = @bitCast((254 - e) << 23);
+    } else if (scale < 0x1p-126) {
         scale = 0x1p-126;
         inv = 1 / scale;
     }
@@ -48,6 +56,18 @@ test "GLM FP8 KV: reference handles every finite BF16 magnitude and round-even t
     }
     var q: [1]u8 = undefined;
     try std.testing.expectError(error.NonFiniteRow, pack(&.{0x7fc0}, &q));
+}
+
+test "GLM FP8 KV: Python row scales handle zero, signed zero, the BF16 floor, and a power boundary" {
+    var codes: [2]u8 = undefined;
+    try std.testing.expectEqual(@as(f32, 0x1p-126), try packFormat(&.{ 0, 0x8000 }, &codes, true));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0x80 }, &codes);
+    try std.testing.expectEqual(@as(f32, 0x1p-126), try packFormat(&.{ 1, 0x8001 }, &codes, true));
+    try std.testing.expectEqualSlices(u8, &.{ 4, 0x84 }, &codes);
+    try std.testing.expectEqual(@as(f32, 0x1p-8), try packFormat(&.{ 0x3f80, 0xbf80 }, &codes, true));
+    try std.testing.expectEqualSlices(u8, &.{ 0x78, 0xf8 }, &codes);
+    try std.testing.expectEqual(@as(f32, 0x1p-7), try packFormat(&.{ 0x3f81, 0x3f00 }, &codes, true));
+    try std.testing.expectEqualSlices(u8, &.{ 0x70, 0x68 }, &codes);
 }
 
 test "GLM FP8 KV: bfBits is core's bits(), 0xffffffff gives a NaN, other words the plain + copy's bits" {

@@ -78,6 +78,7 @@ pub fn admit(gpa: std.mem.Allocator, config_json: []const u8, why: *modelopt.Why
 
 /// One layer's EXL3 experts on a rank: trellis words [E][K/16][N/16][8 * k2] and fp16 scales (suh [E][K], svh [E][N]).
 pub const Experts = struct {
+    banks: [3]u64 = @splat(0), // uniform-width specializations address the original contiguous banks
     gt: u64, // int64 [E]: each expert's gate trellis
     ut: u64,
     dt: u64,
@@ -160,6 +161,7 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
             k2.* = @intCast(h);
         }
         const base = try L.put("layers.{d}.moe.exl3." ++ tw, .{i});
+        out.banks[pi] = base;
         var ptr: u64 = base;
         for (mine) |k2| { // each expert's trellis follows the one before, at its own width
             try L.host.appendSlice(L.gpa, std.mem.asBytes(&ptr));
@@ -277,10 +279,12 @@ fn copyRows(stream: cuda.Stream, dst: u64, dpitch: usize, src: u64, spitch: usiz
     try stream.d.check(stream.d.api.cuMemcpy2DAsync_v2(&m, stream.handle), what);
 }
 pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, plan_buf: cuda.grouped.Plan, x: u64, x_stride: usize, picks: u64, slots: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32, prompt: bool, ey: u64, xd: u64) !void {
-    _ = xd;
     if (slots != top_k + 1) return error.UnsupportedTopK;
     if (dims % 256 != 0 or width % 128 != 0) return error.UnreadableExl3;
     const l = layer(w, count, dims, width, limit);
+    if (eligibleDecode(w, rows, count, dims, width, prompt) and k.glm_decode) {
+        return runDecode(k, ek.router, stream, w, sc.picks, plan_buf, x, x_stride, picks, slots, rows, count, limit, ey, xd);
+    }
     if (prompt and common.prompt.eligible(l)) {
         const scratch = try common.prompt.scratch(sc.picks, l, @min(rows, prompt_rows), slots);
         var at: usize = 0;
@@ -301,6 +305,35 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
         return;
     }
     return compact(k, stream, w, sc, x, x_stride, picks, slots, rows, count, dims, width, limit, ey);
+}
+
+pub fn eligibleDecode(w: Experts, rows: usize, count: usize, dims: usize, width: usize, prompt: bool) bool {
+    return !prompt and rows >= 2 and rows <= 16 and count > 0 and count < cuda.grouped.max_experts and
+        dims == 4096 and width == 1024 and w.uniform_gu == 8 and w.uniform_d == 8 and w.shx and
+        w.banks[0] != 0 and w.banks[1] != 0 and w.banks[2] != 0;
+}
+
+fn launchDecode(f: cuda.Function, stream: cuda.Stream, grid: [3]usize, threads: u32, values: anytype) !void {
+    var a: cuda.Args = .{};
+    inline for (values) |v| a.add(v);
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = threads } }, stream, &a);
+}
+
+/// Route either flat eight-slot picks or the nine-slot plan, using the shared per-row rotation, and the established GLM gate/up epilogue.
+pub fn runDecode(k: *const Kernels, router: cuda.grouped.Router, stream: cuda.Stream, w: Experts, arena: u64, p: cuda.grouped.Plan, x: u64, stride: usize, picks: u64, slots: usize, rows: usize, count: usize, limit: f32, ey: u64, xd: u64) !void {
+    const d = 4096;
+    const width = 1024;
+    const pairs = rows * slots;
+    const np: i32 = @intCast(pairs);
+    const ne: i32 = @intCast(count);
+    const items = cuda.grouped.maxItems(pairs, count + 1, 16);
+    const rotated = arena; // fp16 [rows,4096], an aligned multiple of 8192 bytes
+    const z = rotated + rows * d * 2; // fp32 [2,4,pairs,1024]; the existing compact arena is larger
+    try router.route(stream, picks, pairs, count + 1, 16, p);
+    try launchDecode(k.prompt.rotate, stream, .{ rows, d / 128, 1 }, 32, .{ x, @as(i32, @intCast(stride)), w.suh_g, rotated, @as(i32, d) });
+    try launchDecode(if (slots == top_k) k.glm_gateup_flat else k.glm_gateup, stream, .{ items, width / 128, 8 }, 128, .{ rotated, w.banks[0], w.banks[1], p.items, p.counts, p.members, z, np, ne });
+    try launchDecode(k.gateup, stream, .{ pairs, width / 128, 1 }, 32, .{ z, picks, w.svh_g, w.svh_u, w.suh_d, xd, np, @as(i32, width), @as(i32, 4), ne, limit, @as(i32, 0) });
+    try launchDecode(k.glm_down, stream, .{ items, d / 128, 1 }, 128, .{ xd, w.banks[2], p.items, p.counts, p.members, np, ne, w.svh_d, ey });
 }
 
 /// TF_GLM_MOE_DIRECT: compact's one chunk on picks top-k wrote flat at sc.picks; the slot rows stay at `directOut`.

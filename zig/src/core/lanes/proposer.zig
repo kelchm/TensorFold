@@ -59,6 +59,7 @@ pub const Params = struct {
     silence_rounds: i64 = 16,
     window: usize = 4,
     confident_match: i64 = 24,
+    prompt_copy: ?struct { prompt_len: usize, reply_match: u32 } = null,
 };
 
 /// Continuations backed by enough matching context; silent for `silence_rounds` asks (not rounds) after rejections.
@@ -187,7 +188,16 @@ pub const SuffixLookup = struct {
             if (end >= history.len) continue;
             var length: i64 = 0;
             while (length < s.params.max_extension and length < end and history[end - 1 - @as(usize, @intCast(length))] == joined(history, tail, len - 1 - @as(usize, @intCast(length)))) length += 1;
-            if (length > best_len) {
+            if (s.params.prompt_copy) |policy| {
+                // Occurrences whose last min_match tokens begin in the reply need a longer prefix.
+                const match: usize = @intCast(s.params.min_match);
+                const needed: i64 = if (end >= policy.prompt_len and end - policy.prompt_len >= match) policy.reply_match else s.params.min_match;
+                if (length < needed) continue;
+                // Prefer the latest occurrence with a full continuation, then the earliest partial one.
+                best_len = length;
+                best_end = end;
+                if (history.len - end >= @as(usize, @intCast(max_draft))) break;
+            } else if (length > best_len) {
                 best_len = length;
                 best_end = end;
                 if (length >= s.params.max_extension) break;
@@ -226,6 +236,20 @@ pub const SuffixLookup = struct {
         }
     }
 };
+
+test "context copy prefers full continuations and requires a longer match from the reply" {
+    const a = std.testing.allocator;
+    var s = try SuffixLookup.init(a, .{ .ngram = 2, .min_match = 2, .prompt_copy = .{ .prompt_len = 6, .reply_match = 4 } });
+    defer s.deinit();
+    // The more recent reply occurrence has only the last two tokens in common, so the prompt wins.
+    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 8 }, try s.propose(&.{ 1, 2, 3, 4, 8, 9, 7, 7, 1, 2, 99, 98, 97, 6, 1, 2 }, 3));
+    // The reply's four-token suffix now matches and offers a full recent continuation.
+    try std.testing.expectEqualSlices(u32, &.{ 99, 98, 97 }, try s.propose(&.{ 1, 2, 3, 4, 8, 9, 7, 7, 1, 2, 99, 98, 97, 7, 7, 1, 2 }, 3));
+    var partial = try SuffixLookup.init(a, .{ .ngram = 2, .min_match = 2, .prompt_copy = .{ .prompt_len = 99, .reply_match = 4 } });
+    defer partial.deinit();
+    // No full occurrence: return the longest available continuation (the earliest match).
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 1, 2 }, try partial.propose(&.{ 1, 2, 1, 2, 1, 2 }, 7));
+}
 
 test "suffix lookup copies the continuation after a repeated n-gram" {
     const gpa = std.testing.allocator;

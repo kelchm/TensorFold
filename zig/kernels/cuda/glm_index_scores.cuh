@@ -10,6 +10,7 @@
 #include "glm_index_rope.cuh"
 #ifndef GLM_INDEX_HOST
 #include "common/qmm_frag.cuh"
+#include "glm_packed_key.cuh"
 #endif
 
 namespace glm_index {
@@ -47,8 +48,11 @@ extern "C" __global__ void __launch_bounds__(glm_index::RB * 32)
     tf_glm_index_scores(const __nv_bfloat16* qi, const __nv_bfloat16* wts, int64_t w_stride, const __nv_bfloat16* pk,
                         float* out, const int* pos, int64_t rows, int64_t np, int64_t nb, float scale, float wscale,
                         int64_t heads, int loop, const int* pt, int64_t ps, int pool, int rope, const float* inv) {
+  const bool packed = pool < 0;
+  if (packed) pool = -pool;
   glm_pdl::enter();
   using namespace glm_index;
+  __shared__ float key_scales[2][BP];
   __shared__ __align__(16) __nv_bfloat16 tile[2][BP * D];  // two key tiles
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, q = lane & 3;
   const int64_t r = (int64_t)blockIdx.x * RB + warp, P = pos[0];
@@ -82,7 +86,10 @@ extern "C" __global__ void __launch_bounds__(glm_index::RB * 32)
       const int row = idx / (D / 8), u = idx % (D / 8);
       const int64_t p = pb * BP + row;
       const bool ok = p < nmax;
-      cp16(&tile[buf][tile_at(row, u)], pk + key_at(pt, ps / 2, ok ? p : 0, pp) + u * 8, ok);
+      auto* dst = &tile[buf][tile_at(row, u)];
+      const auto* base = pk + key_at(pt, ps / 2, ok ? p : 0, pp);
+      if (packed) glm_packed_key::stage(dst, &key_scales[buf][row], base, u, ok);
+      else cp16(dst, base + u * 8, ok);
     }
   };
   const int64_t first = (int64_t)blockIdx.y * loop;
@@ -114,10 +121,11 @@ extern "C" __global__ void __launch_bounds__(glm_index::RB * 32)
       }
       for (int nt = 0; nt < 2; ++nt)
         for (int e = 0; e < 2; ++e) {
-          const float v0 = fmaxf(__fmul_rn(acc[0][nt][e], scale), 0.0f),
-                      v1 = fmaxf(__fmul_rn(acc[0][nt][e + 2], scale), 0.0f);
-          const float v2 = fmaxf(__fmul_rn(acc[1][nt][e], scale), 0.0f),
-                      v3 = fmaxf(__fmul_rn(acc[1][nt][e + 2], scale), 0.0f);
+          const float ks = packed ? key_scales[j & 1][gi * 16 + nt * 8 + 2 * q + e] : 1.0f;
+          const float v0 = fmaxf(__fmul_rn(__fmul_rn(acc[0][nt][e], ks), scale), 0.0f),
+                      v1 = fmaxf(__fmul_rn(__fmul_rn(acc[0][nt][e + 2], ks), scale), 0.0f);
+          const float v2 = fmaxf(__fmul_rn(__fmul_rn(acc[1][nt][e], ks), scale), 0.0f),
+                      v3 = fmaxf(__fmul_rn(__fmul_rn(acc[1][nt][e + 2], ks), scale), 0.0f);
           float s = __fmul_rn(wv[1], v1);
           s = __fmaf_rn(wv[0], v0, s);
           s = __fmaf_rn(wv[2], v2, s);

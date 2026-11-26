@@ -4,6 +4,46 @@ const glm = @import("glm");
 const registry = @import("core").contract.registry;
 const t = std.testing;
 
+test "glm dflash: calibrated greedy edge changes the candidate and its temperature changes the chance" {
+    const df = glm.dflash;
+    var dr: df.Drafter = undefined;
+    dr.world = 1;
+    dr.temp = 1;
+    var cand: [df.BLOCK * df.CW]i32 = @splat(-1);
+    var gh: [df.BLOCK * df.RANK]f32 = @splat(0);
+    var pred: [2 * df.RANK]u16 = @splat(0);
+    var succ: [2 * df.RANK]u16 = @splat(0);
+    // The first predecessor feature is one for either token. Token 0 gains an edge of one.
+    pred[0] = 0x3f80;
+    pred[df.RANK] = 0x3f80;
+    succ[0] = 0x3f80;
+    for (1..df.BLOCK) |r| {
+        const i = r * df.CW;
+        cand[i] = 0;
+        cand[i + 1] = 1;
+        cand[i + df.TOPK] = @bitCast(@as(f32, 0));
+        cand[i + df.TOPK + 1] = @bitCast(@as(f32, 0.75));
+        gh[r * df.RANK] = 1;
+    }
+    dr.cand = &cand;
+    dr.gh = &gh;
+    dr.pred = &pred;
+    dr.succ = &succ;
+    var ids: [df.BLOCK - 1]u32 = undefined;
+    var probs: [df.BLOCK - 1]f64 = undefined;
+    var q: df.Req = .{ .slot = 0, .pos = 0, .n = 0, .anchor = 0, .out = &ids, .probs = &probs };
+    for ([_]bool{ false, true }) |calibrated| {
+        q.calibrated = calibrated;
+        df.selector.select(&dr, 0, df.BLOCK, q);
+        const delta: f64 = if (calibrated) (0.75 - 0.6) / 2.0 else (1.0 - 0.75);
+        const expected = 1.0 / (1.0 + @exp(-delta));
+        for (ids, probs) |id, p| {
+            try t.expectEqual(@as(u32, @intFromBool(calibrated)), id);
+            try t.expectApproxEqAbs(expected, p, 1e-8);
+        }
+    }
+}
+
 test "glm dflash: gather and read fit for every supported rank count" {
     for (1..17) |world| for ([_]usize{ 1, 8, glm.dflash.MAX_M }) |rows| {
         const n = glm.dflash_candidates.Layout.init(world, rows, glm.dflash.CW);

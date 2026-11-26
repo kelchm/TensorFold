@@ -8,6 +8,9 @@ const index_mod = @import("cuda_index.zig");
 
 /// What the forward's kernels launch from: our glue's, glm_mm's when tiled, qlinear's lane for FP8 kinds, copy_rows.
 pub const Set = struct {
+    verify_tiles: @import("cuda_verify_tiles.zig").Window = .{},
+    kv_pow2: bool = false,
+    prompt_mma: ?*const @import("cuda_prompt_mma.zig").Kernels = null,
     glue: *const Kernels,
     index: ?*const index_mod.Kernels = null,
     mm: ?*const mm_mod.Kernels = null,
@@ -58,6 +61,7 @@ pub const Kernels = struct {
     expand_v: cuda.Function,
     lat_write: cuda.Function,
     lat_write_fp8: cuda.Function,
+    lat_write_fp8_paged: cuda.Function,
     index_write: cuda.Function,
     pool_keys: cuda.Function,
     select_rows: cuda.Function,
@@ -76,6 +80,8 @@ pub const Kernels = struct {
     chunks_32: cuda.Function,
     chunks_16_fp8: cuda.Function,
     chunks_32_fp8: cuda.Function,
+    chunks_16_fp8_paged: cuda.Function,
+    chunks_32_fp8_paged: cuda.Function,
     merge: cuda.Function,
     scores: cuda.Function,
 
@@ -88,6 +94,8 @@ pub const Kernels = struct {
         try k.chunks_32.allowDynamicShared(chunksSmem(32));
         try k.chunks_16_fp8.allowDynamicShared(chunksSmem(16));
         try k.chunks_32_fp8.allowDynamicShared(chunksSmem(32));
+        try k.chunks_16_fp8_paged.allowDynamicShared(chunksSmem(16));
+        try k.chunks_32_fp8_paged.allowDynamicShared(chunksSmem(32));
         return k;
     }
 };

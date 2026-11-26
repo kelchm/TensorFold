@@ -39,6 +39,8 @@ pub const Buffers = state.Buffers;
 pub const Modules = struct {
     glue: glue.Kernels,
     mods: [8]cuda.Module,
+    prompt_s2: ?cuda.Module,
+    prompt_mma: ?@import("cuda_prompt_mma.zig").Kernels,
     kda: kda.Kernels,
     lane: cuda.qmmf.Lane, // the NVFP4 linears' decode rows (qlinear)
     prompt: cuda.nvfp4.Prompt, // and their prompt rows
@@ -87,6 +89,8 @@ pub const Modules = struct {
         m.exl3 = try exl3.Kernels.load(d);
         errdefer m.exl3.unload();
         m.mm = try mm_mod.Kernels.load(m.mods[7]);
+        m.prompt_s2 = null;
+        m.prompt_mma = null;
         m.mla = if (roped) try cuda.mla.Mla.load(d) else null;
         errdefer if (m.mla) |*x| x.unload();
         m.index = null;
@@ -126,6 +130,8 @@ pub const Modules = struct {
         if (m.index) |*x| x.unload();
         if (m.dscore) |*x| x.unload();
         if (m.mla) |*x| x.unload();
+        if (m.prompt_mma) |*x| x.mod.unload();
+        if (m.prompt_s2) |*x| x.unload();
         m.exl3.unload();
         for (&m.mods) |*x| x.unload();
         m.lane.unload();
@@ -163,6 +169,9 @@ pub const ImageRows = struct { v: *images_mod.Images, slot: u32 };
 pub const Seg = struct { st: *State, row0: usize, rows: usize };
 
 pub const Forward = struct {
+    verify_tiles: @import("cuda_verify_tiles.zig").Window = .{},
+    kv_pow2: bool = false,
+    absorb_mma: bool = false,
     d: *const cuda.Driver,
     m: *const Modules,
     stream: cuda.Stream,
@@ -185,7 +194,7 @@ pub const Forward = struct {
     }
 
     pub fn set(f: *const Forward) glue.Set {
-        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .dsel = f.m.dsel, .dscore = if (f.m.dscore) |*x| x else null, .mla = if (f.m.mla) |*x| x else null };
+        return .{ .verify_tiles = f.verify_tiles, .prompt_mma = if (f.absorb_mma and f.m.prompt_mma != null) &f.m.prompt_mma.? else null, .kv_pow2 = f.kv_pow2, .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .dsel = f.m.dsel, .dscore = if (f.m.dscore) |*x| x else null, .mla = if (f.m.mla) |*x| x else null };
     }
 
     /// The layer sums' boundary (cuda_boundary.zig): every rank's fp32 partial into every gathered buffer.

@@ -59,6 +59,8 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
     rev25_emulated.expectExitCode(0);
     rev25.dependOn(&rev25_emulated.step);
     rev25.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{ "GLM index:", "GLM strict env:", "TF_GLM_INDEX_SPLIT:", "GLM REV25 E8:" } })).step);
+    const mma_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM latent:"} }));
+    b.step("test-glm-prompt-mma-host", "Flash prompt MMA dispatch and non-Flash fallback").dependOn(&mma_run.step);
     const kv8_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM FP8 KV:"} }));
     b.step("test-glm-fp8-kv-host", "GLM latent cache layout, mode agreement and recorded CUDA launches without devices").dependOn(&kv8_run.step);
     step.dependOn(&kv8_run.step);
@@ -87,6 +89,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
     const snapshots = b.createModule(.{ .root_source_file = b.path("zig/glm_snapshot_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm", .module = glm }, .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "engine_api", .module = api }, .{ .name = "copies", .module = copies } } });
     const snapshots_run = b.addRunArtifact(b.addTest(.{ .root_module = snapshots }));
     b.step("test-glm-snapshots-host", "Prompt-sized GLM state copies, page budgets and rank ordering without devices").dependOn(&snapshots_run.step);
+    b.step("test-glm-kv-pages-host", "TF_KV_PAGES for bf16 and E4M3, the page layouts, admission and refusals, on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{ "TF_KV_PAGES", "capacity keeps", "the plan's window", "a paged stream", "the engine's own sequence holds", "a pool is refused", "a follower", "TF_KV_POISON", "every host allocation failure while making the pages", "E4M3 pages", "a request needing more pages" } })).step);
     step.dependOn(&snapshots_run.step);
     b.step("test-glm-prompt-settings-host", "Actual opt-in settings and rank agreement on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{ "prompt K experiment", "TF_GLM_PAIR_EXPERTS", "startup switches", "nvfp4 paired prompt staging bytes", "plan sizes as the Python" } })).step);
     const request_starts = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"glm request starts:"} }));

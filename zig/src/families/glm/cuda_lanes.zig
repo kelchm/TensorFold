@@ -32,6 +32,8 @@ pub const Lanes = struct {
     x: follow.Leader,
     whole: bool = false, // prompt passes run whole (TF_GLM_PROMPT_STEPS=0): no other stream's round between chunks
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
+    long_copy_match: bool = false, // rank 0 selects candidate windows from the current request history
+    calibrated_greedy: bool = false, // rank 0 scores DFlash2 candidates for greedy requests
     mtp_confidence: ?f64 = null, // --mtp-confidence: the MTP head's chains stop where their chance falls under it
     copy_confidence: bool = false, // copy mode keeps head confidence in probabilities so target copies stay priced
     costs: ?lane_costs.Table = null, // MTP's window and draft prices, timed at load (cuda_lane_costs)
@@ -126,7 +128,13 @@ pub const Lanes = struct {
     /// Root/context copies use the same verify/keep path and shared cost allocator as every target window.
     pub fn factsWithCopies(self: *Lanes, enabled: bool) lanes.Model {
         self.copy_confidence = enabled and self.x.e.mtp;
-        return copy_policy.apply(self.facts(), enabled, self.x.e.drafter == null and self.costs != null);
+        var m = copy_policy.apply(self.facts(), enabled, self.x.e.drafter == null and self.costs != null);
+        if (self.long_copy_match and enabled and self.x.e.drafter != null) {
+            m.fixed_copy_drafts = 15;
+            m.copy_match = 8;
+            m.copy_reply_match = 16;
+        }
+        return m;
     }
 
     fn of(ptr: *anyopaque) *Lanes {
@@ -352,7 +360,7 @@ pub const Lanes = struct {
 
     /// The lane host's admission: with a pool, a paged sequence and the request's pages are free.
     pub fn fits(self: *const Lanes, prompt: usize, max_tokens: usize) bool {
-        const p = self.x.e.pages orelse return true;
+        const p = self.x.e.pages orelse return true; // its wait note is rank 0's, on the engine thread
         return p.fits(prompt, max_tokens);
     }
 
@@ -550,12 +558,15 @@ pub const Lanes = struct {
                 n = rows.len;
                 break :a r.follow[rows.len - 1];
             } else self.value(r.first orelse return error.NoFirstToken);
-            reqs[i] = .{ .slot = l.slot, .pos = 0, .n = n, .anchor = anchor, .propose = r.depth > 0, .out = &l.held, .probs = &l.chances };
+            const greedy = if (r.stream.sampling) |s| s.temperature == 0 else true;
+            reqs[i] = .{ .slot = l.slot, .pos = 0, .n = n, .anchor = anchor, .propose = r.depth > 0, .out = &l.held, .probs = &l.chances, .calibrated = self.calibrated_greedy and greedy };
             held[i] = l;
         }
         try self.x.block(reqs[0..requests.len]);
-        const cut = try dflash.confidence();
-        for (requests, held[0..requests.len]) |r, l| {
+        const normal_cut = try dflash.confidence();
+        const calibrated_cut = if (self.calibrated_greedy) try dflash.chainCut(true) else normal_cut;
+        for (requests, held[0..requests.len], reqs[0..requests.len]) |r, l, q| {
+            const cut = if (q.calibrated) calibrated_cut else normal_cut;
             l.held_n = @min(r.depth, max_held);
             var chain: f64 = 1; // glm_cuda's rule: past the first, a chain stops where its product falls under the cut
             for (l.chances[0..l.held_n], 0..) |*c, j| {

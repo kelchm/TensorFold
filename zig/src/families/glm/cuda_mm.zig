@@ -7,7 +7,13 @@ const cuda_pdl = @import("cuda_pdl.zig");
 pub const Tiled = struct { w: u64, n: usize, k: usize, s: u64 = 0, bits: u8 = 16 };
 
 /// The widths glm_mm packs to, by kernel set: bf16 first.
-const widths = [_]u8{ 16, 4, 6, 8 };
+pub const affine4: u8 = 20; // Python MSE affine groups of 64
+pub const fp8_block128: u8 = 24; // Python E4M3 with an FP32 scale per 128
+const widths = [_]u8{ 16, 4, 6, 8, affine4, fp8_block128 };
+
+pub fn weightWidth(format: u8) u8 {
+    return if (format > 16) format - 16 else format;
+}
 
 fn widthIndex(bits: u8) !usize {
     return std.mem.indexOfScalar(u8, &widths, bits) orelse error.BadBits;
@@ -15,7 +21,7 @@ fn widthIndex(bits: u8) !usize {
 
 /// Bytes a packed linear's codes take (its scales follow, 256-aligned): what fits in place of its bf16 tiles.
 pub fn packedBytes(n: usize, k: usize, bits: u8) [2]usize {
-    return .{ std.mem.alignForward(usize, n * k * bits / 8, 256), n * (k / 64) * 2 };
+    return .{ std.mem.alignForward(usize, n * k * weightWidth(bits) / 8, 256), n * (k / 64) * @as(usize, if (bits > 16) 4 else 2) };
 }
 
 /// The linears packed at load: each one's tiles pointer (sorted) and its bits; a linear not here is bf16.
@@ -40,16 +46,18 @@ pub const Packed = struct {
 /// glm_mm's bf16 kernels by row bucket, the K-slice reduce and the tiling.
 pub const Kernels = struct {
     by_rows: [4]cuda.Function, // bf16: 16, 32, 64, 128 rows a block
-    packed_rows: [3][4]cuda.Function, // 4, 6 and 8 bits, as by_rows
+    prompt_s2: ?[5]cuda.Function = null,
+    packed_rows: [5][4]cuda.Function, // 4, 6 and 8 bits, as by_rows
     prompt: cuda.Function, // 128-row blocks, row blocks fastest: a prompt's blocks share each weight tile in L2
     reduce: cuda.Function,
     tile: cuda.Function,
-    tile_packed: [3]cuda.Function, // glm_mm_tile4/6/8: packed rows and their scales into the tiles
+    quant_python: [2]cuda.Function = undefined,
+    tile_packed: [5]cuda.Function, // glm_mm_tile4/6/8: packed rows and their scales into the tiles
     prompt_fixed_k: bool = false, // opt-in prompt experiment; never selected from the number of batched rows
     pdl: bool, // dependent launches: a matmul's weights stream in while the kernel before it finishes
 
     pub fn load(m: cuda.Module) !Kernels {
-        var k: Kernels = .{ .by_rows = undefined, .packed_rows = undefined, .tile_packed = undefined, .prompt = try m.function("glm_mm16_rows"), .reduce = try m.function("glm_mm_reduce"), .tile = try m.function("glm_mm_tile16"), .pdl = true };
+        var k: Kernels = .{ .by_rows = undefined, .packed_rows = undefined, .tile_packed = undefined, .quant_python = .{ try m.function("glm_mm_quant20"), try m.function("glm_mm_quant24") }, .prompt = try m.function("glm_mm16_rows"), .reduce = try m.function("glm_mm_reduce"), .tile = try m.function("glm_mm_tile16"), .pdl = true };
         inline for (.{ "glm_mm16_16", "glm_mm16_32", "glm_mm16_64", "glm_mm16_128" }, 0..) |name, i| {
             k.by_rows[i] = try m.function(name);
             try k.by_rows[i].allowDynamicShared(smem(bucket(i)));
@@ -65,6 +73,15 @@ pub const Kernels = struct {
         k.pdl = cuda_pdl.on();
         return k;
     }
+
+    pub fn preparePrompt2(k: *Kernels, mod: cuda.Module) !void {
+        var fns: [5]cuda.Function = undefined;
+        inline for (widths[1..], 0..) |bits, i| {
+            fns[i] = try mod.function(std.fmt.comptimePrint("glm_mm{d}_128s2", .{bits}));
+            try fns[i].allowDynamicShared(@divExact(sharedBytes(bits, 128), 3) * 2);
+        }
+        k.prompt_s2 = fns;
+    }
 };
 
 const split_target = 192; // column tiles times K slices a launch aims at (the GB10's SMs, a few blocks each)
@@ -79,8 +96,8 @@ fn smem(bm: usize) u32 {
 
 /// A block's shared memory: three stages of `bm` rows of x and a 64-column tile of weights (`bits / 2` words a lane).
 pub fn sharedBytes(bits: u8, bm: usize) u32 {
-    const wpc: usize = if (bits == 16) 8 else bits / 2;
-    return @intCast(3 * (bm * 128 + 8 * 32 * wpc * 4 + 128));
+    const wpc: usize = weightWidth(bits) / 2;
+    return @intCast(3 * (bm * 128 + 8 * 32 * wpc * 4 + @as(usize, if (bits > 16) 256 else 128)));
 }
 
 /// K slices fixed by the shape: column tiles times slices reach the target, each slice at least 4 groups of 64.
@@ -126,6 +143,8 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
         const row_blocks: u32 = @intCast((rows + bm - 1) / bm);
         if (big and wi == 0) {
             try cuda.launch.launch(k.prompt, .{ .grid = .{ .x = row_blocks, .y = cols }, .block = .{ .x = 256 }, .shared = smem(128), .pdl = k.pdl }, s, &a);
+        } else if (big and one and k.prompt_s2 != null) {
+            try cuda.launch.launch(k.prompt_s2.?[wi - 1], .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = 256 }, .shared = @divExact(sharedBytes(w.bits, bm), 3) * 2, .pdl = k.pdl }, s, &a);
         } else { // packed prompts take the 128-row bucket's blocks, one slice
             const f = if (wi == 0) k.by_rows[i] else k.packed_rows[wi - 1][i];
             try cuda.launch.launch(f, .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = if (bm <= 32) 128 else 256 }, .shared = sharedBytes(w.bits, bm), .pdl = k.pdl }, s, &a);

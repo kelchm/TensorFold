@@ -12,12 +12,17 @@ const switches = [_]Name{
     .{ .name = "TF_GLM_VISION_HOST" },
     .{ .name = "TF_GLM_PROF" },
     .{ .name = "TF_GLM_LINK_WAIT" },
+    .{ .name = "TF_GLM_KV_POW2" },
+    .{ .name = "TF_GLM_DFLASH_Q4_DOWN" },
     .{ .name = "TF_GLM_PDL", .default = true },
     .{ .name = "TF_GLM_PROMPT_STEPS", .default = true },
     .{ .name = "TF_GLM_SHARED", .default = true },
     .{ .name = "TF_GLM_DSEL", .default = true },
     .{ .name = "TF_GLM_DSCORES", .default = true },
     .{ .name = "TF_GLM_MOE_DIRECT" },
+    .{ .name = "TF_GLM_EXL3_DECODE" },
+    .{ .name = "TF_GLM_DECODE_MLA_WIDE" },
+    .{ .name = "TF_GLM_DECODE_TILE_RANGES" },
 };
 const counts = [_][:0]const u8{"TF_GLM_DFLASH2_LOG"};
 const reals = [_][:0]const u8{"TF_GLM_DRAFT_CONFIDENCE"};

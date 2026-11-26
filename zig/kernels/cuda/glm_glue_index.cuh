@@ -5,6 +5,7 @@
 
 #include "glm_triton.cuh"
 #include "glm_index_rope.cuh"
+#include "kv_fp8.cuh"
 
 using namespace glm_triton;
 
@@ -48,16 +49,21 @@ extern "C" __global__ void __launch_bounds__(32)
     tf_glm_pool_keys(const __nv_bfloat16* ik, const __nv_bfloat16* ig, const __nv_bfloat16* ape, __nv_bfloat16* pk,
                      const int* pos, int64_t rows, const int* pt, int64_t ps, int pool) {
   glm_pdl::enter();
+  const bool packed = pool < 0;
+  if (packed) pool = -pool;
+  float vals[4];
   constexpr int D = 128;
   const int64_t P = pos[0], p = P / pool + blockIdx.x;
   if (pool * p + pool - 1 > P + rows - 1) return;
   const int64_t pp = 512 / pool;  // a page holds 512 rows' pools
   __nv_bfloat16* out = pk + (pt ? (int64_t)pt[p / pp] * (ps / 2) + (p % pp) * D : p * D);
   if (pool == 1) {
-    for (int j = 0; j < 4; ++j) out[threadIdx.x * 4 + j] = ik[p * D + threadIdx.x * 4 + j];
-    return;
-  }
-  for (int j = 0; j < 4; ++j) {
+    for (int j = 0; j < 4; ++j) {
+      const auto value = ik[p * D + threadIdx.x * 4 + j];
+      if (packed) vals[j] = bf(value);
+      else out[threadIdx.x * 4 + j] = value;
+    }
+  } else for (int j = 0; j < 4; ++j) {
     const int d = threadIdx.x * 4 + j;
     float l[4], e[4];
     for (int q = 0; q < 4; ++q) l[q] = bf(ig[(4 * p + q) * D + d]) + bf(ape[q * D + d]);
@@ -69,8 +75,24 @@ extern "C" __global__ void __launch_bounds__(32)
       const float tq = rbf(__fmul_rn(rbf(div_full(e[q], s)), bf(ik[(4 * p + q) * D + d])));
       t = q == 0 ? tq : t + tq;
     }
-    out[d] = __float2bfloat16_rn(t);
+    if (packed) vals[j] = rbf(t);
+    else out[d] = __float2bfloat16_rn(t);
   }
+  if (!packed) return;
+  float amax = 0.0f;
+  for (int j = 0; j < 4; ++j) amax = fmaxf(amax, fabsf(vals[j]));
+  for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+  float scale, inv;
+  tf_kv_fp8::power_scale(amax, scale, inv);
+  uint32_t word = 0;
+  for (int j = 0; j < 4; ++j) {
+    const uint32_t code = __nv_cvt_float_to_fp8(__fmul_rn(vals[j], inv), __NV_SATFINITE, __NV_E4M3);
+    word |= code << (8 * j);
+  }
+  // Keep the native snapshot's 256-byte pooled-row pitch. Only codes and the scale contain data.
+  uint32_t* row = reinterpret_cast<uint32_t*>(out);
+  row[threadIdx.x] = word;
+  row[D / 4 + threadIdx.x] = threadIdx.x == 0 ? __float_as_uint(scale) : 0;
 }
 
 namespace glm_index {

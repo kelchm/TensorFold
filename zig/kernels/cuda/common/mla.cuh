@@ -44,13 +44,16 @@ constexpr int wide_smem() {
 }
 
 // RW roped columns (Ling's 64) follow the latent in q and keys; SPLIT: block z is chunk z * sw + sr, keys page z.
-template <int HB, bool FP8 = false, int RW = 0, bool SPLIT = false>
+// PAGED8: an E4M3 cache on KV pages (pt, pstep bytes apart): a dense chunk is one page, a sparse key's logical token goes
+// through the table to its page; codes and scales then load as on a window, so the arithmetic is the window's.
+template <int HB, bool FP8 = false, int RW = 0, bool SPLIT = false, bool PAGED8 = false>
 __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
                             float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr,
                             int sw = 1, int sr = 0) {
   static_assert(!(FP8 && RW != 0), "the E4M3 cache holds the latent alone");
   static_assert(!(SPLIT && FP8), "a split cache holds BF16 rows");
+  static_assert(!(PAGED8 && !FP8), "PAGED8 requires FP8");
   constexpr int MT = HB / 16, KW = LW + RW;
   extern __shared__ __align__(16) unsigned char smem[];
   __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(smem);
@@ -67,6 +70,15 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   // a dense chunk's 512 keys are one page, its rows from that page's; a sparse key's row comes as the token list has it
   const __nv_bfloat16* paged = !FP8 && pt && !sparse && live ? lc + ((int64_t)pt[c] * (pstep / 2) - start * KW) : lc;
   const __nv_bfloat16* keys_at = SPLIT ? lc + (c * CH - start) * KW : paged;
+  const unsigned char* codes8 = reinterpret_cast<const unsigned char*>(lc);
+  const float* scales8 = scales;
+  if constexpr (PAGED8) {
+    if (!sparse && live) {
+      const int64_t page = (int64_t)pt[c] * pstep;
+      codes8 += page - start * LW;
+      scales8 = reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(scales) + page) - start;
+    }
+  }
   auto load_kv = [&](int tile) {
     __nv_bfloat16* dst = kvs + (tile & 1) * KT * KW;
     const int64_t first = start + tile * KT;
@@ -76,12 +88,27 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       const bool ok = sparse ? ki < n : ki <= limit;
       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
       if constexpr (FP8) {
-        const unsigned char* codes = reinterpret_cast<const unsigned char*>(lc);
-        const float row_scale = ok ? scales[src] : 1.0f;
+        const unsigned char* code_base = codes8;
+        int64_t code_row = src;
+        float row_scale = 1.0f;
+        if constexpr (PAGED8) {
+          if (sparse) {
+            const int s = ok ? (int)src : 0;
+            const int64_t page = ok ? (int64_t)pt[s >> 9] * pstep : 0;
+            const int row = s & (CH - 1);
+            code_base = codes8 + page;
+            code_row = row;
+            row_scale = ok ? *reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(scales) + page + row * 4) : 1.0f;
+          } else {
+            row_scale = ok ? scales8[src] : 1.0f;
+          }
+        } else {
+          row_scale = ok ? scales8[src] : 1.0f;
+        }
 #pragma unroll
         for (int j = 0; j < 8; j += 2) {
-          const uint16_t bits = ok ? (uint16_t)codes[src * LW + u * 8 + j] |
-                                        ((uint16_t)codes[src * LW + u * 8 + j + 1] << 8) : 0;
+          const uint16_t bits = ok ? (uint16_t)code_base[code_row * LW + u * 8 + j] |
+                                        ((uint16_t)code_base[code_row * LW + u * 8 + j + 1] << 8) : 0;
           const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
           dst[wide(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, row_scale));
           dst[wide(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, row_scale));

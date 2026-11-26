@@ -367,3 +367,5 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_k6(cons
         float* __restrict__ y, int K, int D, int skip) {
     prompt_down<6>(Xd, Td, items, counts, members, svh_d, y, K, D, skip);
 }
+
+#include "glm_exl3_decode.cuh"

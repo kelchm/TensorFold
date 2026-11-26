@@ -4,7 +4,7 @@ const cuda = @import("cuda");
 const mm = @import("cuda_mm.zig");
 const q4 = @import("cuda_q4.zig");
 const taps_mod = @import("cuda_taps.zig");
-const select = @import("dflash_select.zig");
+pub const selector = @import("dflash_select.zig");
 const block = @import("dflash_block.zig");
 
 pub const BLOCK: usize = 8;
@@ -41,7 +41,12 @@ pub fn tapRows(prompt_rows: usize) usize {
 
 /// TF_GLM_DRAFT_CONFIDENCE: where a DFlash2 chain's chance product stops it (glm_cuda's 0.7).
 pub fn confidence() !f64 {
-    return @import("sys").environment.read(f64, "TF_GLM_DRAFT_CONFIDENCE", 0.7);
+    return chainCut(false);
+}
+
+/// Explicit setting overrides the greedy DFlash2 default.
+pub fn chainCut(calibrated: bool) !f64 {
+    return @import("sys").environment.read(f64, "TF_GLM_DRAFT_CONFIDENCE", if (calibrated) 0.3 else 0.7);
 }
 
 /// The drafter MLP split: two ranks as before; three or more with `wide` (Settings.draftWide) and 256-aligned shares.
@@ -82,8 +87,8 @@ pub const Kernels = struct {
 /// A drafter linear: 4 bits (--drafter-bits 4, the default; they only propose) or bf16 tiled for glm_mm.
 pub const Lin = union(enum) { q4: q4.Q4, bf16: mm.Tiled };
 
-/// down and the selector's projection stay bf16 (their fp32 outputs are gathered or read on the host).
-pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, a_base: u64, m_base: u64, qkv: Lin, kv: Lin, o: Lin, gu: Lin, down: mm.Tiled, a_proj: Lin, m_proj: Lin };
+/// The row-parallel down writes fp32 partials at either precision. The selector projection remains bf16.
+pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, a_base: u64, m_base: u64, qkv: Lin, kv: Lin, o: Lin, gu: Lin, down: Lin, a_proj: Lin, m_proj: Lin };
 
 /// A stream's drafter state by slot: its ring, where its context starts, and its last verify's tap rows.
 pub const Slot = struct {
@@ -96,7 +101,7 @@ pub const Slot = struct {
 };
 
 /// One stream's request: `n` rows of its last verify into its context first (0: none), the anchor, rank 0's `out`.
-pub const Req = struct { slot: u32, pos: i64, n: usize, anchor: u32, propose: bool = true, out: ?[]u32 = null, probs: ?[]f64 = null };
+pub const Req = struct { slot: u32, pos: i64, n: usize, anchor: u32, propose: bool = true, calibrated: bool = false, out: ?[]u32 = null, probs: ?[]f64 = null };
 
 /// Context runs: `n` tap rows at `taps` (consecutive), positions pos0.., into `ring`.
 pub const Run = struct { ring: u64, taps: u64, n: usize, pos0: i64 };
@@ -307,7 +312,7 @@ pub const Drafter = struct {
         if (rank0) {
             try block.download(dr, e, std.mem.sliceAsBytes(dr.cand[0..@import("dflash_candidates.zig").Layout.init(dr.world, M, CW).read]), dr.gtk);
             try block.download(dr, e, std.mem.sliceAsBytes(dr.gh[0 .. M * RANK]), dr.g);
-            for (active, 0..) |q, i| select.select(dr, i, M, q);
+            for (active, 0..) |q, i| selector.select(dr, i, M, q);
             if (dr.log > dr.calls) for (active) |q| std.log.info("dflash2 round {d}: slot {d} pos {d} kept {d} anchor {d} drafts {any}", .{ dr.calls, q.slot, q.pos, q.n, q.anchor, q.out.?[0 .. BLOCK - 1] });
             if (dr.calls % 256 == 255) std.log.info("dflash2: {d} rounds, {d} contexts restarted", .{ dr.calls + 1, dr.lost });
         }

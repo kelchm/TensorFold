@@ -62,6 +62,7 @@ pub const Engine = struct {
     lib: *const cuda.nccl.Library,
     comm: cuda.nccl.Comm,
     group: ?*const cuda.tp_group.Group = null, // the main stream's all-gathers (RoCE on two ranks); null: lib and comm
+    verify_tiles: @import("cuda_verify_tiles.zig").Options = .{},
     mesh: mesh_mod.Mesh, // this rank's place: one tensor group of `world` ranks
     backend: *tp.group.Backend, // the boundary's communicator over lib and comm, then the group once it is up
     collective: tp.Collective, // backend's, made once so a const engine hands it out
@@ -159,6 +160,15 @@ pub const Engine = struct {
         const block32 = if (exl3.isExl3(gpa, text)) null else try @import("cuda_experts.zig").wantsBlock32(gpa, text);
         var m = try fw.Modules.load(d, ctx, block32, c.rope != 0);
         errdefer m.deinit();
+        if (o.settings.prompt_s2 and c.exl3 and world == 2 and c.hidden == 4096 and c.rope == 0 and (try ctx.capability()) == 121) {
+            m.prompt_s2 = try cuda.Module.load(d, cuda.kernels.glm_mm_s2);
+            try m.mm.preparePrompt2(m.prompt_s2.?);
+            if (rank == 0) std.log.info("glm: two-stage packed prompt projections enabled", .{});
+        }
+        if (o.settings.absorb_mma and c.exl3 and world == 2 and c.hidden == 4096 and c.nope == 256 and c.v_dim == 256 and c.kv_lora == 512 and c.rope == 0 and (try ctx.capability()) == 121) {
+            m.prompt_mma = try @import("cuda_prompt_mma.zig").Kernels.load(d);
+            if (rank == 0) std.log.info("glm: tensor-core prompt MLA projections enabled for GLM-5.3-Flash", .{});
+        }
         const pair = prompt_pair.wanted(o.settings.pair, o.settings.solo, world);
         const joint_experts = pair and o.settings.pair_experts;
         var pieces = try fw.Pieces.init(d, o.settings.pieces, pair);
@@ -192,7 +202,10 @@ pub const Engine = struct {
         }
         e.m.mm.prompt_fixed_k = o.settings.prompt_fixed_k;
         e.m.tiled = o.settings.tiled;
+        e.m.exl3.glm_decode = o.settings.exl3_decode and world == 2 and try ctx.capability() == 121;
+        if (rank == 0 and e.m.exl3.glm_decode) std.log.info("glm: specialized four-bit EXL3 verification kernels enabled", .{});
         if (o.settings.tiled) e.m.packs = &e.packs;
+        if (o.settings.verify_tiles.enabled()) e.verify_tiles = o.settings.verify_tiles.gate(try ctx.capability(), world, o.settings.pages, o.settings.kv_pow2, o.settings.kv_host);
         if (o.settings.l2pf.want(try ctx.capability(), world)) e.l2pf = try l2pf_mod.L2pf.init(gpa, d, &e.w, o.settings.l2pf);
         errdefer if (e.l2pf) |*p| p.deinit();
         if (o.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
@@ -297,7 +310,7 @@ pub const Engine = struct {
     pub fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
         const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = prompt_pair.piecesOf(e, b), .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .l2pf = if (e.l2pf) |*p| p else null, .pair_experts = e.pair != null and e.settings.pair_experts };
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = prompt_pair.piecesOf(e, b), .split = e.settings.split, .ring = e.settings.ring, .absorb_mma = e.settings.absorb_mma, .kv_pow2 = e.settings.kv_pow2, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .l2pf = if (e.l2pf) |*p| p else null, .pair_experts = e.pair != null and e.settings.pair_experts };
     }
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
@@ -473,6 +486,7 @@ pub const Engine = struct {
         var one: [1]fw.Rank = undefined;
         var f = e.view(&e.bd, &one);
         const at = e.cur.st.pos;
+        f.verify_tiles = e.verify_tiles.window(at, ids.len);
         f.prof = e.profs[ids.len - 1];
         if (f.prof) |p| try p.begin(e.stream, verifyLabel(ids.len));
         try f.run(@ptrCast(ids));
@@ -500,7 +514,7 @@ pub const Engine = struct {
             rows += p.ids.len;
         }
         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(false) else null, .l2pf = if (e.l2pf) |*p| p else null };
+        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .absorb_mma = e.settings.absorb_mma, .kv_pow2 = e.settings.kv_pow2, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(false) else null, .l2pf = if (e.l2pf) |*p| p else null };
         try f.run(@ptrCast(ids[0..rows]));
         if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
         for (parts, segs[0..parts.len]) |p, g| {

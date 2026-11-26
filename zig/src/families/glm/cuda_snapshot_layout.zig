@@ -90,8 +90,10 @@ pub const Plan = struct {
         const latent = try std.math.mul(usize, at, s.row * @as(usize, if (x.ls == 0) 2 else 1));
         const ring = try std.math.mul(usize, @min(at, st.ring_rows), st.ring_row);
         const pooled = try std.math.mul(usize, @min(at / s.pool + 2, x.pk_rows), s.i_dim * 2);
-        try p.addCache(st, x, x.lc, latent, s.latentBytes(), x.ps);
-        if (x.ls != 0) try p.add(st, x.ls, try std.math.mul(usize, at, @sizeOf(f32)));
+        const latent_row = s.row * @as(usize, if (x.ls == 0) 2 else 1);
+        try p.addCache(st, x, x.lc, latent, page_rows * latent_row, x.ps);
+        // E4M3 scales: beside the codes in the arena, or on pages a part's 512 after its codes
+        if (x.ls != 0) try p.addCache(st, x, x.ls, try std.math.mul(usize, at, @sizeOf(f32)), page_rows * @sizeOf(f32), x.ps);
         try p.add(st, st.rings[2 * j], ring);
         try p.add(st, st.rings[2 * j + 1], ring);
         try p.addCache(st, x, x.pk, pooled, s.pkBytes(), if (x.pks != 0) x.pks else x.ps);

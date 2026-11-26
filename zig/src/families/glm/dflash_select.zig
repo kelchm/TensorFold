@@ -52,11 +52,12 @@ pub fn select(dr: *const df.Drafter, i: usize, M: usize, q: df.Req) void {
             const Sc = dr.succ[@as(usize, c[m].id) * RANK ..][0..RANK];
             var dot: f32 = 0;
             for (pg, Sc) |a, b| dot += a * bf(b);
-            sc[m] = c[m].v + dot;
+            sc[m] = c[m].v + if (q.calibrated) 0.6 * dot else dot;
             if (sc[m] > sc[best]) best = m;
         }
         var z: f64 = 0;
-        for (sc[0..n]) |x| z += @exp(@as(f64, x - sc[best]) / dr.temp);
+        const beta: f64 = if (q.calibrated) 2.0 else dr.temp;
+        for (sc[0..n]) |x| z += @exp(@as(f64, x - sc[best]) / beta);
         out[t - 1] = c[best].id;
         if (q.probs) |p| p[t - 1] = 1.0 / z;
         prev = c[best].id;

@@ -16,6 +16,7 @@ const Seen = struct { id: usize, grid: [3]u32, block: u32, shared: u32, args: [1
 fn sizes(id: usize) []const u8 {
     return switch (id) {
         ids.chunks_16, ids.chunks_32, mla_ids.chunks => "888888888884488",
+        701, 702 => "88888844",
         ids.merge => "888888844",
         ids.lat_write => "8888888",
         ids.absorb_q, ids.expand_v => "888888",
@@ -394,4 +395,24 @@ test "prefill exact: E4 keys-only commit slices only safe KV and never reads poi
     try t.expectEqualSlices(u64, &.{ s.dp + l.q_lora * 2, l.q_lora + l.row(), l.kv_norm, s.lat, l.row(), s.xs_lat }, wide_norm[0].args[0..6]);
     try t.expectEqual(@as(usize, 0), Launch.of(ids.rmsnorm_1536, &mb).len);
     try t.expectEqual(@as(usize, 0), Launch.of(ids.absorb_q, &mb).len);
+}
+
+test "GLM latent: prompt MMA keeps short, unaligned and roped queries on their original dispatch" {
+    var f: Fakes = undefined;
+    f.init();
+    const module: @import("cuda_prompt_mma.zig").Kernels = .{ .mod = undefined, .kn = .{ .d = &f.d, .handle = @ptrFromInt(701) }, .nk = .{ .d = &f.d, .handle = @ptrFromInt(702) } };
+    var set: glue.Set = .{ .glue = &f.ks, .mla = &f.m, .prompt = true, .prompt_mma = &module };
+    try latent.absorbQ(set, f.stream(), 0x10, 0x20, 0x30, 129, 32, 256, 0, 512);
+    try latent.expandV(set, f.stream(), 0x10, 0x20, 0x30, 129, 32, 256, 512);
+    try latent.absorbQ(set, f.stream(), 0x10, 0x20, 0x30, 63, 32, 256, 0, 512);
+    try latent.absorbQ(set, f.stream(), 0x18, 0x20, 0x30, 128, 32, 256, 0, 512);
+    try latent.absorbQ(set, f.stream(), 0x10, 0x20, 0x30, 128, 22, 192, 64, 512);
+    set.prompt = false;
+    try latent.expandV(set, f.stream(), 0x10, 0x20, 0x30, 129, 32, 256, 512);
+    try t.expectEqual(Seen{ .id = 701, .grid = .{ 4, 2, 32 }, .block = 256, .shared = 56832, .args = args16(&.{ 0x10, 8192, 0x20, 0x30, 16384, 129, 512, 256 }) }, Launch.seen[0]);
+    try t.expectEqual(Seen{ .id = 702, .grid = .{ 2, 2, 32 }, .block = 256, .shared = 61440, .args = args16(&.{ 0x10, 16384, 0x20, 0x30, 8192, 129, 256, 512 }) }, Launch.seen[1]);
+    try t.expectEqual(@as(usize, ids.absorb_q), Launch.seen[2].id);
+    try t.expectEqual(@as(usize, ids.absorb_q), Launch.seen[3].id);
+    try t.expectEqual(@as(usize, mla_ids.absorb_q_192), Launch.seen[4].id);
+    try t.expectEqual(@as(usize, ids.expand_v), Launch.seen[5].id);
 }

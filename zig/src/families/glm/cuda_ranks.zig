@@ -8,6 +8,11 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// The forward's knobs a rank reads from its environment (the Python family's names and defaults).
 pub const Settings = struct {
+    kv_pow2: bool = false,
+    absorb_mma: bool = false,
+    prompt_s2: bool = false,
+    dflash_q4_down: bool = false,
+    verify_tiles: @import("cuda_verify_tiles.zig").Options = .{},
     kv8: bool = false, // --kv-cache fp8, supplied by the native options rather than an environment override
     pages: bool = false, // TF_KV_PAGES as `open` resolves it (with the world and --kv-cache): every sequence on pages
     prompt_fixed_k: bool = false, // TF_GLM_PROMPT_K: one (default) or shape (experimental fixed K slices)
@@ -19,6 +24,7 @@ pub const Settings = struct {
     pieces: u32 = 3, // TF_GLM_OVERLAP_PIECES: a prompt chunk's exchanges in this many row pieces (1: whole); unset, 8 under solo on the wire.
     solo: bool = false, // TF_GLM_CHUNK_SOLO: 4096 (prompt buffers for two chunks a pass, while no stream decodes) or 2048
     pair: bool = true, // TF_GLM_PROMPT_PAIR: 1 (while no stream decodes, a prompt step takes two chunks, each one's exchanges under the other's sites) or 0
+    exl3_decode: bool = false,
     pair_experts: bool = false, // TF_GLM_PAIR_EXPERTS=1: paired chunks share 128-pair NVFP4 routed-expert items (0: two 64-pair passes)
     index_split: u32 = 2048, // TF_GLM_INDEX_SPLIT: from this position on, rank 0 splits a prompt chunk's indexer rows (0: never)
     heat: ?heat.Bands = null, // TF_HEAT_HIGH and TF_HEAT_LOW (upstream's names): a prompt chunk waits on every rank's hottest zone
@@ -51,6 +57,10 @@ pub const Settings = struct {
     /// `read` from a lookup with no blank text, so every name below and in l2pf's reader is unset when blank.
     fn readSet(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
         var s: Settings = .{};
+        s.exl3_decode = @import("sys").environment.value(bool, "TF_GLM_EXL3_DECODE", get("TF_GLM_EXL3_DECODE"), false) catch {
+            problem.* = "TF_GLM_EXL3_DECODE: 0 or 1";
+            return error.BadSetting;
+        };
         if (get("TF_GLM_PROMPT_K")) |v| {
             if (std.mem.eql(u8, v, "shape")) s.prompt_fixed_k = true else if (!std.mem.eql(u8, v, "one")) {
                 problem.* = "TF_GLM_PROMPT_K: one or shape";
@@ -62,6 +72,14 @@ pub const Settings = struct {
             if (!std.mem.eql(u8, v, "0") and !std.mem.eql(u8, v, "1")) {
                 problem.* = "TF_GLM_PROMPT_TAIL: 0 or 1";
                 return error.BadSetting;
+            }
+        }
+        inline for (.{ .{ "TF_GLM_PACKED_PROMPT_S2", "prompt_s2" }, .{ "TF_GLM_ABSORB_MMA", "absorb_mma" }, .{ "TF_GLM_KV_POW2", "kv_pow2" }, .{ "TF_GLM_DFLASH_Q4_DOWN", "dflash_q4_down" } }) |flag| {
+            if (get(flag[0])) |v| {
+                if (std.mem.eql(u8, v, "1")) @field(s, flag[1]) = true else if (!std.mem.eql(u8, v, "0")) {
+                    problem.* = flag[0] ++ ": 0 or 1";
+                    return error.BadSetting;
+                }
             }
         }
         if (get("TF_GLM_MM")) |v| {
@@ -140,18 +158,22 @@ pub const Settings = struct {
             }
         }
         inline for (.{ .{ "TF_GLM_DENSE_BITS", "dense_bits" }, .{ "TF_GLM_HEAD_BITS", "head_bits" } }) |e| if (get(e[0])) |v| {
-            const b = std.fmt.parseInt(u8, v, 10) catch {
-                problem.* = e[0] ++ ": 4, 6, 8 or 16";
-                return error.BadSetting;
-            };
-            @field(s, e[1]) = switch (b) {
-                4, 6, 8, 16 => b,
-                0 => 16, // the old family's spelling of bf16
-                else => {
-                    problem.* = e[0] ++ ": 4, 6, 8 or 16";
+            if (std.mem.eql(u8, v, "q4-mse") or std.mem.eql(u8, v, "fp8")) {
+                @field(s, e[1]) = if (std.mem.eql(u8, v, "q4-mse")) 20 else 24;
+            } else {
+                const b = std.fmt.parseInt(u8, v, 10) catch {
+                    problem.* = e[0] ++ ": 4, 6, 8, 16, q4-mse, or fp8";
                     return error.BadSetting;
-                },
-            };
+                };
+                @field(s, e[1]) = switch (b) {
+                    4, 6, 8, 16 => b,
+                    0 => 16, // the old family's spelling of bf16
+                    else => {
+                        problem.* = e[0] ++ ": 4, 6, 8, 16, q4-mse, or fp8";
+                        return error.BadSetting;
+                    },
+                };
+            }
         };
         s.heat = heat.bandsFrom(get("TF_HEAT_HIGH"), get("TF_HEAT_LOW")) catch {
             problem.* = "TF_HEAT_HIGH and TF_HEAT_LOW: both or neither, in degrees, with low at or under high";
@@ -179,6 +201,12 @@ pub const Settings = struct {
                 problem.* = "TF_GLM_KV_HOST_GIB: the host pages' GiB, more than 0, with TF_GLM_KV_HOST=1";
                 return error.BadSetting;
             }
+        }
+        inline for (.{ .{ "TF_GLM_DECODE_MLA_WIDE", "mla" }, .{ "TF_GLM_DECODE_TILE_RANGES", "ranges" } }) |flag| {
+            @field(s.verify_tiles, flag[1]) = @import("sys").environment.value(bool, flag[0], get(flag[0]), false) catch {
+                problem.* = flag[0] ++ ": 0 or 1";
+                return error.BadSetting;
+            };
         }
         if (get("TF_GLM_DRAFT_SPLIT")) |v| {
             if (std.mem.eql(u8, v, "1")) s.draft_split = true else if (!std.mem.eql(u8, v, "0")) {
@@ -226,7 +254,7 @@ fn wireOpens(get: *const fn ([:0]const u8) ?[]const u8) bool {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 23, // this struct's version (22, plus pair_experts)
+    layout: u32 = 31, // matched formats distinguish the latent cache and the DFlash2 down projections
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -311,19 +339,19 @@ pub const Fingerprint = extern struct {
         checkpoint_digest: [32]u8,
     ) Fingerprint {
         const f: Fingerprint = .{
-            .kv8 = @intFromBool(s.kv8),
+            .kv8 = if (s.kv_pow2) 2 else @intFromBool(s.kv8),
             .pages = @intFromBool(s.pages),
             .world = @intCast(world),
             .rank = @intCast(rank),
             .prompt_fixed_k = @intFromBool(s.prompt_fixed_k),
-            .tiled = @intFromBool(s.tiled),
+            .tiled = @intFromBool(s.tiled) | (@as(u32, @intFromBool(s.verify_tiles.mla)) << 1) | (@as(u32, @intFromBool(s.verify_tiles.ranges)) << 2),
             .split = if (!s.split) 0 else if (s.ring) 2 else 1,
             .kda_wide = @intFromBool(s.kda_wide),
             .kda_pad = @intFromBool(s.kda_pad),
             .kv_live_half = @intFromBool(s.kv_live_half),
             .pieces = s.pieces,
             .pair = @intFromBool(s.pair),
-            .pair_experts = @intFromBool(s.pair_experts),
+            .pair_experts = @as(u32, @intFromBool(s.pair_experts)) | (@as(u32, @intFromBool(s.exl3_decode)) << 1),
             .layers = s.layers,
             .mtp = @intFromBool(mtp),
             .roce_multi = @intFromBool(s.roce_multi),
@@ -333,7 +361,7 @@ pub const Fingerprint = extern struct {
             .kv_host_gib = s.kv_host_gib,
             .solo = @intFromBool(s.solo),
             .l2pf = s.l2pf.words(),
-            .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
+            .bits = @as(u32, @intFromBool(s.prompt_s2)) << 25 | @as(u32, @intFromBool(s.absorb_mma)) << 24 | @as(u32, @intFromBool(s.dflash_q4_down)) << 16 | @as(u32, s.dense_bits) << 8 | s.head_bits,
             .capacity = capacity,
             .heat_high = if (s.heat) |b| b.high_c else 0,
             .heat_low = if (s.heat) |b| b.low_c else 0,
@@ -480,17 +508,17 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .layout => "a different build of this check",
         .rank => "a rank number given twice or out of order",
         .world => "the ranks were started with different world sizes",
-        .kv8 => "--kv-cache fp8",
+        .kv8 => "--kv-cache and TF_GLM_KV_POW2",
         .pages => "TF_KV_PAGES (unset or auto pages from two ranks)",
         .prompt_fixed_k => "TF_GLM_PROMPT_K",
-        .tiled => "TF_GLM_MM",
+        .tiled => "TF_GLM_MM, TF_GLM_DECODE_MLA_WIDE or TF_GLM_DECODE_TILE_RANGES",
         .split => "TF_GLM_PREFILL_REDUCE",
         .kda_wide => "TF_GLM_KDA_DECODE_WIDE",
         .kda_pad => "TF_GLM_KDA_PAD",
         .kv_live_half => "TF_GLM_KV_LIVE_HALF",
         .pieces => "TF_GLM_OVERLAP_PIECES",
         .pair => "TF_GLM_PROMPT_PAIR",
-        .pair_experts => "TF_GLM_PAIR_EXPERTS",
+        .pair_experts => "TF_GLM_PAIR_EXPERTS / TF_GLM_EXL3_DECODE",
         .layers => "TF_GLM_LAYERS",
         .mtp => "--no-drafts given to some ranks and not others",
         .vision => "--vision (or its image tokens) given to some ranks and not others",
@@ -505,7 +533,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .kv_host_gib => "TF_GLM_KV_HOST_GIB",
         .solo => "TF_GLM_CHUNK_SOLO",
         .l2pf => "TF_GLM_L2PF, _MB, _CTAS or _PACE_GBPS",
-        .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
+        .bits => "TF_GLM_DENSE_BITS, TF_GLM_HEAD_BITS, TF_GLM_PACKED_PROMPT_S2, TF_GLM_ABSORB_MMA or TF_GLM_DFLASH_Q4_DOWN",
         .capacity => "the sequence capacity (the context)",
         .heat_high => "TF_HEAT_HIGH",
         .heat_low => "TF_HEAT_LOW",

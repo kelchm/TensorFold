@@ -141,6 +141,10 @@ pub const Experts = struct {
     grouped: [3]Function, // one per codebook
     gateup: Function,
     down_combine: Function,
+    glm_decode: bool = false,
+    glm_gateup_flat: Function = undefined,
+    glm_gateup: Function = undefined,
+    glm_down: Function = undefined,
     prompt: prompt.Kernels = undefined,
     plan_rotate: Function = undefined,
     plan_finish: Function = undefined,
@@ -158,6 +162,9 @@ pub const Experts = struct {
         };
         errdefer e.mod.unload();
         e.prompt = try prompt.Kernels.resolve(e.mod);
+        e.glm_gateup_flat = try e.mod.function("tf_glm_exl3_decode_gateup_flat");
+        e.glm_gateup = try e.mod.function("tf_glm_exl3_decode_gateup");
+        e.glm_down = try e.mod.function("tf_glm_exl3_decode_down");
         e.plan_rotate = try e.mod.function("tf_exl3_plan_rotate");
         e.plan_finish = try e.mod.function("tf_exl3_plan_finish");
         e.plan_finish_after = try e.mod.function("tf_exl3_plan_finish_after");

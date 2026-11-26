@@ -58,6 +58,9 @@ pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, out: u64, ro
         return (try roped(set)).absorbQ(stream, q, d + rd, wk, out, lw + rd, rows, heads, d, lw);
     }
     if (d != 256 or lw != 512) return error.LatentShape;
+    if (set.prompt_mma) |m| {
+        if (set.prompt and m.eligible(rows, .{ q, wk, out })) return m.project(.kn, stream, q, wk, out, rows, heads);
+    }
     try rowBlocks(set.glue.absorb_q, stream, q, wk, out, rows, heads, lw / 32);
 }
 
@@ -81,6 +84,9 @@ fn rowBlocks(f: cuda.Function, stream: cuda.Stream, in: u64, w: u64, out: u64, r
 /// latent.expand_v (BF16 kv_b): out [rows][heads][dv] bf16 = o_lat [rows][heads][lw] . wv [heads][dv][lw].
 pub fn expandV(set: glue.Set, stream: cuda.Stream, ol: u64, wv: u64, out: u64, rows: usize, heads: usize, dv: usize, lw: usize) !void {
     if (dv != 256 or lw != 512) return error.LatentShape;
+    if (set.prompt_mma) |m| {
+        if (set.prompt and m.eligible(rows, .{ ol, wv, out })) return m.project(.nk, stream, ol, wv, out, rows, heads);
+    }
     try rowBlocks(set.glue.expand_v, stream, ol, wv, out, rows, heads, dv / 16);
 }
 
@@ -92,16 +98,29 @@ pub fn cacheBytes(capacity: usize, lw: usize, kv8: bool) !usize {
 }
 
 /// On pages: the stream's table (i32 page ids) and the step from page to page in bytes and latent rows; 0: in order.
-pub const Table = struct { pt: u64 = 0, ps: u64 = 0, page_rows: u64 = 0 };
+/// `logical`: the sparse token lists stay positions (an E4M3 cache, whose chunks take each key through `pt`, its codes
+/// and scales being different units); otherwise tf_glm_dsa_tokens writes each token's BF16 row on the pages.
+pub const Table = struct { pt: u64 = 0, ps: u64 = 0, page_rows: u64 = 0, logical: bool = false };
 
-/// BF16 rows through `t`, or E4M3 rows and their scales (scales nonzero), which take no pages.
+/// A signed stride keeps the FP8 writer launch ABI and tags power-of-two scaling.
+fn quantStride(stride: usize, pow2: bool) i64 {
+    const positive: i64 = @intCast(stride);
+    return if (pow2) -positive else positive;
+}
+
+/// BF16 rows through `t`, or E4M3 rows and their scales (scales nonzero): in order, or on pages through `t`, where
+/// `cache` and `scales` are this cache's codes and scales in page 0 and pages lie `t.ps` bytes apart.
 pub fn latentWriteFormat(set: glue.Set, stream: cuda.Stream, lat: u64, lat_stride: usize, cache: u64, scales: u64, t: Table, pos: u64, rows: usize, lw: usize) !void {
     if (scales == 0) return latentWrite(set, stream, lat, lat_stride, cache, t, pos, rows, lw);
     if (lw != 512) return error.LatentShape;
-    if (t.pt != 0) return error.Fp8OnPages;
     var a: cuda.Args = .{};
-    inline for (.{ lat, @as(i64, @intCast(lat_stride)), cache, scales, pos }) |v| a.add(v);
-    try cuda_pdl.launch(set.glue.lat_write_fp8, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 512 } }, stream, &a);
+    inline for (.{ lat, quantStride(lat_stride, set.kv_pow2), cache, scales, pos }) |v| a.add(v);
+    if (t.pt != 0) {
+        a.add(t.pt);
+        a.add(@as(i64, @intCast(t.ps)));
+    }
+    const f = if (t.pt != 0) set.glue.lat_write_fp8_paged else set.glue.lat_write_fp8;
+    try cuda_pdl.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 512 } }, stream, &a);
 }
 
 /// latent.latent_write: rows of `lat` (stride `lat_stride`) into slots pos .. pos + rows - 1 (pos an i32 on device).
@@ -127,24 +146,27 @@ pub fn attentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, 
 /// latent._dense_chunks (keys through pos + r) and _sparse_chunks (row r's `counts` of `tokens`); `lw` 512 or 576.
 fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, pos: u64, tokens: u64, counts: u64, p: Partials, rows: usize, heads: usize, lw: usize, nch: usize, w: usize, scale: f32, hb: usize, sparse: bool) !void {
     const rope_cols = try ropeOf(lw);
-    if (scales != 0 and t.pt != 0) return error.Fp8OnPages;
     if (rope_cols != 0) {
         if (scales != 0) return error.LatentShape; // the E4M3 cache holds the latent alone
         if (hb != heads_tile) return error.HeadBlock;
         const on: cuda.mla.On = .{ .pt = t.pt, .ps = t.ps, .tokens = tokens, .counts = counts, .w = w, .sparse = sparse };
         return (try roped(set)).chunksOn(stream, qa, cache, pos, on, .{ .po = p.po, .pm = p.pm, .pl = p.pl }, rows, heads, nch, scale);
     }
+    const kv8 = scales != 0;
+    const paged8 = kv8 and t.pt != 0;
+    // a paged sparse list's units are the kernel's: positions for E4M3 (Table.logical), the BF16 rows otherwise
+    if (sparse and t.pt != 0 and t.logical != paged8) return error.TokenUnits;
     const f = switch (hb) {
-        heads_tile => if (scales == 0) set.glue.chunks_16 else set.glue.chunks_16_fp8,
-        heads_tile_wide => if (scales == 0) set.glue.chunks_32 else set.glue.chunks_32_fp8,
+        heads_tile => if (!kv8) set.glue.chunks_16 else if (paged8) set.glue.chunks_16_fp8_paged else set.glue.chunks_16_fp8,
+        heads_tile_wide => if (!kv8) set.glue.chunks_32 else if (paged8) set.glue.chunks_32_fp8_paged else set.glue.chunks_32_fp8,
         else => return error.HeadBlock,
     };
     var a: cuda.Args = .{};
     a.add(qa);
     a.add(cache);
-    if (scales != 0) a.add(scales);
+    if (kv8) a.add(scales);
     inline for (.{ pos, tokens, counts, p.po, p.pm, p.pl, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(i64, @intCast(w)), scale, @as(c_int, @intFromBool(sparse)) }) |v| a.add(v);
-    if (scales == 0) {
+    if (!kv8 or paged8) {
         a.add(t.pt);
         a.add(@as(i64, @intCast(t.ps)));
     }
@@ -159,7 +181,8 @@ pub fn sparseAttention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, 
 
 pub fn sparseAttentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, tokens: u64, counts: u64, w: usize, p: Partials, out: u64, rows: usize, heads: usize, lw: usize, scale: f32) !void {
     const nch = chunksFor(w);
-    try chunks(set, stream, qa, cache, scales, t, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, headBlockFor(rows, lw), true);
+    const hb = if (!set.prompt and set.verify_tiles.wide(rows, heads, lw, w, scales, t.pt, t.logical)) heads_tile_wide else headBlockFor(rows, lw);
+    try chunks(set, stream, qa, cache, scales, t, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, hb, true);
     try merge(set, stream, p, out, counts, rows, heads, lw, nch, true);
 }
 

@@ -170,15 +170,27 @@ pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernel
             try d.check(d.api.cuMemcpyDtoDAsync_v2(ptr, tmp.ptr, n * k * 2, s.handle), "cuMemcpyDtoDAsync");
             continue;
         }
-        try host.resize(gpa, n * k);
-        try s.synchronize();
-        try cuda.memory.download(d, ptr, std.mem.sliceAsBytes(host.items)[0 .. n * k * 2]);
-        try words.resize(gpa, n * k * bits / 32);
-        try scales.resize(gpa, n * (k / 64));
-        qpack.quantize(bits, host.items, n, k, words.items, scales.items);
-        const sizes = mm_mod.packedBytes(n, k, bits); // codes then scales, inside the bf16 tiles' bytes
-        try tmp.upload(0, std.mem.sliceAsBytes(words.items));
-        try tmp.upload(sizes[0], std.mem.sliceAsBytes(scales.items));
+        const sizes = mm_mod.packedBytes(n, k, bits);
+        if (bits == mm_mod.affine4 or bits == mm_mod.fp8_block128) {
+            const group: usize = if (bits == mm_mod.affine4) 64 else 128;
+            if (k % group != 0) return error.BadShape;
+            const groups = n * k / group;
+            var a: cuda.Args = .{};
+            a.add(ptr);
+            a.add(tmp.ptr);
+            a.add(tmp.ptr + sizes[0]);
+            a.add(@as(c_longlong, @intCast(groups)));
+            try cuda.launch.launch(mk.quant_python[@intFromBool(bits == mm_mod.fp8_block128)], .{ .grid = .{ .x = @intCast((groups + 7) / 8) }, .block = .{ .x = 256 } }, s, &a);
+        } else {
+            try host.resize(gpa, n * k);
+            try s.synchronize();
+            try cuda.memory.download(d, ptr, std.mem.sliceAsBytes(host.items)[0 .. n * k * 2]);
+            try words.resize(gpa, n * k * bits / 32);
+            try scales.resize(gpa, n * (k / 64));
+            qpack.quantize(bits, host.items, n, k, words.items, scales.items);
+            try tmp.upload(0, std.mem.sliceAsBytes(words.items));
+            try tmp.upload(sizes[0], std.mem.sliceAsBytes(scales.items));
+        }
         try mm_mod.tilePacked(mk, s, bits, tmp.ptr, tmp.ptr + sizes[0], ptr, ptr + sizes[0], n, k);
         try s.synchronize(); // tmp is the next linear's
         freed += try compact(w, d, s, e.field, sizes[0] + sizes[1]); // its bf16 bytes back to the device

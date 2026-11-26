@@ -6,6 +6,7 @@ const cuda_pdl = @import("cuda_pdl.zig");
 
 /// qmm_group.cu's tile-2 instantiation (LaneTile<64, 16, 64, 1, 4, 8>, bf16 out), as zig/kernels/cuda exports it.
 const group_symbol = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
+const group_f32_symbol = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb1ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
 const group_smem: u32 = 35328; // LaneTile<64, 16, 64, 1, 4, 8>::SMEM
 
 /// qmm_group.cu's Part and Parts, passed by value: four projections at most, one used here.
@@ -20,6 +21,7 @@ comptime {
 pub const Q4 = struct { w: u64, s: u64, b: u64, n: usize, k: usize, npad: usize };
 
 pub const Kernels = struct {
+    group_f32: cuda.Function,
     group: cuda.Function,
     pack_dense: cuda.Function,
     transpose: cuda.Function,
@@ -28,11 +30,13 @@ pub const Kernels = struct {
     /// From the qmm_group and affine4_pack modules.
     pub fn load(group: cuda.Module, ops: cuda.Module, ctx: *const cuda.Context) !Kernels {
         const k: Kernels = .{
+            .group_f32 = try group.function(group_f32_symbol),
             .group = try group.function(group_symbol),
             .pack_dense = try ops.function("tf_pack_dense"),
             .transpose = try ops.function("tf_transpose_pad16"),
             .gb10 = try ctx.attribute(.compute_capability_major) == 12 and try ctx.attribute(.compute_capability_minor) == 1,
         };
+        try k.group_f32.allowDynamicShared(group_smem);
         try k.group.allowDynamicShared(group_smem);
         return k;
     }
@@ -79,6 +83,11 @@ pub fn pack(ks: *const Kernels, stream: cuda.Stream, words: u64, scales: u64, bi
 
 /// qmm.matmul of a Q4 (tile 2, up to 16 rows): x bf16 (`ldx` apart), group sums xs fp32 [rows][k/64] -> out bf16.
 pub fn matmul(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize) !void {
+    return matmulOutput(ks, stream, x, ldx, xs, q, out, rows, false);
+}
+
+/// A row-parallel projection retains its unrounded accumulator until after tensor-parallel summation.
+pub fn matmulOutput(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize, wide: bool) !void {
     if (rows == 0 or rows > 16) return error.WindowTooWide;
     const sk = splitK(q.n, q.k);
     const tiles = (q.n + 63) / 64;
@@ -99,7 +108,7 @@ pub fn matmul(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u
         .cluster = if (sk > 1) .{ .x = @intCast(sk) } else null,
         .pdl = ks.gb10 and cuda_pdl.on(),
     };
-    try cuda.launch.launch(ks.group, cfg, stream, &a);
+    try cuda.launch.launch(if (wide) ks.group_f32 else ks.group, cfg, stream, &a);
 }
 
 test "the draft head's shape takes one K slice; npad rounds to 128s" {

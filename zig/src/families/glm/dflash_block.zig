@@ -18,12 +18,11 @@ fn set(e: anytype) glue.Set {
     return .{ .glue = &e.m.glue, .mm = &e.m.mm };
 }
 
-/// out[m, n] = x[m, k] . w^T, bf16 out (`wide`: fp32, glm_mm only): 4 bits 16 rows a launch, or glm_mm.
+/// out[m, n] = x[m, k] . w^T, bf16 out (`wide`: unrounded fp32 rank partials): 4 bits 16 rows a launch, or glm_mm.
 fn lin(dr: *const Drafter, e: anytype, x: u64, w: df.Lin, out: u64, m: usize, wide: bool) !void {
     switch (w) {
         .bf16 => |t| try mm.matmul(&e.m.mm, e.stream, x, t.k, t, out, dr.part, m, wide, false),
         .q4 => |q| {
-            if (wide) return error.WideFromFourBits;
             var a: cuda.Args = .{};
             a.add(x);
             a.add(@as(i32, @intCast(q.k)));
@@ -33,7 +32,8 @@ fn lin(dr: *const Drafter, e: anytype, x: u64, w: df.Lin, out: u64, m: usize, wi
             var r0: usize = 0;
             while (r0 < m) : (r0 += 16) {
                 const rows = @min(16, m - r0);
-                try q4.matmul(&e.m.q4, e.stream, x + r0 * q.k * 2, q.k, dr.gs + r0 * (q.k / 64) * 4, q, out + r0 * q.n * 2, rows);
+                const elem_bytes: usize = if (wide) 4 else 2;
+                try q4.matmulOutput(&e.m.q4, e.stream, x + r0 * q.k * 2, q.k, dr.gs + r0 * (q.k / 64) * 4, q, out + r0 * q.n * elem_bytes, rows, wide);
             }
         },
     }
@@ -147,7 +147,7 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
         }
         if (dr.split) { // each rank's share of down's K as fp32 partials, gathered and summed in rank order
             const bytes = M * D * 4;
-            try linB(dr, e, dr.act, l.down, dr.sums + e.share.rank * bytes, M, true);
+            try lin(dr, e, dr.act, l.down, dr.sums + e.share.rank * bytes, M, true);
             try gather(e, dr.sums, bytes);
             var a: cuda.Args = .{};
             a.add(dr.sums);
@@ -155,7 +155,7 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
             a.add(@as(i32, @intCast(M)));
             a.add(@as(i32, @intCast(dr.world)));
             try go(dr.k.sumn, .{ .x = @intCast(M), .y = D / 1024 }, 256, e, &a);
-        } else try linB(dr, e, dr.act, l.down, dr.a, M, false);
+        } else try lin(dr, e, dr.act, l.down, dr.a, M, false);
         try conv(dr, e, dr.a, 1, l.m_base + 2 * D * 2, dr.x, true, M);
     }
     // every row through the drafts' 4-bit head (this rank's vocabulary), its 16 best, gathered; rank 0's projections

@@ -99,7 +99,7 @@ pub const Kernels = struct {
     pub fn scoresTiles(k: *const Kernels, s: cuda.Stream, qi: u64, wts: u64, w_stride: usize, pk: u64, out: u64, at: u64, rows: usize, np: usize, nb: usize, scale: f32, wscale: f32, heads: usize, pt: u64, ps: u64, loop: usize, g: sparse.Geometry) !void {
         const grid: [2]u32 = .{ @intCast(cdiv(rows, score_rows)), @intCast(@max(1, cdiv(nb, loop))) };
         var a: cuda.Args = .{};
-        inline for (.{ qi, wts, @as(i64, @intCast(w_stride)), pk, out, at, @as(i64, @intCast(rows)), @as(i64, @intCast(np)), @as(i64, @intCast(nb)), scale, wscale, @as(i64, @intCast(heads)), @as(c_int, @intCast(loop)), pt, @as(i64, @intCast(ps)), @as(c_int, @intCast(g.pool)), @as(c_int, @intCast(g.rope)), g.inv }) |v| a.add(v);
+        inline for (.{ qi, wts, @as(i64, @intCast(w_stride)), pk, out, at, @as(i64, @intCast(rows)), @as(i64, @intCast(np)), @as(i64, @intCast(nb)), scale, wscale, @as(i64, @intCast(heads)), @as(c_int, @intCast(loop)), pt, @as(i64, @intCast(ps)), g.keyPool(), @as(c_int, @intCast(g.rope)), g.inv }) |v| a.add(v);
         try cuda_pdl.launch(k.scores_fn, .{ .grid = .{ .x = grid[0], .y = grid[1] }, .block = .{ .x = threads } }, s, &a);
     }
 

@@ -9,6 +9,21 @@
 #include "cuda_bf16.h"
 #include "cuda_runtime.h"
 
+namespace glm_packed_key {
+inline float decode(unsigned char c) {
+  const int exp = (c >> 3) & 15, man = c & 7;
+  const float x = exp ? std::ldexp(float(8 + man), exp - 10) : std::ldexp(float(man), -9);
+  return c & 128 ? -x : x;
+}
+inline void stage(__nv_bfloat16* dst, float* scale, const __nv_bfloat16* base, int u, bool ok) {
+  const auto* row = reinterpret_cast<const unsigned char*>(base);
+  for (int i = 0; i < 8; ++i) dst[i] = __float2bfloat16_rn(ok ? decode(row[8 * u + i]) : 0.0f);
+  if (u == 0) {
+    *scale = 1.0f;
+    if (ok) std::memcpy(scale, row + 128, 4);
+  }
+}
+}
 namespace glm_index {
 inline void cp16(void* d, const void* s, bool ok) { ok ? (void)std::memcpy(d, s, 16) : (void)std::memset(d, 0, 16); }
 inline void cp_commit() {}
@@ -91,7 +106,7 @@ static void token_rows(const int64_t* pools, int pos, int K, int* tokens, int* c
   }
 }
 
-struct Case { int64_t pos, rows, np; int loop, heads; bool paged; int pool = 4, rope = 0; };
+struct Case { int64_t pos, rows, np; int loop, heads; bool paged; int pool = 4, rope = 0; bool packed = false; };
 
 // tf_glm_scores' result for one (row, pool), the model of the mma: a chain of double sums per k16 step, then its rules
 static float model_score(const std::vector<__nv_bfloat16>& q, const std::vector<__nv_bfloat16>& w, int64_t w_stride,
@@ -141,7 +156,20 @@ static void scores_case(std::mt19937_64& g, const Case& c, bool check_model) {
     pt[p / pp] = order[p / pp];
     std::memcpy(&store[(int64_t)order[p / pp] * page_elems + (p % pp) * D], &keys[p * D], D * 2);
   }
-  const __nv_bfloat16* pk = c.paged ? store.data() : keys.data();
+  std::vector<__nv_bfloat16> plain = keys;
+  if (c.packed) {
+    for (int64_t p = 0; p < (int64_t)(keys.size() / D); ++p) {
+      const float ks = std::ldexp(1.0f, int(g() % 21) - 10);
+      auto* bytes = reinterpret_cast<unsigned char*>(plain.data() + p * D);
+      for (int i = 0; i < D; ++i) {
+        bytes[i] = static_cast<unsigned char>(g() % 127) | ((g() & 1) << 7);
+        keys[p * D + i] = __float2bfloat16_rn(glm_packed_key::decode(bytes[i]) * ks);
+      }
+      std::memcpy(bytes + D, &ks, 4);
+      std::memcpy(&store[(int64_t)order[p / pp] * page_elems + (p % pp) * D], bytes, D * 2);
+    }
+  }
+  const __nv_bfloat16* pk = c.paged ? store.data() : plain.data();
   const float scale = 0.0883883461f, wscale = 0.176776692f;
   const int pos = (int)c.pos;
   // rope: the model turns q's pairs below c.rope itself (row r at pos + r), the kernel its fragments
@@ -163,7 +191,7 @@ static void scores_case(std::mt19937_64& g, const Case& c, bool check_model) {
   std::memcpy(out.data(), raw.data(), out.size() * 4);
   run_grid((c.rows + 7) / 8, (nb + c.loop - 1) / c.loop, 256, [&] {
     tf_glm_index_scores(q.data(), w.data(), W, pk, out.data(), &pos, c.rows, c.np, nb, scale, wscale, c.heads, c.loop,
-                        c.paged ? pt.data() : nullptr, c.paged ? page_elems * 2 : 0, c.pool, c.rope, inv.data());
+                        c.paged ? pt.data() : nullptr, c.paged ? page_elems * 2 : 0, c.packed ? -c.pool : c.pool, c.rope, inv.data());
   });
   if (check_model) {
     int64_t bad = 0, unread = 0;
@@ -203,7 +231,7 @@ static void scores_case(std::mt19937_64& g, const Case& c, bool check_model) {
     run_grid((rows + 7) / 8, (part_nb + c.loop - 1) / c.loop, 256, [&] {
       tf_glm_index_scores(q.data() + lo * c.heads * D, w.data() + lo * W, W, pk, part_scores.data() + lo * c.np, &at, rows,
                           c.np, part_nb, scale, wscale, c.heads, c.loop, c.paged ? pt.data() : nullptr,
-                          c.paged ? page_elems * 2 : 0, c.pool, c.rope, inv.data());
+                          c.paged ? page_elems * 2 : 0, c.packed ? -c.pool : c.pool, c.rope, inv.data());
     });
     run_grid(rows, 1, glm_index::T, [&] {
       tf_glm_index_pools(part_scores.data() + lo * c.np, part_pools.data() + lo * K, c.np, &at, K, cap, target, nullptr, c.pool);
@@ -308,11 +336,11 @@ int main(int argc, char** argv) {
       scores_case(g, c, false);
   } else {
     for (const Case& c : {Case{0, 1, 1024, 2, 32, false}, Case{1000, 19, 1024, 4, 32, false}, Case{3000, 24, 1024, 16, 32, true},
-                          Case{3900, 17, 1000, 3, 32, false}, Case{5000, 9, 2048, 5, 20, true},
+                          Case{1000, 9, 512, 4, 32, false, 4, 0, true}, Case{600, 10, 512, 2, 20, true, 4, 0, true}, Case{3900, 17, 1000, 3, 32, false}, Case{5000, 9, 2048, 5, 20, true},
                           Case{6000, 24, 2048, 8, 32, false}, Case{12000, 8, 4096, 3, 32, true},
                           // full GLM-5.3's: every key scored (pools of 1, 512 a page), queries roped on 64 dims
                           Case{3000, 9, 4096, 4, 32, true, 1, 64}, Case{2100, 17, 2560, 3, 32, false, 1, 64},
-                          Case{5000, 8, 8192, 16, 32, true, 1, 0}})
+                          Case{5000, 8, 8192, 16, 32, true, 1, 0}, Case{600, 9, 1024, 3, 32, true, 1, 64, true}})
       scores_case(g, c, true);
   }
   hc_post_own_case(g);

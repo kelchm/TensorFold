@@ -19,10 +19,18 @@ pub const width = topk_pools * pool + pool - 1;
 
 /// The indexer's shape: rows a pooled key sums (1: keys as written), pools a row keeps, roped dims (`inv` [rope / 2]).
 pub const Geometry = struct {
+    packed_keys: bool = false,
+
     pool: usize = pool,
     topk: usize = topk_pools,
     rope: usize = 0,
     inv: u64 = 0,
+
+    /// Scoring and pooling share a signed pool width to identify packed E4M3 keys.
+    pub fn keyPool(g: Geometry) c_int {
+        const rows: c_int = @intCast(g.pool);
+        return if (g.packed_keys) -rows else rows;
+    }
 
     /// A row's token list: its pools' tokens, then the incomplete pool's up to pool - 1.
     pub fn width(g: Geometry) usize {
@@ -96,13 +104,15 @@ pub fn decodeSelect(
 }
 
 /// sparse.index_update: the window's LayerNormed (and roped) index keys and gates into ik, ig; completed pools into pk.
-pub fn indexUpdate(set: glue.Set, stream: cuda.Stream, k_raw: u64, k_stride: usize, gate: u64, ln_w: u64, ln_b: u64, ape: u64, ik: u64, ig: u64, pk: u64, t: latent.Table, pos: u64, rows: usize, g: Geometry) !void {
+pub fn indexUpdate(set: glue.Set, stream: cuda.Stream, k_raw: u64, k_stride: usize, gate: u64, ln_w: u64, ln_b: u64, ape: u64, ik: u64, ig: u64, pk: u64, t: latent.Table, pos: u64, rows: usize, geometry: Geometry) !void {
+    var g = geometry;
+    g.packed_keys = set.kv_pow2;
     try g.check();
     var a: cuda.Args = .{};
     inline for (.{ k_raw, @as(i64, @intCast(k_stride)), gate, ln_w, ln_b, ik, ig, pos, @as(f32, 1e-6), @as(c_int, @intCast(g.rope)), g.inv }) |v| a.add(v);
     try cuda_pdl.launch(set.glue.index_write, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &a);
     var b: cuda.Args = .{};
-    inline for (.{ ik, ig, ape, pk, pos, @as(i64, @intCast(rows)), t.pt, @as(i64, @intCast(t.ps)), @as(c_int, @intCast(g.pool)) }) |v| b.add(v);
+    inline for (.{ ik, ig, ape, pk, pos, @as(i64, @intCast(rows)), t.pt, @as(i64, @intCast(t.ps)), g.keyPool() }) |v| b.add(v);
     try cuda_pdl.launch(set.glue.pool_keys, .{ .grid = .{ .x = @intCast(rows / g.pool + 2) }, .block = .{ .x = 32 } }, stream, &b);
 }
 
@@ -148,8 +158,10 @@ pub fn selectTokens(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u6
 }
 
 /// With `split`, this rank picks for its block of rows only (as one pass would, block by block) and gathers the rest.
-pub fn selectTokensProfile(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64, wts: u64, w_stride: usize, pk: u64, t: latent.Table, pos: u64, host_pos: usize, rows: usize, heads: usize, d: usize, g: Geometry, np_max_cap: usize, s: Scratch, tokens: u64, counts: u64, split: ?Split, profile: ?*@import("cuda_prof.zig").Prof) !void {
+pub fn selectTokensProfile(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64, wts: u64, w_stride: usize, pk: u64, t: latent.Table, pos: u64, host_pos: usize, rows: usize, heads: usize, d: usize, geometry: Geometry, np_max_cap: usize, s: Scratch, tokens: u64, counts: u64, split: ?Split, profile: ?*@import("cuda_prof.zig").Prof) !void {
     const prof = @import("cuda_prof.zig");
+    var g = geometry;
+    g.packed_keys = set.kv_pow2;
     try g.check();
     const np_max = poolBucket(host_pos, rows, np_max_cap, g);
     const b = @min(rows, select_rows);
@@ -173,13 +185,17 @@ pub fn selectTokensProfile(set: glue.Set, ops: cuda.Module, stream: cuda.Stream,
         const nb = cdiv(scoreColumns(host_pos + a, n, np_max, g), 64);
         const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(d), -0.5));
         var sa: cuda.Args = .{};
-        inline for (.{ qi + a * heads * d * 2, wts + a * w_stride * 2, @as(i64, @intCast(w_stride)), pk, s.scores, at, @as(i64, @intCast(np_max)), @as(i64, @intCast(nb)), scale, headScale(heads), @as(i64, @intCast(heads)), @as(c_int, @intCast(loop)), t.pt, @as(i64, @intCast(t.ps)), @as(c_int, @intCast(g.pool)), @as(c_int, @intCast(g.rope)), g.inv }) |v| sa.add(v);
+        inline for (.{ qi + a * heads * d * 2, wts + a * w_stride * 2, @as(i64, @intCast(w_stride)), pk, s.scores, at, @as(i64, @intCast(np_max)), @as(i64, @intCast(nb)), scale, headScale(heads), @as(i64, @intCast(heads)), @as(c_int, @intCast(loop)), t.pt, @as(i64, @intCast(t.ps)), g.keyPool(), @as(c_int, @intCast(g.rope)), g.inv }) |v| sa.add(v);
         if (d != 128 or heads > 32) return error.IndexShape;
         const quick = if (set.index) |k| if (k.takes(rows, np_max, pk, t.ps)) k else null else null;
         // a decode window's rows: the same scores from glm_index_scores (8 rows a CTA, key tiles staged once)
-        const dec = if (set.dscore) |k| if (k.takesDecode(rows, np_max, nb, pk, t.ps)) k else null else null;
+        const decode_loop = if (set.dscore) |k| blk: {
+            const stock = if (k.takesDecode(rows, np_max, nb, pk, t.ps)) index_mod.decodeLoop(n, nb) else null;
+            const decision = if (!set.prompt and split == null and g.packed_keys) set.verify_tiles else @import("cuda_verify_tiles.zig").Window{};
+            break :blk decision.scoreLoop(stock, nb, heads, g.pool, g.rope, pk, t.pt, t.ps);
+        } else null;
         var stamp = prof.span(profile, stream, .index_score);
-        if (quick) |k| try k.scores(stream, qi + a * heads * d * 2, wts + a * w_stride * 2, w_stride, pk, s.scores, at, n, np_max, nb, scale, headScale(heads), heads, t.pt, t.ps, g) else if (dec) |k| try k.scoresTiles(stream, qi + a * heads * d * 2, wts + a * w_stride * 2, w_stride, pk, s.scores, at, n, np_max, nb, scale, headScale(heads), heads, t.pt, t.ps, index_mod.decodeLoop(n, nb), g) else try cuda_pdl.launch(set.glue.scores, .{ .grid = .{ .x = @intCast(n), .y = @intCast(cdiv(nb, loop)) }, .block = .{ .x = 128 } }, stream, &sa);
+        if (quick) |k| try k.scores(stream, qi + a * heads * d * 2, wts + a * w_stride * 2, w_stride, pk, s.scores, at, n, np_max, nb, scale, headScale(heads), heads, t.pt, t.ps, g) else if (decode_loop) |tiles| try set.dscore.?.scoresTiles(stream, qi + a * heads * d * 2, wts + a * w_stride * 2, w_stride, pk, s.scores, at, n, np_max, nb, scale, headScale(heads), heads, t.pt, t.ps, tiles, g) else try cuda_pdl.launch(set.glue.scores, .{ .grid = .{ .x = @intCast(n), .y = @intCast(cdiv(nb, loop)) }, .block = .{ .x = 128 } }, stream, &sa);
         stamp.end();
         stamp = prof.span(profile, stream, .index_select);
         if (quick) |k| if (k.select) {
@@ -211,7 +227,7 @@ pub fn selectTokensProfile(set: glue.Set, ops: cuda.Module, stream: cuda.Stream,
     args.add(@as(c_int, @intCast(g.topk)));
     args.add(tokens);
     args.add(counts);
-    args.add(t.pt);
+    args.add(if (t.logical) @as(u64, 0) else t.pt); // an E4M3 cache's lists stay positions; its chunks take the table
     args.add(@as(i64, @intCast(t.page_rows)));
     args.add(@as(c_int, @intCast(g.pool)));
     try cuda_pdl.launch(assemble, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &args);
@@ -287,6 +303,9 @@ test "GLM index geometry: indexUpdate passes GLM-5.3-Flash's rope 0 and pools of
         try std.testing.expectEqual(@as(usize, 2), R.n);
         try std.testing.expectEqual([2]c_uint{ 64, @intCast(64 / g.pool + 2) }, R.grids);
         try std.testing.expectEqual([2]c_int{ @intCast(g.rope), @intCast(g.pool) }, R.last);
+        R.n = 0;
+        try indexUpdate(.{ .glue = &ks, .kv_pow2 = true }, stream, 0x100, 160, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 0x800, .{}, 0x900, 64, g);
+        try std.testing.expectEqual([2]c_int{ @intCast(g.rope), -@as(c_int, @intCast(g.pool)) }, R.last);
     }
     try std.testing.expectError(error.IndexShape, indexUpdate(.{ .glue = &ks }, stream, 0, 160, 0, 0, 0, 0, 0, 0, 0, .{}, 0, 64, .{ .pool = 2 }));
 }

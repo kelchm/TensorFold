@@ -5,6 +5,7 @@
 
 #include "glm_glue_router.cuh"
 #include <cuda_fp8.h>
+#include "glm_packed_key.cuh"
 #include "common/mla.cuh"
 #include "glm_index_rope.cuh"
 
@@ -43,6 +44,24 @@ extern "C" __global__ void __launch_bounds__(256)
                                  po, pm, pl, rows, heads, w, scale, sparse, nullptr, 0, scales);
 }
 
+// The E4M3 variants on KV pages: the stream's table `pt`, its pages `pstep` bytes apart (codes and scales in each).
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_chunks_16_fp8_paged(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
+                               const int* tok, const int* cnt, float* po, float* pm, float* pl, int64_t rows,
+                               int64_t heads, int64_t w, float scale, int sparse, const int* pt, int64_t pstep) {
+  glm_pdl::enter();
+  glm_attn::chunks_wide<16, true, 0, false, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
+                                                 po, pm, pl, rows, heads, w, scale, sparse, pt, pstep, scales);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_chunks_32_fp8_paged(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
+                               const int* tok, const int* cnt, float* po, float* pm, float* pl, int64_t rows,
+                               int64_t heads, int64_t w, float scale, int sparse, const int* pt, int64_t pstep) {
+  glm_pdl::enter();
+  glm_attn::chunks_wide<32, true, 0, false, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
+                                                 po, pm, pl, rows, heads, w, scale, sparse, pt, pstep, scales);
+}
+
 // latent._merge, block (row, head), 128 threads: chunks merged in order, o / l by div.full; skips sparse count-0 rows.
 extern "C" __global__ void __launch_bounds__(128)
     tf_glm_merge(const float* po, const float* pm, const float* pl, __nv_bfloat16* out, const int* cnt, int64_t rows,
@@ -77,8 +96,11 @@ extern "C" __global__ void __launch_bounds__(128)
     tf_glm_scores(const __nv_bfloat16* qi, const __nv_bfloat16* wts, int64_t w_stride, const __nv_bfloat16* pk,
                   float* out, const int* pos, int64_t np, int64_t nb, float scale, float wscale, int64_t heads,
                   int loop, const int* pt, int64_t ps, int pool, int rope, const float* inv) {
+  const bool packed = pool < 0;
+  if (packed) pool = -pool;
   glm_pdl::enter();
   constexpr int D = 128, HP = 32, BP = 64;
+  __shared__ float key_scales[4][2][16];
   __shared__ __align__(16) __nv_bfloat16 sm[4 * 2 * 16 * D];  // q's 32 rows, then each warp's two 16-pool buffers
   auto at = [](int row, int u) { return row * D + ((u ^ (row & 7)) << 3); };
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, q = lane & 3;
@@ -103,7 +125,10 @@ extern "C" __global__ void __launch_bounds__(128)
       const int idx = lane + t * 32, row = idx / (D / 8), u = idx % (D / 8);
       const int64_t p = p0 + row;
       const bool ok = p < npool;
-      glm_attn::cp16(sm + (warp * 2 + buf) * 16 * D + at(row, u), src + (ok ? row : 0) * D + u * 8, ok);
+      __nv_bfloat16* dst = sm + (warp * 2 + buf) * 16 * D + at(row, u);
+      const __nv_bfloat16* base = src + (ok ? row : 0) * D;
+      if (packed) glm_packed_key::stage(dst, &key_scales[warp][buf][row], base, u, ok);
+      else glm_attn::cp16(dst, base + u * 8, ok);
     }
   };
   const int64_t first = (int64_t)blockIdx.y * loop;
@@ -145,10 +170,11 @@ extern "C" __global__ void __launch_bounds__(128)
     __syncwarp();
     for (int nt = 0; nt < 2; ++nt)
       for (int e = 0; e < 2; ++e) {
-        const float v0 = fmaxf(__fmul_rn(acc[0][nt][e], scale), 0.0f),
-                    v1 = fmaxf(__fmul_rn(acc[0][nt][e + 2], scale), 0.0f);
-        const float v2 = fmaxf(__fmul_rn(acc[1][nt][e], scale), 0.0f),
-                    v3 = fmaxf(__fmul_rn(acc[1][nt][e + 2], scale), 0.0f);
+        const float ks = packed ? key_scales[warp][j & 1][nt * 8 + 2 * q + e] : 1.0f;
+        const float v0 = fmaxf(__fmul_rn(__fmul_rn(acc[0][nt][e], ks), scale), 0.0f),
+                    v1 = fmaxf(__fmul_rn(__fmul_rn(acc[0][nt][e + 2], ks), scale), 0.0f);
+        const float v2 = fmaxf(__fmul_rn(__fmul_rn(acc[1][nt][e], ks), scale), 0.0f),
+                    v3 = fmaxf(__fmul_rn(__fmul_rn(acc[1][nt][e + 2], ks), scale), 0.0f);
         float s = glm_triton::fmul(wv[1], v1);
         s = __fmaf_rn(wv[0], v0, s);
         s = __fmaf_rn(wv[2], v2, s);

@@ -62,13 +62,13 @@ fn run(w: *World, rank: usize, world: usize, text: ?[]const u8, kv8: bool) !void
 }
 
 fn refusal(rank: usize) !void {
-    for ([_][]const u8{ "on", "all", "1" }) |mode| {
+    for ([_][]const u8{ "yes", "pages", "2" }) |mode| {
         var w: World = .{};
         const peer = 1 - rank;
         try run(&w, peer, 2, "auto", true);
         try std.testing.expect(w.waiting[peer]);
-        try std.testing.expectError(error.Fp8OnPages, run(&w, rank, 2, mode, true));
-        try std.testing.expectEqualStrings("Fp8OnPages", w.refused[peer] orelse "waiting for missing rank");
+        try std.testing.expectError(error.BadKvPages, run(&w, rank, 2, mode, true));
+        try std.testing.expectEqualStrings("BadKvPages", w.refused[peer] orelse "waiting for missing rank");
         try std.testing.expect(!w.waiting[peer]);
         try std.testing.expect(w.connected[rank] and w.connected[peer]);
         try std.testing.expect(!w.constructed[rank]);
@@ -78,18 +78,17 @@ fn refusal(rank: usize) !void {
     }
 }
 
-test "GLM startup: refusing rank zero promptly tells the waiting follower Fp8OnPages" {
+test "GLM startup: refusing rank zero promptly tells the waiting follower BadKvPages" {
     try refusal(0);
 }
 
-test "GLM startup: refusing follower promptly tells waiting rank zero Fp8OnPages" {
+test "GLM startup: refusing follower promptly tells waiting rank zero BadKvPages" {
     try refusal(1);
 }
 
 test "GLM startup: valid modes reach construction with every other setting intact" {
     for ([_]bool{ false, true }) |kv8| for ([_][]const u8{ "auto", "off", "0", "on", "all" }) |mode| {
-        if (kv8 and (std.mem.eql(u8, mode, "on") or std.mem.eql(u8, mode, "all"))) continue;
-        var w: World = .{};
+        var w: World = .{}; // E4M3 pages too: on and all reach construction with pages
         try run(&w, 0, 2, mode, kv8);
         try std.testing.expect(w.connected[0]);
         try std.testing.expect(w.constructed[0]);
@@ -125,35 +124,35 @@ test "GLM startup: failed liveness connection never resolves settings or constru
     try std.testing.expectEqual(@as(usize, 0), w.reports);
 }
 
-test "GLM startup: legacy paging matrix preserves settings and reports each rank before construction" {
-    const Case = struct { raw: ?[]const u8, single: bool, multi: bool, fp8_refuses: bool, mode: []const u8 };
+test "GLM startup: paging matrix resolves formats and strict input and reports each rank before construction" {
+    const Case = struct { raw: ?[]const u8, single: bool, multi: bool, invalid: bool, mode: []const u8 };
     const cases = [_]Case{
-        .{ .raw = null, .single = false, .multi = true, .fp8_refuses = false, .mode = "auto" },
-        .{ .raw = "auto", .single = false, .multi = true, .fp8_refuses = false, .mode = "auto" },
-        .{ .raw = "off", .single = false, .multi = false, .fp8_refuses = false, .mode = "off" },
-        .{ .raw = "0", .single = false, .multi = false, .fp8_refuses = false, .mode = "off" },
-        .{ .raw = "on", .single = true, .multi = true, .fp8_refuses = true, .mode = "on" },
-        .{ .raw = "1", .single = true, .multi = true, .fp8_refuses = true, .mode = "on" },
-        .{ .raw = "all", .single = true, .multi = true, .fp8_refuses = true, .mode = "on" },
-        .{ .raw = "", .single = true, .multi = true, .fp8_refuses = true, .mode = "on" },
-        .{ .raw = "false", .single = true, .multi = true, .fp8_refuses = true, .mode = "on" },
-        .{ .raw = "AUTO", .single = true, .multi = true, .fp8_refuses = true, .mode = "on" },
-        .{ .raw = "00", .single = true, .multi = true, .fp8_refuses = true, .mode = "on" },
-        .{ .raw = " 0 ", .single = true, .multi = true, .fp8_refuses = true, .mode = "on" },
-        .{ .raw = "off\n\x1b[31m", .single = true, .multi = true, .fp8_refuses = true, .mode = "on" },
+        .{ .raw = null, .single = false, .multi = true, .invalid = false, .mode = "auto" },
+        .{ .raw = "auto", .single = false, .multi = true, .invalid = false, .mode = "auto" },
+        .{ .raw = "off", .single = false, .multi = false, .invalid = false, .mode = "off" },
+        .{ .raw = "0", .single = false, .multi = false, .invalid = false, .mode = "off" },
+        .{ .raw = "on", .single = true, .multi = true, .invalid = false, .mode = "on" },
+        .{ .raw = "1", .single = true, .multi = true, .invalid = false, .mode = "on" },
+        .{ .raw = "all", .single = true, .multi = true, .invalid = false, .mode = "on" },
+        .{ .raw = "", .single = true, .multi = true, .invalid = true, .mode = "on" },
+        .{ .raw = "false", .single = true, .multi = true, .invalid = true, .mode = "on" },
+        .{ .raw = "AUTO", .single = true, .multi = true, .invalid = true, .mode = "on" },
+        .{ .raw = "00", .single = true, .multi = true, .invalid = true, .mode = "on" },
+        .{ .raw = " 0 ", .single = true, .multi = true, .invalid = true, .mode = "on" },
+        .{ .raw = "off\n\x1b[31m", .single = true, .multi = true, .invalid = true, .mode = "on" },
     };
     for (cases) |c| for (1..17) |world| for ([_]bool{ false, true }) |kv8| {
         const last_rank = @min(world, 2);
         for (0..last_rank) |rank| {
             var w: World = .{ .expected_world = world };
-            if (kv8 and c.fp8_refuses) {
-                try std.testing.expectError(error.Fp8OnPages, run(&w, rank, world, c.raw, kv8));
+            if (c.invalid) {
+                try std.testing.expectError(error.BadKvPages, run(&w, rank, world, c.raw, kv8));
                 try std.testing.expect(!w.constructed[rank]);
                 try std.testing.expectEqual(@as(usize, 0), w.reports);
                 try std.testing.expectEqual(@as(usize, 1), w.notifications);
                 continue;
             }
-            const pages = !kv8 and (if (world == 1) c.single else c.multi);
+            const pages = if (kv8 and std.mem.eql(u8, c.mode, "auto")) false else if (world == 1) c.single else c.multi;
             try run(&w, rank, world, c.raw, kv8);
             try std.testing.expectEqualDeep(Settings{ .kv8 = kv8, .pages = pages }, w.settings[rank].?);
             try std.testing.expectEqual(@as(usize, 1), w.reports);
