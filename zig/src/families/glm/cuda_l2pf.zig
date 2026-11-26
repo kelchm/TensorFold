@@ -8,6 +8,7 @@ const projection = @import("cuda_proj.zig");
 /// TF_GLM_L2PF and its knobs at DeepSeek V4.1's defaults (TF_DSV41_L2PF's): on unless 0, the knobs read unless 0.
 pub const Options = struct {
     on: bool = true,
+    shared_first: bool = false,
     named: bool = false, // TF_GLM_L2PF=1: on whatever the GPU, where unset is a GB10's alone (`want`)
     mb: u32 = 12, // TF_GLM_L2PF_MB: a site's budget in MiB
     ctas: u32 = 2, // TF_GLM_L2PF_CTAS: the CTAs a site's prefetch spreads over
@@ -23,6 +24,10 @@ pub const Options = struct {
             }
             o.named = true;
         }
+        o.shared_first = @import("sys").environment.value(bool, "TF_GLM_L2PF_SHARED_FIRST", get("TF_GLM_L2PF_SHARED_FIRST"), false) catch {
+            problem.* = "TF_GLM_L2PF_SHARED_FIRST: 0 or 1";
+            return error.BadSetting;
+        };
         const knobs = .{
             .{ "TF_GLM_L2PF_MB", "mb", 1, "TF_GLM_L2PF_MB: a site's budget in MiB, 1 or more" },
             .{ "TF_GLM_L2PF_CTAS", "ctas", 1, "TF_GLM_L2PF_CTAS: 1 or more" },
@@ -39,9 +44,17 @@ pub const Options = struct {
         return o;
     }
 
+    fn siteCount(o: Options) usize {
+        return if (o.shared_first) 4 else 3;
+    }
+
+    pub fn front(o: Options, rows: usize) bool {
+        return o.shared_first and ((rows >= 2 and rows <= 4) or rows == 6);
+    }
+
     /// What the ranks agree on: zeros when off, so knobs nobody reads never differ.
     pub fn words(o: Options) [4]u32 {
-        return if (o.on) .{ 1, o.mb, o.ctas, o.pace_gbps } else @splat(0);
+        return if (o.on) .{ 1 | @as(u32, @intFromBool(o.shared_first)) << 1, o.mb, o.ctas, o.pace_gbps } else @splat(0);
     }
 
     /// Whether `cap` prefetches at `world` ranks: named on any GPU, unset on a GB10 (sm_121) at two ranks or more.
@@ -51,7 +64,7 @@ pub const Options = struct {
 };
 
 /// A layer's sites: n before gather_b (the next mixer's input), f before gather_a (the ffn's head), o (KDA's chain).
-pub const Site = enum(u2) { n, f, o };
+pub const Site = enum(u2) { n, f, o, f_first };
 
 /// One site's rows of the table and their bytes.
 pub const Span = struct { at: u32 = 0, rows: u32 = 0, bytes: u64 = 0 };
@@ -99,10 +112,11 @@ fn sources(l: weights.Layer, site: Site) Sources {
                 s.proj(a.q_b);
             },
         },
-        .f => switch (l.ffn) {
+        .f, .f_first => switch (l.ffn) {
             .moe => |m| {
                 s.add(m.router);
-                s.proj(m.shared_gu); // read after the routed experts, which no table holds (the router picks them)
+                s.proj(m.shared_gu);
+                if (site == .f_first and m.exl3 != null) s.proj(m.shared_down);
             },
             .dense => |m| switch (m.w) {
                 .nvfp4 => |x| {
@@ -132,9 +146,14 @@ pub fn take(sizes: []const u64, budget: u64, out: []u64) void {
 
 /// Every site's rows of (address, bytes) from `bufs`, the weights' allocations; false when a source starts none.
 pub fn table(gpa: std.mem.Allocator, bufs: []const cuda.DeviceBuffer, layers: []const weights.Layer, budget: u64, rows: *std.ArrayList([2]i64), spans: []Span) !bool {
-    std.debug.assert(spans.len == layers.len * 3);
-    for (layers, 0..) |_, j| for ([_]Site{ .n, .f, .o }) |site| {
-        const sp = &spans[j * 3 + @backingInt(site)];
+    return tableOptions(gpa, bufs, layers, budget, rows, spans, .{});
+}
+
+fn tableOptions(gpa: std.mem.Allocator, bufs: []const cuda.DeviceBuffer, layers: []const weights.Layer, budget: u64, rows: *std.ArrayList([2]i64), spans: []Span, options: Options) !bool {
+    std.debug.assert(spans.len == layers.len * options.siteCount());
+    const sites = [_]Site{ .n, .f, .o, .f_first };
+    for (layers, 0..) |_, j| for (sites[0..options.siteCount()]) |site| {
+        const sp = &spans[j * options.siteCount() + @backingInt(site)];
         sp.* = .{ .at = @intCast(rows.items.len) };
         if (site == .n and j + 1 == layers.len) continue; // the last layer's next is the head
         const src = sources(layers[if (site == .n) j + 1 else j], site);
@@ -174,18 +193,18 @@ pub const L2pf = struct {
 
     /// Built after the weights load and tile (tiling moves packed linears); null when a source is not a buffer.
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, o: Options) !?L2pf {
-        const spans = try gpa.alloc(Span, w.layers.len * 3);
+        const spans = try gpa.alloc(Span, w.layers.len * o.siteCount());
         errdefer gpa.free(spans);
         var host: std.ArrayList([2]i64) = .empty;
         defer host.deinit(gpa);
-        if (!try table(gpa, w.buffers.items, w.layers, @as(u64, o.mb) << 20, &host, spans)) {
+        if (!try tableOptions(gpa, w.buffers.items, w.layers, @as(u64, o.mb) << 20, &host, spans, o)) {
             gpa.free(spans);
             return null;
         }
         if (host.items.len == 0) return error.NoPrefetchRows;
         var total: u64 = 0;
         for (spans) |sp| total += sp.bytes;
-        std.log.info("TF_GLM_L2PF: {d} rows, {d} MiB a decode window, {d} CTAs a site, the gathers' sites at {d} GB/s (0: unpaced)", .{ host.items.len, total >> 20, o.ctas, o.pace_gbps });
+        std.log.info("TF_GLM_L2PF: {d} rows, {d} MiB across prefetch sites, {d} CTAs a site, the gathers' sites at {d} GB/s (0: unpaced)", .{ host.items.len, total >> 20, o.ctas, o.pace_gbps });
         var rows = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(host.items));
         errdefer rows.free();
         var mods: [2]cuda.Module = .{ try cuda.Module.load(d, cuda.kernels.l2pf), undefined };
@@ -216,8 +235,9 @@ pub const L2pf = struct {
 
     /// Site `site` of layer `j` read into L2 on the side stream from this point of `main` on.
     pub fn fork(p: *const L2pf, main: cuda.Stream, j: usize, site: Site) !void {
-        if (j * 3 >= p.spans.len) return;
-        const sp = p.spans[j * 3 + @backingInt(site)];
+        const sites = p.o.siteCount();
+        if (@backingInt(site) >= sites or j >= p.spans.len / sites) return;
+        const sp = p.spans[j * sites + @backingInt(site)];
         if (sp.rows == 0) return;
         try p.fork_ev.record(main);
         try p.side.wait(p.fork_ev);
@@ -355,4 +375,25 @@ test "the table: each site's sources in its matmuls' order, site n from the next
     }, &spans);
     rows.clearRetainingCapacity();
     try t.expect(!try table(t.allocator, bufs[1..], &.{ d, e }, 12 * MiB, &rows, &spans));
+}
+
+test "startup switches: shared weights stay on the original schedule outside the eligible verify rows" {
+    const t = std.testing;
+    var problem: []const u8 = "";
+    const on = try Options.read(Env(.{.{ "TF_GLM_L2PF_SHARED_FIRST", "1" }}).get, &problem);
+    try t.expectEqual([4]u32{ 3, 12, 2, 150 }, on.words());
+    try t.expect(!on.front(1) and on.front(2) and on.front(3) and on.front(4) and !on.front(5) and on.front(6) and !on.front(7) and !on.front(8) and !on.front(16));
+    try t.expectError(error.BadSetting, Options.read(Env(.{.{ "TF_GLM_L2PF_SHARED_FIRST", "true" }}).get, &problem));
+    var l: weights.Layer = undefined;
+    l.ffn = .{ .moe = undefined };
+    l.ffn.moe.exl3 = @as(@import("cuda_exl3.zig").Experts, undefined);
+    l.ffn.moe.router = 0x100;
+    l.ffn.moe.shared_gu = .{ .bf16 = 0x200 };
+    l.ffn.moe.shared_down = .{ .bf16 = 0x300 };
+    const usual = sources(l, .f);
+    const early = sources(l, .f_first);
+    try t.expectEqualSlices(u64, &.{ 0x100, 0x200 }, usual.ptrs[0..usual.len]);
+    try t.expectEqualSlices(u64, &.{ 0x100, 0x200, 0x300 }, early.ptrs[0..early.len]);
+    l.ffn.moe.exl3 = null;
+    try t.expectEqual(@as(usize, 2), sources(l, .f_first).len);
 }

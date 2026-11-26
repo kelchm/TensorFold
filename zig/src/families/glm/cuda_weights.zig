@@ -43,8 +43,13 @@ pub const Weights = struct {
     norm: glue.Norm = .{ .bf16 = 0 },
     head: projection.Proj = .{ .bf16 = 0 }, // [share.vocab][dims]: bf16, or MXFP8 for the lane
     mtp: ?Mtp = null,
+    external_head: ?q4.Q4 = null,
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     named: std.ArrayList(Named) = .empty,
+
+    pub fn draftHead(w: *const Weights) ?q4.Q4 {
+        return w.external_head orelse if (w.mtp) |m| m.draft else null;
+    }
 
     pub fn deinit(w: *Weights) void {
         for (w.buffers.items) |*b| b.free();
@@ -535,6 +540,11 @@ fn recipeTable(r: *const core.modelopt.Recipes) ?*const core.modelopt.Recipes {
 
 /// weights.load without the MTP head: embedding, layers, final norm, the rank's head rows (bf16, MXFP8); `pack_dense`.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: cuda.Stream, tools: Tools, dir: []const u8, c: cfg.Config, share: shard.Share, layers: []const u32, with_mtp: bool) !Weights {
+    return loadFor(gpa, io, d, stream, tools, dir, c, share, layers, if (with_mtp) .mtp else .none);
+}
+
+pub const DraftWeights = enum { none, mtp, external };
+pub fn loadFor(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: cuda.Stream, tools: Tools, dir: []const u8, c: cfg.Config, share: shard.Share, layers: []const u32, mode: DraftWeights) !Weights {
     var w: Weights = .{ .gpa = gpa, .config = c, .share = share };
     errdefer w.deinit();
     var ck = try core.Checkpoint.openModelPrefix(gpa, io, dir, prefix);
@@ -555,7 +565,13 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
     w.norm = try L.norm("norm.weight", .{}, "norm");
     const vocab: formats.Part = .{ .rel = "lm_head", .rows = .{ share.vocab.lo, share.vocab.hi } };
     w.head = try formats.cut(&L, &head_ck, &.{"lm_head"}, &.{vocab}, &.{ .bf16, .mxfp8 }, "head", .{});
-    if (with_mtp and c.mtp > 0) w.mtp = try @import("cuda_mtp_load.zig").load(&L, &head_ck);
+    switch (mode) {
+        .none => {},
+        .mtp => if (c.mtp > 0) {
+            w.mtp = try @import("cuda_mtp_load.zig").load(&L, &head_ck);
+        },
+        .external => w.external_head = try @import("cuda_mtp_load.zig").draft(&L, &head_ck),
+    }
     return w;
 }
 

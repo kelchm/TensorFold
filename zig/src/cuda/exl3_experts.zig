@@ -142,6 +142,10 @@ pub const Experts = struct {
     gateup: Function,
     down_combine: Function,
     glm_decode: bool = false,
+    glm_nmajor: bool = false,
+    glm_gateup_nmajor: Function = undefined,
+    glm_gateup_flat_nmajor: Function = undefined,
+    glm_down_nmajor: Function = undefined,
     glm_gateup_flat: Function = undefined,
     glm_gateup: Function = undefined,
     glm_down: Function = undefined,
@@ -165,6 +169,9 @@ pub const Experts = struct {
         e.glm_gateup_flat = try e.mod.function("tf_glm_exl3_decode_gateup_flat");
         e.glm_gateup = try e.mod.function("tf_glm_exl3_decode_gateup");
         e.glm_down = try e.mod.function("tf_glm_exl3_decode_down");
+        e.glm_gateup_nmajor = try e.mod.function("tf_glm_exl3_decode_gateup_nmajor");
+        e.glm_gateup_flat_nmajor = try e.mod.function("tf_glm_exl3_decode_gateup_flat_nmajor");
+        e.glm_down_nmajor = try e.mod.function("tf_glm_exl3_decode_down_nmajor");
         e.plan_rotate = try e.mod.function("tf_exl3_plan_rotate");
         e.plan_finish = try e.mod.function("tf_exl3_plan_finish");
         e.plan_finish_after = try e.mod.function("tf_exl3_plan_finish_after");

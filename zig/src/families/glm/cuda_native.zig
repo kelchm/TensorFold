@@ -207,6 +207,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         return err;
     };
     try @import("cuda_roce_multi.zig").validate(p.world, p.rank, set.roce_multi);
+    if (set.dflash_only and (o.drafter == null or !o.drafts)) {
+        std.log.err("TF_GLM_DFLASH_ONLY=1 requires --drafter and enabled drafts", .{});
+        return error.BadSetting;
+    }
     if (set.dflash_q4_down and (o.drafter == null or !o.drafts or o.drafter_bits != 4)) {
         std.log.err("TF_GLM_DFLASH_Q4_DOWN=1 requires enabled DFlash2 and --drafter-bits 4", .{});
         return error.BadSetting;

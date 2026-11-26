@@ -97,8 +97,8 @@ pub const Lanes = struct {
 
     /// Round loop facts: copies up to max_rows, head chains to max_drafts, shared windows unless TF_GLM_SHARED=0.
     pub fn facts(self: *const Lanes) lanes.Model {
-        const drafting = self.x.e.mtp;
         const block = self.x.e.drafter != null;
+        const drafting = self.x.e.mtp or block;
         const costs = if (block) null else if (self.costs) |*c| c else null;
         const sharing = drafting and !self.alone;
         return .{
@@ -127,7 +127,7 @@ pub const Lanes = struct {
 
     /// Root/context copies use the same verify/keep path and shared cost allocator as every target window.
     pub fn factsWithCopies(self: *Lanes, enabled: bool) lanes.Model {
-        self.copy_confidence = enabled and self.x.e.mtp;
+        self.copy_confidence = enabled and (self.x.e.mtp or self.x.e.drafter != null);
         var m = copy_policy.apply(self.facts(), enabled, self.x.e.drafter == null and self.costs != null);
         if (self.long_copy_match and enabled and self.x.e.drafter != null) {
             m.fixed_copy_drafts = 15;

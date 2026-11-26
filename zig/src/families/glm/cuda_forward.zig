@@ -169,6 +169,7 @@ pub const ImageRows = struct { v: *images_mod.Images, slot: u32 };
 pub const Seg = struct { st: *State, row0: usize, rows: usize };
 
 pub const Forward = struct {
+    scheduled_l2: bool = false,
     verify_tiles: @import("cuda_verify_tiles.zig").Window = .{},
     kv_pow2: bool = false,
     absorb_mma: bool = false,
@@ -273,8 +274,11 @@ pub const Forward = struct {
                 if (out) |o| try mlp.fill(f.mlpKernels(), f.stream, m, b.dense, 0, rows, b.prefill, o);
             },
             .moe => |m| {
-                try moe.body(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, rows, b.prefill);
-                if (out) |o| try moe.fill(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, 0, rows, b.prefill, o);
+                const pf = f.prefetch();
+                var kernels = f.moeKernels();
+                kernels.early_shared = f.scheduled_l2 and pf != null and pf.?.o.front(rows) and out != null and m.exl3 != null;
+                try moe.body(kernels, f.stream, m, b.moe, b.normed, c.hidden, rows, b.prefill);
+                if (out) |o| try moe.fill(kernels, f.stream, m, b.moe, b.normed, c.hidden, 0, rows, b.prefill, o);
             },
         }
     }
@@ -435,7 +439,7 @@ pub const Forward = struct {
                 if (r.segs.len > 0) try shared.mixer(f, r, l, li, di, R, slot(r, R)) else try f.mixer(r, l, li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), slot(r, R));
             }
             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].mixer == .kda) .kda else .mla);
-            if (pf) |p| try p.fork(f.stream, j, .f);
+            if (pf) |p| try p.fork(f.stream, j, if (f.scheduled_l2 and p.o.front(R)) .f_first else .f);
             try f.resolve(R);
             if (f.prof) |p| p.mark(f.stream, .gather_a);
             prof_mod.context(f.prof, j, null, .ffn);

@@ -331,9 +331,14 @@ pub fn runDecode(k: *const Kernels, router: cuda.grouped.Router, stream: cuda.St
     const z = rotated + rows * d * 2; // fp32 [2,4,pairs,1024]; the existing compact arena is larger
     try router.route(stream, picks, pairs, count + 1, 16, p);
     try launchDecode(k.prompt.rotate, stream, .{ rows, d / 128, 1 }, 32, .{ x, @as(i32, @intCast(stride)), w.suh_g, rotated, @as(i32, d) });
-    try launchDecode(if (slots == top_k) k.glm_gateup_flat else k.glm_gateup, stream, .{ items, width / 128, 8 }, 128, .{ rotated, w.banks[0], w.banks[1], p.items, p.counts, p.members, z, np, ne });
+    const nmajor = k.glm_nmajor and (rows == 4 or rows == 8 or rows == 16);
+    const gateup = if (nmajor)
+        (if (slots == top_k) k.glm_gateup_flat_nmajor else k.glm_gateup_nmajor)
+    else
+        (if (slots == top_k) k.glm_gateup_flat else k.glm_gateup);
+    try launchDecode(gateup, stream, .{ items, width / 128, 8 }, 128, .{ rotated, w.banks[0], w.banks[1], p.items, p.counts, p.members, z, np, ne });
     try launchDecode(k.gateup, stream, .{ pairs, width / 128, 1 }, 32, .{ z, picks, w.svh_g, w.svh_u, w.suh_d, xd, np, @as(i32, width), @as(i32, 4), ne, limit, @as(i32, 0) });
-    try launchDecode(k.glm_down, stream, .{ items, d / 128, 1 }, 128, .{ xd, w.banks[2], p.items, p.counts, p.members, np, ne, w.svh_d, ey });
+    try launchDecode(if (nmajor) k.glm_down_nmajor else k.glm_down, stream, .{ items, d / 128, 1 }, 128, .{ xd, w.banks[2], p.items, p.counts, p.members, np, ne, w.svh_d, ey });
 }
 
 /// TF_GLM_MOE_DIRECT: compact's one chunk on picks top-k wrote flat at sc.picks; the slot rows stay at `directOut`.

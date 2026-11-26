@@ -464,7 +464,11 @@ pub const State = struct {
     }
 
     pub fn initFormat(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, kv8: bool) !State {
-        return make(gpa, d, w, capacity, kv8, null, true);
+        return initWindowFormat(gpa, d, w, capacity, kv8, true);
+    }
+
+    pub fn initWindowFormat(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, kv8: bool, head: bool) !State {
+        return make(gpa, d, w, capacity, kv8, null, head);
     }
 
     /// A sequence whose latent rows and pooled keys are pages of `p`; it holds no rows until a stream maps some.

@@ -62,6 +62,7 @@ pub const Engine = struct {
     lib: *const cuda.nccl.Library,
     comm: cuda.nccl.Comm,
     group: ?*const cuda.tp_group.Group = null, // the main stream's all-gathers (RoCE on two ranks); null: lib and comm
+    scheduled_l2: bool = false,
     verify_tiles: @import("cuda_verify_tiles.zig").Options = .{},
     mesh: mesh_mod.Mesh, // this rank's place: one tensor group of `world` ranks
     backend: *tp.group.Backend, // the boundary's communicator over lib and comm, then the group once it is up
@@ -176,7 +177,7 @@ pub const Engine = struct {
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .mesh = place, .backend = backend, .collective = backend.collective(), .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .mtp = o.mtp };
+        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .mesh = place, .backend = backend, .collective = backend.collective(), .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .mtp = o.mtp and !o.settings.dflash_only };
         const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
         if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
         const Tile = struct {
@@ -194,7 +195,8 @@ pub const Engine = struct {
             }
         };
         const tiler: Tile = .{ .gpa = gpa, .mk = &e.m.mm, .s = stream, .d = d, .enabled = o.settings.tiled, .dense = o.settings.dense_bits, .head = o.settings.head_bits, .packs = &e.packs };
-        e.w = try @import("cuda_load_owner.zig").finish(try weights.load(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, o.mtp), tiler, Tile.apply);
+        const draft_weights: weights.DraftWeights = if (o.settings.dflash_only) .external else if (o.mtp) .mtp else .none;
+        e.w = try @import("cuda_load_owner.zig").finish(try weights.loadFor(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, draft_weights), tiler, Tile.apply);
         errdefer e.w.deinit();
         errdefer {
             gpa.free(e.packs.ptrs);
@@ -203,11 +205,13 @@ pub const Engine = struct {
         e.m.mm.prompt_fixed_k = o.settings.prompt_fixed_k;
         e.m.tiled = o.settings.tiled;
         e.m.exl3.glm_decode = o.settings.exl3_decode and world == 2 and try ctx.capability() == 121;
+        e.m.exl3.glm_nmajor = e.m.exl3.glm_decode and o.settings.exl3_nmajor;
         if (rank == 0 and e.m.exl3.glm_decode) std.log.info("glm: specialized four-bit EXL3 verification kernels enabled", .{});
         if (o.settings.tiled) e.m.packs = &e.packs;
         if (o.settings.verify_tiles.enabled()) e.verify_tiles = o.settings.verify_tiles.gate(try ctx.capability(), world, o.settings.pages, o.settings.kv_pow2, o.settings.kv_host);
         if (o.settings.l2pf.want(try ctx.capability(), world)) e.l2pf = try l2pf_mod.L2pf.init(gpa, d, &e.w, o.settings.l2pf);
         errdefer if (e.l2pf) |*p| p.deinit();
+        e.scheduled_l2 = o.settings.l2pf.shared_first and e.l2pf != null and world == 2 and o.settings.kv_pow2 and (try ctx.capability()) == 121;
         if (o.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
         errdefer {
             e.free(0);
@@ -221,8 +225,9 @@ pub const Engine = struct {
         errdefer if (e.pair) |*p| p.deinit();
         e.bd = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
         errdefer e.bd.deinit();
-        e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
-        errdefer e.bm.deinit();
+        if (!o.settings.dflash_only) e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
+        errdefer if (!o.settings.dflash_only) e.bm.deinit();
+        if (o.settings.dflash_only and rank == 0) std.log.info("glm: external DFlash2 with Q4 draft head, checkpoint MTP layer disabled", .{});
         if (o.mtp) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
         e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world * pick_rows);
@@ -276,7 +281,7 @@ pub const Engine = struct {
         e.smp.deinit();
         e.pairs.free();
         if (e.bs) |*b| b.deinit();
-        e.bm.deinit();
+        if (!e.settings.dflash_only) e.bm.deinit();
         e.bd.deinit();
         if (e.pair) |*p| p.deinit();
         e.bp.deinit();
@@ -329,7 +334,7 @@ pub const Engine = struct {
         if (made) {
             const q = try e.gpa.create(Seq);
             errdefer e.gpa.destroy(q);
-            q.* = .{ .st = try fw.State.initFormat(e.gpa, e.d, &e.w, e.capacity, e.settings.kv8) };
+            q.* = .{ .st = try fw.State.initWindowFormat(e.gpa, e.d, &e.w, e.capacity, e.settings.kv8, !e.settings.dflash_only) };
             e.seqs.items[slot] = q;
         }
         e.cur = e.seqs.items[slot].?;
@@ -486,6 +491,7 @@ pub const Engine = struct {
         var one: [1]fw.Rank = undefined;
         var f = e.view(&e.bd, &one);
         const at = e.cur.st.pos;
+        f.scheduled_l2 = e.scheduled_l2;
         f.verify_tiles = e.verify_tiles.window(at, ids.len);
         f.prof = e.profs[ids.len - 1];
         if (f.prof) |p| try p.begin(e.stream, verifyLabel(ids.len));

@@ -4,6 +4,45 @@ const glm = @import("glm");
 const registry = @import("core").contract.registry;
 const t = std.testing;
 
+test "glm dflash: each optional decode switch has its own rank fingerprint across all eight combinations" {
+    const ranks = glm.ranks;
+    const h: [32]u8 = @splat(0);
+    for (0..8) |i| {
+        const s: ranks.Settings = .{ .dflash_only = i & 1 != 0, .l2pf = .{ .shared_first = i & 2 != 0 }, .exl3_decode = true, .exl3_nmajor = i & 4 != 0 };
+        const f = ranks.Fingerprint.of(2, 0, s, 8192, true, h, h, h);
+        try t.expectEqual(@as(u32, 34), f.layout);
+        try t.expectEqual(@as(u32, 1 | (@as(u32, @intFromBool(s.dflash_only)) << 2)), f.mtp);
+        try t.expectEqual(@as(u32, 1 | (@as(u32, @intFromBool(s.l2pf.shared_first)) << 1)), f.l2pf[0]);
+        try t.expectEqual(@as(u32, 2 | (@as(u32, @intFromBool(s.exl3_nmajor)) << 2)) | @intFromBool(s.pair_experts), f.pair_experts);
+        try t.expect(ranks.mismatch(&.{f, ranks.Fingerprint.of(2, 1, s, 8192, true, h, h, h)}) == null);
+    }
+}
+
+test "glm dflash: external-only keeps the draft projection and scheduling when the MTP layer is absent" {
+    var e: glm.engine.Engine = undefined;
+    var dr: glm.dflash.Drafter = undefined;
+    e.drafter = &dr;
+    e.mtp = false;
+    e.w.mtp = null;
+    e.w.external_head = null;
+    try t.expect(e.w.draftHead() == null);
+    const head: glm.q4.Q4 = .{ .w = 11, .s = 12, .b = 13, .n = 64, .k = 128, .npad = 64 };
+    e.w.external_head = head;
+    try t.expectEqualDeep(head, e.w.draftHead().?);
+    var adapter: glm.lanes.Lanes = .{ .x = .{ .e = &e, .link = undefined } };
+    const standalone = adapter.factsWithCopies(true);
+    try t.expect(standalone.speculate and standalone.draft_streams and standalone.hidden_rows);
+    e.mtp = true;
+    const both = adapter.factsWithCopies(true);
+    try t.expectEqualDeep(standalone, both);
+
+    const h: [32]u8 = @splat(0);
+    const ranks = glm.ranks;
+    const fp0 = ranks.Fingerprint.of(2, 0, .{}, 8192, true, h, h, h);
+    const fp1 = ranks.Fingerprint.of(2, 1, .{ .dflash_only = true }, 8192, true, h, h, h);
+    try t.expectEqual(ranks.Fingerprint.Field.mtp, ranks.mismatch(&.{ fp0, fp1 }).?.field);
+}
+
 test "glm dflash: calibrated greedy edge changes the candidate and its temperature changes the chance" {
     const df = glm.dflash;
     var dr: df.Drafter = undefined;

@@ -60,7 +60,7 @@ pub fn tableFor(k: Kept, block: bool) ?Table {
 pub fn price(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, x: follow.Leader) !?Table {
     const e = x.e;
     const pin = try pinnedForm();
-    if (!e.mtp or e.capacity < prefix + 2 * fw.window_rows + 2) return untimed(x, pin);
+    if ((!e.mtp and e.drafter == null) or e.capacity < prefix + 2 * fw.window_rows + 2) return untimed(x, pin);
     var name: [256]u8 = undefined;
     var shape: [512]u8 = undefined;
     const block = e.drafter != null;
@@ -171,14 +171,14 @@ fn keyShape(e: *const engine.Engine, sm: usize, driver: c_int, shape: []u8, pin:
     const draft_hex = std.fmt.bytesToHex(if (e.drafter) |dr| dr.checkpoint_digest else @as([32]u8, @splat(0)), .lower);
     const tail: []const u8 = if (pin) |f| (if (f) " form factored" else " form classic") else "";
     var suffix_buffer: [64]u8 = undefined;
-    const suffix = try std.fmt.bufPrint(&suffix_buffer, " tiles{d}/{d}{s}", .{ @intFromBool(set.verify_tiles.mla), @intFromBool(set.verify_tiles.ranges), tail });
+    const suffix = try std.fmt.bufPrint(&suffix_buffer, " tiles{d}/{d} first{d} external{d}{s}", .{ @intFromBool(set.verify_tiles.mla), @intFromBool(set.verify_tiles.ranges), @intFromBool(set.l2pf.shared_first), @intFromBool(set.dflash_only), tail });
     return std.fmt.bufPrint(shape, "sm{d} cuda{d} ranks{d} {s} drafter{d}/{d}/{s} layers{d} l2{d}/{d}/{d}/{d}/{d} warps{d} kda{d} mm{d} bits{d}/{d} kv8{d} pages{d} host{d} roce{d} p2p{s}/{s}/{s} pad{d} pdl{d} dsel{d} wide{d} power{d} draftdown{d}{s}", .{
         sm,                                          driver,                       e.share.world,                          hex[0..],                                   @intFromBool(e.drafter != null),
         if (e.drafter) |dr| dr.bits else @as(u8, 0), draft_hex[0..],               set.layers,                             @intFromBool(set.l2pf.on),                  @intFromBool(set.l2pf.named),
         set.l2pf.mb,                                 set.l2pf.ctas,                set.l2pf.pace_gbps,                     e.m.experts.nvfp4.warps,                    @intFromBool(set.kda_wide),
         @intFromBool(set.tiled),                     set.dense_bits,               set.head_bits,                          @intFromBool(set.kv8),                      @intFromBool(set.pages),
         set.kv_host,                                 @intFromBool(set.roce_multi), sys.getenv("NCCL_P2P_LEVEL") orelse "", sys.getenv("NCCL_MIN_NCHANNELS") orelse "", sys.getenv("NCCL_MAX_NCHANNELS") orelse "",
-        @intFromBool(set.kda_pad),                   @intFromBool(e.m.mm.pdl),     @intFromBool(e.m.dsel),                 @as(u8, @intFromBool(set.roce_wide)) | (@as(u8, @intFromBool(set.exl3_decode)) << 1), @intFromBool(set.kv_pow2), @intFromBool(set.dflash_q4_down), suffix,
+        @intFromBool(set.kda_pad),                   @intFromBool(e.m.mm.pdl),     @intFromBool(e.m.dsel),                 @as(u8, @intFromBool(set.roce_wide)) | (@as(u8, @intFromBool(set.exl3_decode)) << 1) | (@as(u8, @intFromBool(set.exl3_nmajor)) << 2), @intFromBool(set.kv_pow2), @intFromBool(set.dflash_q4_down), suffix,
     });
 }
 
@@ -273,7 +273,7 @@ test "GLM cost identity: the consumed key includes drafter precision and all tim
     e.drafter = &dr;
     var base: [512]u8 = undefined;
     const before = try keyShape(&e, 121, 13000, &base, null);
-    for (0..17) |which| {
+    for (0..20) |which| {
         const original = e.settings;
         switch (which) {
             0 => dr.bits = 0,
@@ -293,6 +293,9 @@ test "GLM cost identity: the consumed key includes drafter precision and all tim
             14 => e.settings.roce_wide = true,
             15 => e.settings.kv_pow2 = true,
             16 => e.settings.dflash_q4_down = true,
+            17 => e.settings.l2pf.shared_first = true,
+            18 => e.settings.dflash_only = true,
+            19 => e.settings.exl3_nmajor = true,
             else => unreachable,
         }
         var changed: [512]u8 = undefined;

@@ -46,14 +46,21 @@ __device__ __forceinline__ uint4 ldg_nc_v4(const uint32_t* p) {
     return v;
 }
 
-template <bool DOWN, int slots = 9>
+template <bool DOWN, int slots = 9, bool OUTPUT_MAJOR = false>
 __device__ __forceinline__ void projection(const half* __restrict__ X, const uint32_t* __restrict__ T0,
     const uint32_t* __restrict__ T1, const int* __restrict__ items, const int* __restrict__ counts,
     const int* __restrict__ members, float* __restrict__ Z, int P, int E, const half* __restrict__ svh_d,
     float* __restrict__ y) {
     constexpr int W = 4, NT = 8, STEPS = 16, SK = DOWN ? 1 : 4;
     constexpr int K = DOWN ? 1024 : 4096, N = DOWN ? 4096 : 1024;
-    const int item = blockIdx.x, nblock = blockIdx.y, zz = blockIdx.z;
+    int item = blockIdx.x, nblock = blockIdx.y;
+    if constexpr (OUTPUT_MAJOR) {
+        constexpr int nb = N / (NT * 16);
+        const unsigned linear = blockIdx.y * gridDim.x + blockIdx.x;
+        item = linear / nb;
+        nblock = linear % nb;
+    }
+    const int zz = blockIdx.z;
     const int total = counts[0];
     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
     if (item >= total || e >= E) return;
@@ -196,4 +203,17 @@ extern "C" __global__ void __launch_bounds__(128) tf_glm_exl3_decode_gateup_flat
 extern "C" __global__ void __launch_bounds__(128) tf_glm_exl3_decode_down(const half* x, const uint32_t* d,
         const int* items, const int* counts, const int* members, int pairs, int experts, const half* svh, float* out) {
     tf_glm_exl3_decode::projection<true>(x, d, d, items, counts, members, nullptr, pairs, experts, svh, out);
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_glm_exl3_decode_gateup_nmajor(const half* x, const uint32_t* g,
+        const uint32_t* u, const int* items, const int* counts, const int* members, float* z, int pairs, int experts) {
+    tf_glm_exl3_decode::projection<false, 9, true>(x, g, u, items, counts, members, z, pairs, experts, nullptr, nullptr);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_glm_exl3_decode_gateup_flat_nmajor(const half* x, const uint32_t* g,
+        const uint32_t* u, const int* items, const int* counts, const int* members, float* z, int pairs, int experts) {
+    tf_glm_exl3_decode::projection<false, 8, true>(x, g, u, items, counts, members, z, pairs, experts, nullptr, nullptr);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_glm_exl3_decode_down_nmajor(const half* x, const uint32_t* d,
+        const int* items, const int* counts, const int* members, int pairs, int experts, const half* svh, float* out) {
+    tf_glm_exl3_decode::projection<true, 9, true>(x, d, d, items, counts, members, nullptr, pairs, experts, svh, out);
 }

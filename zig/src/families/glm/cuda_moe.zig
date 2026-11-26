@@ -48,6 +48,7 @@ pub const Kernels = struct {
     exl3: *const exl3.Kernels,
     put_slot: cuda.Function,
     prof: ?*prof_mod.Prof = null,
+    early_shared: bool = false,
     direct: bool = false, // TF_GLM_MOE_DIRECT=1 (opt-in): see `direct`
 };
 
@@ -78,6 +79,7 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     const shared_id: i32 = @intCast(l.count);
     const flat = direct(k, l, rows, prompt);
     try prepare(k, stream, l, s, x, x_stride, rows, s.pick, if (flat) s.x3.picks else null);
+    if (k.early_shared) try sharedRows(k, stream, l, s, x, x_stride, 0, rows);
     const stamp = prof_mod.span(k.prof, stream, .experts);
     defer stamp.end();
     if (k.prof) |p| p.mark(stream, .router);
@@ -99,6 +101,14 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     try experts.run(k.experts, stream, if (prompt) .down else .down_f32, l.routed, plan, s.eact, l.routed.width, rows, s.ey, shared_id);
 }
 
+fn sharedRows(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize) !void {
+    const d = l.routed.dims;
+    const n = hi - lo;
+    try projection.matmul(k.set, stream, l.shared_gu, x + lo * x_stride * 2, x_stride, s.sgu + lo * 2 * l.shared * 2, s.mm_part, n, 2 * l.shared, d, false);
+    try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
+    try projection.matmul(k.set, stream, l.shared_down, s.sact + lo * l.shared * 2, l.shared, s.sy + lo * d * 4, s.mm_part, n, d, l.shared, true);
+}
+
 /// Shared expert and its slot, before the slot sum; paired passes call this on the original exchange pieces.
 pub fn shared(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize, prompt: bool) !void {
     const d = l.routed.dims;
@@ -106,9 +116,7 @@ pub fn shared(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_s
     const n = hi - lo;
     const bf16_slots = prompt and l.exl3 == null;
     const eb: usize = if (bf16_slots) 2 else 4;
-    try projection.matmul(k.set, stream, l.shared_gu, x + lo * x_stride * 2, x_stride, s.sgu + lo * 2 * l.shared * 2, s.mm_part, n, 2 * l.shared, d, false);
-    try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
-    try projection.matmul(k.set, stream, l.shared_down, s.sact + lo * l.shared * 2, l.shared, s.sy + lo * d * 4, s.mm_part, n, d, l.shared, true);
+    if (!k.early_shared) try sharedRows(k, stream, l, s, x, x_stride, lo, hi);
     if (direct(k, l, hi, prompt)) { // body ran these rows direct: a decode window, filled whole; fill sums it (combineTail)
         if (lo != 0) return error.BadWindow;
         return;
