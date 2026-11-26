@@ -97,7 +97,9 @@ pub fn reserve(s: *pc.Store, prompt: []const u32, born: u32, from: ?*pc.Entry, m
         const can = evictable(s, from, prompt);
         if (bytes + can.bytes < need or slots + can.slots < 1) return;
         while (bytes < need or slots < 1) {
-            const i = others.victim(s, from, prompt, born, need, 1) orelse return;
+            const native = others.victim(s, from, prompt, born, need, 1) orelse return;
+            const missing: u64 = @intCast(@max(0, @as(i128, need) - bytes));
+            const i = if (s.eviction == .single_leaf) singleLeafVictim(s, from, prompt, born, missing, native) else native;
             bytes += s.entries.items[i].bytes;
             slots += 1;
             s.remove(i);
@@ -116,6 +118,22 @@ pub fn reserve(s: *pc.Store, prompt: []const u32, born: u32, from: ?*pc.Entry, m
         s.remove(i);
         s.counts.evicted += 1;
     }
+}
+
+/// A byte shortage can evict a reused state and then a second victim. In the LRU fallback,
+/// use one eligible, never-resumed leaf when it alone funds the endpoint. Keep native tiers,
+/// the restore source, other conversations' restrictions and every queued reservation intact.
+fn singleLeafVictim(s: *const pc.Store, from: ?*pc.Entry, prompt: []const u32, born: u32, missing: u64, native: usize) usize {
+    const first = s.entries.items[native];
+    if (first.bytes >= missing or first.seen.hits == 0 or policy.redundant(s, first, prompt, born)) return native;
+    var candidate: ?usize = null;
+    for (s.entries.items, 0..) |e, i| {
+        if (e == from or e.borrowers != 0 or e.bytes < missing or e.seen.hits != 0) continue;
+        if (e.shared or e.branched or e.rewind or e.expired or policy.extended(s, e)) continue;
+        if (s.reservation_guard.?.protects(s, e) or (s.keep_others and !policy.own(e, from, prompt))) continue;
+        if (candidate == null or e.used < s.entries.items[candidate.?].used) candidate = i;
+    }
+    return candidate orelse native;
 }
 
 /// The endpoint first; interior, rewind and extra shared cuts compete for the room after it, ladder rungs last.
@@ -156,4 +174,62 @@ pub fn fitting(s: *pc.Store, a: std.mem.Allocator, prompt: []const u32, marks: [
     }
     std.mem.sort(u32, fitted, {}, std.sort.asc(u32));
     return fitted;
+}
+
+test "single leaf: byte deficit, full payment, policy tiers, queue promises and fallback" {
+    const t = std.testing;
+    var words = [_]u32{ 3, 4, 5, 6 };
+    var enough = [_]u32{ 7, 0 };
+    const prompt = [_]u32{ 9, 10, 11 };
+    const first: pc.Entry = .{ .tokens = words[0..1], .last = words[0..1], .at = 1, .born = 1, .used = 3, .seen = .{ .hits = 5 }, .bytes = 472, .saved = undefined };
+    var states: [4]pc.Entry = @splat(first);
+    // Both large leaves fit: prefer the least recently used of them.
+    for (states[1..], 0..) |*e, i| {
+        e.tokens = enough[0..1];
+        e.seen.hits = 0;
+        e.used = 8 + i;
+        e.bytes = 1830;
+    }
+    states[1].bytes = 1425;
+    var guard: ?*const pc.Entry = null;
+    const Gate = struct {
+        fn needed(ctx: *anyopaque, e: *const pc.Entry) bool {
+            const protected: *?*const pc.Entry = @ptrCast(@alignCast(ctx));
+            return protected.* == e;
+        }
+    };
+    var s: pc.Store = .{ .gpa = t.allocator, .family = undefined, .rules = .{}, .budget = 8192, .reservation_guard = .{ .ctx = @ptrCast(&guard), .needed = Gate.needed, .exact = true } };
+    defer s.entries.deinit(t.allocator);
+    for (&states) |*e| try s.entries.append(t.allocator, e);
+    try t.expectEqual(@as(usize, 2), singleLeafVictim(&s, null, &prompt, 3, 1426, 0));
+    try t.expectEqual(@as(usize, 1), singleLeafVictim(&s, null, &prompt, 3, 1425, 0));
+    try t.expectEqual(@as(usize, 0), singleLeafVictim(&s, null, &prompt, 3, 472, 0));
+    try t.expectEqual(@as(usize, 0), singleLeafVictim(&s, null, &prompt, 3, 1831, 0));
+    try t.expectEqual(@as(usize, 3), singleLeafVictim(&s, &states[2], &prompt, 3, 1426, 0));
+    guard = &states[3];
+    for (0..7) |i| {
+        var e = &states[2];
+        const save = e.*;
+        switch (i) {
+            0 => e.branched = true,
+            1 => e.shared = true,
+            2 => e.rewind = true,
+            3 => e.borrowers = 1,
+            4 => e.seen.hits = 1,
+            5 => e.expired = true,
+            else => try e.ext.append(t.allocator, &states[1]),
+        }
+        try t.expectEqual(@as(usize, 0), singleLeafVictim(&s, null, &prompt, 3, 1426, 0));
+        e.ext.deinit(t.allocator);
+        e.* = save;
+    }
+    s.keep_others = true;
+    try t.expectEqual(@as(usize, 0), singleLeafVictim(&s, null, &prompt, 3, 1426, 0));
+    s.keep_others = false;
+    states[0].seen.hits = 0;
+    try t.expectEqual(@as(usize, 0), singleLeafVictim(&s, null, &prompt, 3, 1426, 0));
+    states[0] = first;
+    try states[0].ext.append(t.allocator, &states[1]);
+    defer states[0].ext.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 0), singleLeafVictim(&s, null, &prompt, 3, 1426, 0));
 }

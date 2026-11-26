@@ -92,7 +92,7 @@ pub const Entry = struct {
     bytes: u64,
     born: u32, // the prompt length of the request that kept it (a reply's end and its warm pass: that reply's): a later turn's is longer
     used: u64, // the store's clock at its last keep or resume
-    seen: Seen = .{}, // wall-clock created and last-use times and resumes, for the dashboard (never policy)
+    seen: Seen = .{}, // dashboard timestamps and resumes; single-leaf reservation also reads its hit count
     resume_credit: u2 = 0, // bounded policy metadata, separate from dashboard history
     last: []u32, // the last prompt that kept or resumed it
     shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it

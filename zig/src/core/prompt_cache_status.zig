@@ -7,7 +7,7 @@ const chain = @import("rows_chain.zig");
 /// Set by the server before an engine loads when `--dashboard` is on; off, kept states are not named (no prefix hash).
 pub var named: std.atomic.Value(bool) = .init(false);
 
-/// An entry's wall-clock times and resumes: shown on the dashboard, never read by eviction (`used` orders that).
+/// An entry's wall-clock times and resumes. Single-leaf reservation reads only the hit count; `used` orders recency.
 pub const Seen = struct {
     id: chain.Stem = @splat(0), // the state's name stem: its `.st` file's name when the store keeps it on disk
     created_ms: i64 = 0,

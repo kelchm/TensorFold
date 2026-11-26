@@ -2,10 +2,11 @@
 const std = @import("std");
 const pc = @import("prompt_cache.zig");
 const policy = @import("prompt_cache_policy.zig");
-pub const Policy = enum { main, decayed_resume };
+pub const Policy = enum { main, decayed_resume, single_leaf };
 pub const Credit = struct { key: u64 = 0, n: usize = 0, at: u32 = 0, resumes: u2 = 0 };
 
 pub fn fromText(raw: ?[]const u8) Policy {
+    if (std.mem.eql(u8, raw orelse "", "single_leaf")) return .single_leaf;
     return if (std.mem.eql(u8, raw orelse "", "decayed_resume")) .decayed_resume else .main;
 }
 
