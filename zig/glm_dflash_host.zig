@@ -4,13 +4,54 @@ const glm = @import("glm");
 const registry = @import("core").contract.registry;
 const t = std.testing;
 
+test "glm dflash: the live-pricing setting accepts only supported modes" {
+    const Probe = struct {
+        var raw: ?[]const u8 = null;
+        fn get(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_DFLASH_LIVE_PRICES")) raw else null;
+        }
+    };
+    var issue: []const u8 = "";
+    for ([_][]const u8{ "0", "1", "2" }, 0..) |input, i| {
+        Probe.raw = input;
+        const settings = try glm.ranks.Settings.read(Probe.get, &issue);
+        try t.expectEqual(@as(u2, @intCast(i)), settings.dflash_live_prices);
+    }
+    for ([_][]const u8{ "3", "-1", "yes" }) |input| {
+        Probe.raw = input;
+        try t.expectError(error.BadSetting, glm.ranks.Settings.read(Probe.get, &issue));
+        try t.expect(std.mem.startsWith(u8, issue, "TF_GLM_DFLASH_LIVE_PRICES"));
+    }
+}
+
+test "glm dflash: live pricing needs copies and the external drafter; each mode has a distinct rank identity" {
+    var e: glm.engine.Engine = undefined;
+    var dr: glm.dflash.Drafter = undefined;
+    e.drafter = &dr;
+    e.mtp = true;
+    var a: glm.lanes.Lanes = .{ .x = .{ .e = &e, .link = undefined } };
+    const h: [32]u8 = @splat(0);
+    for (0..3) |n| {
+        const mode: u2 = @intCast(n);
+        a.live_prices = mode;
+        const m = a.factsWithCopies(true);
+        try t.expectEqual(@as(u32, if (n == 0) 0 else 4), m.lone_cost_tile);
+        try t.expectEqual(@as(@TypeOf(m.lone_probe), switch (n) { 0 => .all, 1 => .observed_only, else => .positive_chances }), m.lone_probe);
+        try t.expectEqual(@as(u32, 0), a.factsWithCopies(false).lone_cost_tile);
+        const fp = glm.ranks.Fingerprint.of(2, 0, .{ .dflash_live_prices = mode }, 8192, true, h, h, h);
+        try t.expectEqual(@as(u32, 1) + 8 * @as(u32, mode), fp.mtp);
+    }
+    e.drafter = null;
+    try t.expectEqual(@as(u32, 0), a.factsWithCopies(true).lone_cost_tile);
+}
+
 test "glm dflash: each optional decode switch has its own rank fingerprint across all eight combinations" {
     const ranks = glm.ranks;
     const h: [32]u8 = @splat(0);
     for (0..8) |i| {
         const s: ranks.Settings = .{ .dflash_only = i & 1 != 0, .l2pf = .{ .shared_first = i & 2 != 0 }, .exl3_decode = true, .exl3_nmajor = i & 4 != 0 };
         const f = ranks.Fingerprint.of(2, 0, s, 8192, true, h, h, h);
-        try t.expectEqual(@as(u32, 34), f.layout);
+        try t.expectEqual(@as(u32, 35), f.layout);
         try t.expectEqual(@as(u32, 1 | (@as(u32, @intFromBool(s.dflash_only)) << 2)), f.mtp);
         try t.expectEqual(@as(u32, 1 | (@as(u32, @intFromBool(s.l2pf.shared_first)) << 1)), f.l2pf[0]);
         try t.expectEqual(@as(u32, 2 | (@as(u32, @intFromBool(s.exl3_nmajor)) << 2)) | @intFromBool(s.pair_experts), f.pair_experts);

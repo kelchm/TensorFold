@@ -158,6 +158,7 @@ pub const rules = [_]Rule{
     .{ .name = "TF_GLM_PACKED_PROMPT_S2", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_ABSORB_MMA", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_KV_POW2", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_GLM_DFLASH_LIVE_PRICES", .scope = .glm, .kind = .u32, .max = 2, .forms = "0 (off), 1 (observed rounds) or 2 (also probe offered widths)" },
     .{ .name = "TF_GLM_DFLASH_ONLY", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_L2PF_SHARED_FIRST", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_DFLASH_Q4_DOWN", .scope = .glm, .kind = .flag, .forms = "0 or 1" },

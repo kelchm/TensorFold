@@ -317,7 +317,7 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
         try alloc.allocateDrafts(a, fixed, probs, costs, p.fixed, e.rule.row_cost.capRows(plans.len, anySampled(plans), @max(plans.len, e.cfg.batch_rows)), .{ .plain_ms = p.plain, .row_ms = p.row, .least_rows = e.rule.row_cost.leastRows(plans.len, anySampled(plans)) })
     else
         try alloc.allocateDrafts(a, fixed, probs, costs, overhead, if (explicit or live) @max(plans.len, e.cfg.batch_rows) else e.rule.row_cost.capRows(plans.len, anySampled(plans), @max(plans.len, e.cfg.batch_rows)), .{ .row_ms = if (explicit or live) 0 else e.rule.row_cost.extraMs(plans.len, anySampled(plans)), .least_rows = if (explicit or live) 0 else e.rule.row_cost.leastRows(plans.len, anySampled(plans)) });
-    const trial = if (live) lone_costs.probe(e, plans[0]) else null;
+    const trial = if (live) lone_costs.offeredProbe(e, plans[0], probs[0]) else null;
     if (trial) |count| {
         counts[0] = count;
         plans[0].cost_probe_rows = count + 1;

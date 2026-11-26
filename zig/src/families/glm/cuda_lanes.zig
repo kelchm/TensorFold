@@ -32,6 +32,7 @@ pub const Lanes = struct {
     x: follow.Leader,
     whole: bool = false, // prompt passes run whole (TF_GLM_PROMPT_STEPS=0): no other stream's round between chunks
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
+    live_prices: u2 = 0,
     long_copy_match: bool = false, // rank 0 selects candidate windows from the current request history
     calibrated_greedy: bool = false, // rank 0 scores DFlash2 candidates for greedy requests
     mtp_confidence: ?f64 = null, // --mtp-confidence: the MTP head's chains stop where their chance falls under it
@@ -129,6 +130,10 @@ pub const Lanes = struct {
     pub fn factsWithCopies(self: *Lanes, enabled: bool) lanes.Model {
         self.copy_confidence = enabled and (self.x.e.mtp or self.x.e.drafter != null);
         var m = copy_policy.apply(self.facts(), enabled, self.x.e.drafter == null and self.costs != null);
+        if (self.live_prices != 0 and enabled and self.x.e.drafter != null) {
+            m.lone_cost_tile = 4;
+            m.lone_probe = if (self.live_prices == 1) .observed_only else .positive_chances;
+        }
         if (self.long_copy_match and enabled and self.x.e.drafter != null) {
             m.fixed_copy_drafts = 15;
             m.copy_match = 8;

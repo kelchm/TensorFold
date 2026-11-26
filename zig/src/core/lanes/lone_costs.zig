@@ -52,10 +52,23 @@ pub fn prices(e: anytype, p: anytype) !Table {
 
 /// Keep overdue calibration through short offers; space later probes from the completed trial.
 pub fn probe(e: anytype, p: anytype) ?u32 {
+    return probeRows(e, p, p.count() + 1);
+}
+
+pub fn offeredProbe(e: anytype, p: anytype, chances: []const f64) ?u32 {
+    return switch (e.cfg.lone_probe) {
+        .all => probe(e, p),
+        .observed_only => null,
+        .positive_chances => probeRows(e, p, 1 + (std.mem.indexOfScalar(f64, chances, 0) orelse chances.len)),
+    };
+}
+
+/// Probe only widths the proposer made available. A zero-chance tail can encode its explicit stop.
+fn probeRows(e: anytype, p: anytype, offered: usize) ?u32 {
     const s = p.stream;
     if (s.rounds < s.cost_probe_after) return null;
     const samples = observed(s);
-    const most: u32 = @intCast(@min(p.count() + 1, e.cfg.batch_rows));
+    const most: u32 = @intCast(@min(offered, e.cfg.batch_rows));
     var retry: ?u32 = null;
     var earliest: u64 = std.math.maxInt(u64);
     var rows: u32 = 1;

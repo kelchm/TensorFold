@@ -383,7 +383,7 @@ fn finishRank(a: OpenArgs) !Loaded {
     own.link.asleep = cuda.tp_watch.open(); // the other ranks begin asleep (follow): the first step wakes them
     const calibrated = try @import("sys").environment.read(bool, "TF_GLM_DFLASH_CALIBRATED", false);
     const long_copy_match = try @import("sys").environment.read(bool, "TF_GLM_COPY_8_16", false);
-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = !steps, .alone = !shared, .mtp_confidence = o.mtp_confidence, .calibrated_greedy = calibrated, .long_copy_match = long_copy_match };
+    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = !steps, .alone = !shared, .mtp_confidence = o.mtp_confidence, .calibrated_greedy = calibrated, .long_copy_match = long_copy_match, .live_prices = set.dflash_live_prices };
     if (long_copy_match and own.copies and own.e.drafter != null) std.log.info("verified copies: prompt match 8, reply match 16, up to 15 drafts", .{});
     if (calibrated and own.e.drafter != null) std.log.info("DFlash2 greedy selector: edge 0.6, confidence temperature 2, chain cut {d}", .{try dflash.chainCut(true)});
     const extra: u64 = (if (o.drafter != null) dflash.ring_bytes else 0) + if (own.e.images) |v| v.streamBytes() else @as(usize, 0);

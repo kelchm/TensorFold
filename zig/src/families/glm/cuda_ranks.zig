@@ -9,6 +9,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 /// The forward's knobs a rank reads from its environment (the Python family's names and defaults).
 pub const Settings = struct {
     dflash_only: bool = false,
+    dflash_live_prices: u2 = 0,
     kv_pow2: bool = false,
     absorb_mma: bool = false,
     prompt_s2: bool = false,
@@ -59,6 +60,11 @@ pub const Settings = struct {
     /// `read` from a lookup with no blank text, so every name below and in l2pf's reader is unset when blank.
     fn readSet(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
         var s: Settings = .{};
+        const prices = @import("sys").environment.value(u32, "TF_GLM_DFLASH_LIVE_PRICES", get("TF_GLM_DFLASH_LIVE_PRICES"), 0) catch {
+            problem.* = "TF_GLM_DFLASH_LIVE_PRICES: 0, 1 or 2";
+            return error.BadSetting;
+        };
+        s.dflash_live_prices = @intCast(prices);
         s.exl3_decode = @import("sys").environment.value(bool, "TF_GLM_EXL3_DECODE", get("TF_GLM_EXL3_DECODE"), false) catch {
             problem.* = "TF_GLM_EXL3_DECODE: 0 or 1";
             return error.BadSetting;
@@ -260,7 +266,7 @@ fn wireOpens(get: *const fn ([:0]const u8) ?[]const u8) bool {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 34, // external-only MTP, shared-first prefetch and routed-expert traversal
+    layout: u32 = 35, // MTP also carries the DFlash2 single-stream pricing mode
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -359,7 +365,7 @@ pub const Fingerprint = extern struct {
             .pair = @intFromBool(s.pair),
             .pair_experts = @as(u32, @intFromBool(s.pair_experts)) | (@as(u32, @intFromBool(s.exl3_decode)) << 1) | (@as(u32, @intFromBool(s.exl3_nmajor)) << 2),
             .layers = s.layers,
-            .mtp = @as(u32, @intFromBool(mtp)) | (@as(u32, @intFromBool(s.dflash_only)) << 2),
+            .mtp = @as(u32, @intFromBool(mtp)) | (@as(u32, @intFromBool(s.dflash_only)) << 2) | (@as(u32, s.dflash_live_prices) << 3),
             .roce_multi = @intFromBool(s.roce_multi),
             .roce_wide = @intFromBool(s.roce_wide and world >= 3), // two ranks ask by default, so a lone TF_ROCE=1 there is no difference
             .draft_split = @intFromBool(s.draft_split and world >= 3), // two ranks split whatever it says
@@ -526,7 +532,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .pair => "TF_GLM_PROMPT_PAIR",
         .pair_experts => "TF_GLM_PAIR_EXPERTS / TF_GLM_EXL3_DECODE / TF_GLM_EXL3_N_MAJOR",
         .layers => "TF_GLM_LAYERS",
-        .mtp => "--no-drafts, --drafter or TF_GLM_DFLASH_ONLY differs across ranks",
+        .mtp => "--no-drafts, --drafter, TF_GLM_DFLASH_ONLY or TF_GLM_DFLASH_LIVE_PRICES differs across ranks",
         .vision => "--vision (or its image tokens) given to some ranks and not others",
         .video_tokens => "--vision-video-tokens",
         .max_images => "the image count limit",

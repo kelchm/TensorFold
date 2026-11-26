@@ -75,6 +75,31 @@ test "lone price: unseen widths retain measured tile jumps and full rounds are n
     }
 }
 
+test "lone price: observed windows do not force a trial, and active probes respect the proposer's stop" {
+    var cfg = try setup();
+    defer cfg.deinit(a);
+    var target: fake.Fake = .{ .gpa = a };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var e = Engine.init(a, &cfg, target.backend(), clock.clock());
+    defer e.deinit();
+    var s = try Stream.init(a, .{ .id = "offered-prefix", .prompt = &.{3}, .max_new = 128 });
+    defer s.deinit(a);
+    const p: win.Plan = .{ .stream = &s, .position = 1, .kind = .head, .tokens = &.{ 2, 3, 4, 5, 6, 7, 8 } };
+    const chances = [_]f64{ 0.9, 0.7, 0.5, 0, 0, 0, 0 };
+    s.rounds = 16;
+    try e.rule.observeCost(0, 20, false, win.who(&s));
+    cfg.lone_cost_tile = 4;
+    cfg.lone_probe = .observed_only;
+    try std.testing.expectEqual(@as(?u32, null), own.offeredProbe(&e, p, &chances));
+    cfg.lone_probe = .positive_chances;
+    try std.testing.expectEqual(@as(?u32, 3), own.offeredProbe(&e, p, &chances));
+    try e.rule.observeCost(3, 35, false, win.who(&s));
+    try std.testing.expectEqual(@as(?u32, null), own.offeredProbe(&e, p, &chances));
+    cfg.lone_probe = .all;
+    try std.testing.expectEqual(@as(?u32, 7), own.offeredProbe(&e, p, &chances));
+}
+
 test "lone price: tile probes are bounded, respect available rows, and stop after calibration" {
     var cfg = try setup();
     defer cfg.deinit(a);

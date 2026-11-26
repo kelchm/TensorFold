@@ -11,6 +11,8 @@ pub const Cost = alloc.Cost;
 pub const default_prior = [_]f64{ 0.85, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5 };
 
 /// What a backend reports about its loaded model: the attributes the Python engine reads at setup.
+pub const LoneProbe = enum { all, observed_only, positive_chances };
+
 pub const Model = struct {
     fixed_draft_block: bool = false, // a positive draft depth runs one fixed block pass
     learn_row_costs: bool = false, // shared_costs came from another machine: learn what a row costs here
@@ -61,6 +63,7 @@ pub const Model = struct {
     join_drafts: bool = false, // with join_tail: a round's joined prompts' first drafts in one call (Engine.finishStreams)
     replay_runs: bool = false, // a round's finals go to the backend together first (Backend.finals)
     lane_costs: []const Cost = &.{}, // a lone stream's window ms by rows, up to its widest tree (timed at load)
+    lone_probe: LoneProbe = .all,
     lone_cost_tile: u32 = 0, // live lone-window pricing probes at these target row boundaries (0: off)
     context_copies: bool = false, // a lone head window shares its agreeing copy path and appends the rest
     copy_match: i64 = 8, // matching history tokens a copy needs
@@ -114,6 +117,7 @@ pub const Config = struct {
     draft_step_ms: f64 = 0, // Model.draft_step_ms
     shared_drafts: u32 = 0, // Model.shared_drafts
     shared_mtp_cap: u32 = 0, // Model.shared_mtp_cap
+    lone_probe: LoneProbe = .all,
     lone_cost_tile: u32 = 0, // Model.lone_cost_tile
     context_copies: bool = false, // Model.context_copies, within the existing verification width
     copy_reply_match: u32 = 0, // Minimum matching reply suffix when prompt-aware copies are enabled.
@@ -163,6 +167,7 @@ pub const Config = struct {
             .copy_reply_match = m.copy_reply_match,
             .lone_copies = m.lone_copies,
             .lone_cost_tile = m.lone_cost_tile,
+            .lone_probe = m.lone_probe,
             .family_width = width,
             .max_copy = max_copy,
             .own_copy_rates = m.own_copy_rates,
