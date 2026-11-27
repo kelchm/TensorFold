@@ -48,7 +48,13 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             s.p = b.kproj;
             try kda_block.project(f.set(), f.stream, k, s, b.normed, c.hidden, rows);
             if (f.prefetch()) |p| try p.fork(f.stream, l.index, .o); // TF_GLM_L2PF: o read into L2 while the chains run
-            for (r.segs) |g| {
+            // decode on the three-kernel chain: every segment in one launch a kernel, q and y apart (kda.chainSegs)
+            const wide = chainWide(f, r.segs.len);
+            const batched = kda.useSegs(b.prefill, wide, f.m.kda.segs and f.m.kda.hasSegs(), r.segs.len);
+            var t: kda.Segs = undefined;
+            var copies: kda.Copies = undefined; // batched: every segment's rows in one copy launch when all fit
+            var copy_all = batched and f.m.kda.hasCopySegs();
+            for (r.segs, 0..) |g, i| {
                 const st = g.st;
                 const cur = st.cur[li];
                 var v = s;
@@ -65,13 +71,24 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
                     continue;
                 }
                 v.p = st.proj + li * st.proj_layer * 2; // the window's rows stay with the layer until its commit
-                try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(v.p, b.kproj + g.row0 * w * 2, g.rows * w * 2, f.stream.handle), "cuMemcpyDtoDAsync");
+                const src = b.kproj + g.row0 * w * 2;
+                if (batched) {
+                    copy_all = copy_all and kda.copyFits(src, v.p, g.rows * w * 2);
+                    copies.c[i] = .{ .src = src, .dst = v.p, .n = @intCast(g.rows * w * 2 / 16) };
+                } else try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(v.p, src, g.rows * w * 2, f.stream.handle), "cuMemcpyDtoDAsync");
                 const kv = li * fw.window_rows * st.heads * kda.dk;
                 v.saves.k = st.save_k + kv * 4;
                 v.saves.v = st.save_v + kv * 2;
                 v.saves.g = st.save_g + kv * 4;
                 v.saves.b = st.save_b + li * fw.window_rows * st.heads * 4;
-                try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), chainWide(f, r.segs.len));
+                if (batched) {
+                    t.s[i] = kda_block.segOf(k, v, g.rows, conv, st.recAt(cur, li), g.row0);
+                } else try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), wide);
+            }
+            if (batched) {
+                if (copy_all) try kda.copySegs(&f.m.kda, f.stream, &copies, r.segs.len) else for (r.segs, copies.c[0..r.segs.len]) |g, x|
+                    try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(x.dst, x.src, g.rows * w * 2, f.stream.handle), "cuMemcpyDtoDAsync");
+                try kda_block.chainSegs(&f.m.kda, f.stream, k, &t, r.segs.len);
             }
             if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
         },
@@ -105,4 +122,7 @@ test "shared KDA chain uses shared_kda_wide on multi-stream segments and kda_wid
     f.shared_kda_wide = true;
     try std.testing.expect(!chainWide(&f, 1));
     try std.testing.expect(chainWide(&f, 2));
+    // TF_GLM_SHARED_KDA_WIDE=0 disables wide chains and therefore also prevents chainSegs batching on shared windows.
+    try std.testing.expect(!kda.useSegs(false, false, true, 4));
+    try std.testing.expect(kda.useSegs(false, true, true, 4));
 }

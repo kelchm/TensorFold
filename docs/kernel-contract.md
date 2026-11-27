@@ -756,3 +756,12 @@ Only unsplit prompt calls select K32; fused slices retain the parent K64 tile.
 Each new control launches K32 for its output type at small and production row counts.
 `qmmf-prompt-bench` times the 64-row lane, prompt16, the parent K64 tile and K32 on each Flash Next BF16 shape.
 Measured nvcc 13.0 resources cover both K32 entries on sm_120 and sm_121; later compiler receipts remain pending.
+
+GLM's shared decode windows run every segment's KDA chain in one launch a kernel (`tf_glm_kda_prep_segs`,
+`tf_glm_kda_step_segs`, `tf_glm_kda_step4_segs`, `tf_glm_kda_step2_segs` and `tf_glm_kda_out_segs`, the segment in
+grid z). They register as byte replacements of `kda.chain`'s three per-segment launches, covering out rows, every
+segment's state and the k, v, decay and beta saves across ragged 1 to 16 segment windows at 32 and 22 heads with
+padded projection rows and nonfinite inputs. Two controls corrupt the table (reading the next segment's state, or
+sharing row 0's q and y scratch). The segments' projection rows reach their streams in one `tf_glm_kda_copy_segs`
+launch when 16-byte aligned, a byte replacement of `cuMemcpyDtoDAsync` a segment over poisoned gaps; its control
+copies each segment one unit short. `TF_GLM_KDA_SEGS=0` keeps the per-segment launches.

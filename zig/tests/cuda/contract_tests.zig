@@ -525,6 +525,8 @@ fn registered(gpu: check.Gpu, only: []const []const u8, t0: *i96) !g.Tally {
     defer glm_top1.destroy(a);
     const glm_q4_f32 = try @import("contract_glm_q4_f32.zig").Suite.create(a, gpu, s, mods[1], mods[4], cap, &kernels);
     defer glm_q4_f32.destroy(a);
+    const glm_kda_segs = try @import("contract_glm_kda_segs.zig").Group.create(a, gpu, s, &kernels);
+    defer glm_kda_segs.destroy(a);
     var glm_ops = try cuda.Module.load(gpu.d, kk.glm_ops);
     defer glm_ops.unload();
     var glm_tokens = glm_index_k.Tokens{ .rig = .{ .gpu = gpu, .s = s }, .f = try glm_ops.function("tf_glm_dsa_tokens") };

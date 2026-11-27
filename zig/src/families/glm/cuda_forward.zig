@@ -79,6 +79,7 @@ pub const Modules = struct {
         m.kda = try kda.Kernels.load(m.mods[0]);
         m.kda.pdl = @import("cuda_pdl.zig").on();
         m.kda.step_warps = kda.stepWarpsSetting(try @import("sys").environment.read(usize, "TF_GLM_KDA_STEP_WARPS", 0));
+        m.kda.segs = try @import("sys").environment.read(bool, "TF_GLM_KDA_SEGS", true);
         m.experts = try experts.Kernels.load(d, m.mods[2], @intCast(try ctx.attribute(.multiprocessor_count)), block32);
         errdefer m.experts.unload();
         m.copy_rows = try m.mods[1].function("tf_glm_copy_rows");

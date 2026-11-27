@@ -38,4 +38,5 @@ pub const rules = [_]Rule{
     .{ .name = "TF_GLM_KDA_STEP_WARPS", .scope = .glm, .kind = .word, .trim = " \t", .words = &.{ "auto", "8", "4", "2" }, .forms = "auto, 8, 4 or 2" },
     .{ .name = "TF_GLM_HC_SPLIT", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_HC_PART", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_GLM_KDA_SEGS", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
 };

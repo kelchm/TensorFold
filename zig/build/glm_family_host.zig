@@ -40,6 +40,12 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
     const startup_run = b.addRunArtifact(b.addTest(.{ .root_module = startup }));
     b.step("test-glm-startup-host", "Page refusals propagate through rank liveness before engine construction").dependOn(&startup_run.step);
     step.dependOn(&startup_run.step);
+    const segs_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM KDA segs:"} }));
+    const segs_contract = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_glm_kda_segs.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm_cuda", .module = glm }, .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } });
+    const segs_step = b.step("test-glm-kda-segs-host", "A shared window's KDA segment table, its batching rule and its contract's planted faults without devices");
+    segs_step.dependOn(&segs_run.step);
+    segs_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = segs_contract, .filters = &.{"GLM KDA segs contract:"} })).step);
+    step.dependOn(segs_step);
     const thin_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM thin weights:"} }));
     b.step("test-glm-thin-weights-host", "TF_GLM_LAYERS's admission bytes by tensor from synthetic shard headers").dependOn(&thin_run.step);
     step.dependOn(&thin_run.step);
