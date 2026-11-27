@@ -25,6 +25,7 @@ const switches = [_]Name{
     .{ .name = "TF_GLM_EXL3_N_MAJOR" },
     .{ .name = "TF_GLM_PACKED_PROMPT_S2" },
     .{ .name = "TF_GLM_PAIR_DFLASH" },
+    .{ .name = "TF_GLM_ROCE_FUSE" },
     .{ .name = "TF_GLM_PDL", .default = true },
     .{ .name = "TF_GLM_PROMPT_STEPS", .default = true },
     .{ .name = "TF_GLM_MULTI_PREFILL" },

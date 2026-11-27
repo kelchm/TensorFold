@@ -209,6 +209,7 @@ const stock_rules = [_]Rule{
     .{ .name = "TF_GLM_EXL3_N_MAJOR", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_PACKED_PROMPT_S2", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_PAIR_DFLASH", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_GLM_ROCE_FUSE", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_PDL", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_QWEN_PDL", .scope = .common, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_PROMPT_STEPS", .scope = .glm, .kind = .flag, .forms = "0 or 1" },

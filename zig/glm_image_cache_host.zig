@@ -441,6 +441,7 @@ fn checkInterruptedPrefix(planned: []const u32) !void {
     c.e.stream = .{ .d = &d, .handle = null };
     c.e.lib = &lib;
     c.e.comm = null;
+    c.e.group = null;
     c.e.dropped = .empty;
     c.e.announce = 0;
     c.e.share.rank = 0;

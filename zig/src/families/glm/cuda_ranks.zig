@@ -31,6 +31,7 @@ pub const Settings = struct {
     dense_bits: u8 = 16, // TF_GLM_DENSE_BITS: the dense linears packed at load to 4, 6 or 8 bits (16: bf16)
     head_bits: u8 = 16, // TF_GLM_HEAD_BITS: the head, likewise
     roce_multi: bool = false, // TF_GLM_ROCE_MULTI: 1 (three ranks or more: small all-gathers on fabric/tp's multirank RoCE beside NCCL) or 0
+    roce_fuse: bool = false, // TF_GLM_ROCE_FUSE=1: TP2 whole-window gather + HC post or MTP residual in one kernel
     roce_wide: bool = false, // TF_ROCE=1: at three ranks or more the RoCE gather and the drafter MLP split (two ranks: always)
     kv_host: u8 = 0, // TF_GLM_KV_HOST=1: KV pages in host memory (1); with TF_GLM_KV_HOST_SHARED=1, one copy a host (2)
     kv_host_gib: f64 = 0, // TF_GLM_KV_HOST_GIB: the host pages' GiB (0: one full window)
@@ -207,7 +208,7 @@ pub const Settings = struct {
                 return error.BadSetting;
             };
         }
-        inline for (.{ .{ "TF_GLM_EXL3_DECODE", "exl3_decode" }, .{ "TF_GLM_EXL3_N_MAJOR", "exl3_nmajor" }, .{ "TF_GLM_PACKED_PROMPT_S2", "prompt_s2" }, .{ "TF_GLM_DFLASH_SNAP_CONTEXT", "dflash_snap_context" }, .{ "TF_GLM_PAIR_DFLASH", "pair_dflash" } }) |flag| {
+        inline for (.{ .{ "TF_GLM_EXL3_DECODE", "exl3_decode" }, .{ "TF_GLM_EXL3_N_MAJOR", "exl3_nmajor" }, .{ "TF_GLM_PACKED_PROMPT_S2", "prompt_s2" }, .{ "TF_GLM_DFLASH_SNAP_CONTEXT", "dflash_snap_context" }, .{ "TF_GLM_PAIR_DFLASH", "pair_dflash" }, .{ "TF_GLM_ROCE_FUSE", "roce_fuse" } }) |flag| {
             @field(s, flag[1]) = @import("sys").environment.value(bool, flag[0], get(flag[0]), false) catch {
                 problem.* = flag[0] ++ ": 0 or 1";
                 return error.BadSetting;
@@ -265,7 +266,7 @@ pub fn toolPieces(s: *Settings, comptime get: *const fn ([:0]const u8) ?[]const 
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 31, // 30, plus drafter_bits, drafter_checkpoint, and pair_dflash bit in pair
+    layout: u32 = 32, // 31, plus roce_fuse
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -296,6 +297,7 @@ pub const Fingerprint = extern struct {
     bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
     capacity: u64, // tokens a sequence holds
     drafter_bits: u64 = 0, // --drafter-bits (0: no drafter, 16: bf16, 4: q4)
+    roce_fuse: u64 = 0, // TF_GLM_ROCE_FUSE: whole-window posts fuse only where every rank enabled TP2 RoCE fusion
     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
     heat_low: f64,
     kv_host_gib: f64 = 0, // TF_GLM_KV_HOST_GIB: each rank's row marks span the host pages rank 0 counts
@@ -336,6 +338,7 @@ pub const Fingerprint = extern struct {
         bits,
         capacity,
         drafter_bits,
+        roce_fuse,
         heat_high,
         heat_low,
         kv_host_gib,
@@ -372,6 +375,7 @@ pub const Fingerprint = extern struct {
             .layers = s.layers,
             .mtp = @as(u32, @intFromBool(mtp)) | (@as(u32, @intFromBool(s.dflash_only)) << 2) | (@as(u32, @intFromBool(s.dflash_q4_down)) << 3) | (@as(u32, @intFromBool(s.dflash_snap_context)) << 4),
             .roce_multi = @intFromBool(s.roce_multi),
+            .roce_fuse = @intFromBool(s.roce_fuse),
             .roce_wide = @intFromBool(s.roce_wide and world >= 3), // two ranks ask by default, so a lone TF_ROCE=1 there is no difference
             .draft_split = @intFromBool(s.draft_split and world >= 3), // two ranks split whatever it says
             .kv_host = s.kv_host,
@@ -428,6 +432,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "bits",
             "capacity",
             "drafter_bits",
+            "roce_fuse",
             "heat_high",
             "heat_low",
             "kv_host_gib",
@@ -549,6 +554,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .max_videos => "the video count limit",
         .max_frames => "the frame limit",
         .roce_multi => "TF_GLM_ROCE_MULTI",
+        .roce_fuse => "TF_GLM_ROCE_FUSE",
         .roce_wide => "TF_ROCE=1 at three ranks or more (the RoCE gather and the drafter split)",
         .draft_split => "TF_GLM_DRAFT_SPLIT=1 at three ranks or more (the drafter split)",
         .kv_host => "TF_GLM_KV_HOST or TF_GLM_KV_HOST_SHARED",
