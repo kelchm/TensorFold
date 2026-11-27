@@ -75,6 +75,8 @@ test {
     _ = @import("cuda_ranks_test.zig");
     _ = @import("cuda_ranks_p2_test.zig");
     _ = @import("cuda_ranks_roce_test.zig");
+    _ = @import("cuda_hc_fuse_test.zig");
+    _ = @import("cuda_router_fuse_test.zig");
     _ = @import("cuda_env.zig");
     _ = @import("cuda_taps_tp_test.zig");
     _ = @import("cuda_pdl.zig");

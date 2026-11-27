@@ -44,6 +44,7 @@ pub const Settings = struct {
     kv_live_half: bool = false, // TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone (cuda_snapshot_layout.zig)
     draft_split: bool = false, // TF_GLM_DRAFT_SPLIT=1: three ranks or more split the drafter MLP without TF_ROCE=1
     shared_side: bool = true, // TF_GLM_SHARED_SIDE: decode window shared expert on its own stream; same bytes, ranks may differ
+    hc_fuse: bool = false, // TF_GLM_HC_FUSE: prompt hc_post writes the next hc_pre's partials; same bytes, ranks may differ
 
     /// Whether three ranks or more split the DFlash2 drafter's MLP (dflash.mlpSplit's `wide`); two ranks always do.
     pub fn draftWide(s: Settings) bool {
@@ -206,7 +207,7 @@ pub const Settings = struct {
                 return error.BadSetting;
             };
         }
-        inline for (.{ .{ "TF_GLM_DFLASH_ONLY", "dflash_only" }, .{ "TF_GLM_DFLASH_Q4_DOWN", "dflash_q4_down" }, .{ "TF_GLM_EXL3_DECODE", "exl3_decode" }, .{ "TF_GLM_EXL3_N_MAJOR", "exl3_nmajor" }, .{ "TF_GLM_PACKED_PROMPT_S2", "prompt_s2" }, .{ "TF_GLM_DFLASH_SNAP_CONTEXT", "dflash_snap_context" }, .{ "TF_GLM_PAIR_DFLASH", "pair_dflash" }, .{ "TF_GLM_ROCE_FUSE", "roce_fuse" } }) |flag| {
+        inline for (.{ .{ "TF_GLM_DFLASH_ONLY", "dflash_only" }, .{ "TF_GLM_DFLASH_Q4_DOWN", "dflash_q4_down" }, .{ "TF_GLM_EXL3_DECODE", "exl3_decode" }, .{ "TF_GLM_EXL3_N_MAJOR", "exl3_nmajor" }, .{ "TF_GLM_PACKED_PROMPT_S2", "prompt_s2" }, .{ "TF_GLM_DFLASH_SNAP_CONTEXT", "dflash_snap_context" }, .{ "TF_GLM_PAIR_DFLASH", "pair_dflash" }, .{ "TF_GLM_ROCE_FUSE", "roce_fuse" }, .{ "TF_GLM_HC_FUSE", "hc_fuse" } }) |flag| {
             @field(s, flag[1]) = @import("sys").environment.value(bool, flag[0], get(flag[0]), false) catch {
                 problem.* = flag[0] ++ ": 0 or 1";
                 return error.BadSetting;

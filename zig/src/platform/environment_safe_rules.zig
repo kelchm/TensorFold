@@ -43,5 +43,7 @@ pub const rules = [_]Rule{
     .{ .name = "TF_GLM_SHARED_SLOT", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_MM_FAST4", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_DENSE_PRUNE", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_GLM_HC_FUSE", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_GLM_ROUTER_FUSE", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_EXL3_PROMPT_GU", .scope = .glm, .kind = .word, .trim = " \t", .words = &.{ "0", "pc" }, .forms = "0 or pc" },
 };

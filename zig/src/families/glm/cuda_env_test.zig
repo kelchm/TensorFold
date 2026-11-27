@@ -43,6 +43,8 @@ const switches = [_]Name{
     .{ .name = "TF_GLM_SHARED_SLOT" },
     .{ .name = "TF_GLM_MM_FAST4" },
     .{ .name = "TF_GLM_DENSE_PRUNE", .default = true },
+    .{ .name = "TF_GLM_HC_FUSE" },
+    .{ .name = "TF_GLM_ROUTER_FUSE" },
 };
 const counts = [_][:0]const u8{"TF_GLM_DFLASH2_LOG"};
 const reals = [_][:0]const u8{ "TF_GLM_DRAFT_CONFIDENCE", "TF_GLM_SHARED_DRAFT_CONFIDENCE" };

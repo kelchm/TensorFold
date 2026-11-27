@@ -75,6 +75,8 @@ pub const cuda_pending = @import("qwen_whole_records.zig").records ++
     @import("glm_hc_split_records.zig").records ++
     @import("glm_prompt_records.zig").records ++
     @import("glm_mla_records.zig").records ++
+    @import("glm_hc_fuse_records.zig").records ++
+    @import("glm_router_fuse_records.zig").records ++
     @import("h3_image_cuda_records.zig").records;
 pub const metal_before = @import("fsr_records.zig").metal ++
     @import("scale_index_records.zig").metal ++

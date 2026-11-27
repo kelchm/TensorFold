@@ -43,6 +43,8 @@ pub const Kernels = struct {
     rank_sum: cuda.Function,
     hc_post: cuda.Function,
     hc_post_own: cuda.Function,
+    hc_post_partial: cuda.Function, // TF_GLM_HC_FUSE: hc_post and the next site's hc_partial in one launch
+    hc_post_partial_own: cuda.Function, // split prefill's fused hc_post + hc_partial with rank me's own partial
     combine: cuda.Function,
     combine_tail: cuda.Function,
     slice_sum: cuda.Function,
@@ -57,6 +59,7 @@ pub const Kernels = struct {
     group_sums: cuda.Function,
     topk: cuda.Function,
     router_tile: cuda.Function,
+    router_fused: cuda.Function, // TF_GLM_ROUTER_FUSE: router_tile's slices added in the block, slice_sum's bytes
     hc_partial: cuda.Function,
     hc_partial8: cuda.Function,
     hc_partial8_o2: ?cuda.Function = null, // its bytes from 13 blocks of two dots a K block (hc_part)
@@ -100,6 +103,7 @@ pub const Kernels = struct {
     hc_split: bool = true, // TF_GLM_HC_SPLIT: a decode window's hc_finish on the split schedule (the same bits)
     hc_part: bool = true, // TF_GLM_HC_PART: decode windows to hc_part_rows rows take tf_glm_hc_partial8_o2
     dense_prune: bool = true, // TF_GLM_DENSE_PRUNE: dense attention skips rows sparse attention writes (dsa_block)
+    router_fuse: bool = false, // TF_GLM_ROUTER_FUSE: a prompt call's router in one launch (routerFused; same bits)
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
@@ -114,6 +118,7 @@ pub const Kernels = struct {
         k.hc_split = try env.read(bool, "TF_GLM_HC_SPLIT", true);
         k.hc_part = try env.read(bool, "TF_GLM_HC_PART", true);
         k.dense_prune = try env.read(bool, "TF_GLM_DENSE_PRUNE", true);
+        k.router_fuse = try env.read(bool, "TF_GLM_ROUTER_FUSE", false);
         try k.bmm_tile.allowDynamicShared(bmm_tile_smem);
         try k.bmm_tile1.allowDynamicShared(bmm_tile1_smem[1]);
         try k.chunks_16.allowDynamicShared(chunksSmem(16));
@@ -225,12 +230,24 @@ pub const router_ks = 8;
 /// Shared bytes tf_glm_router_tile stages (common/router_mma.cuh): two stages of 64 rows and 32 experts by 64 + 8.
 pub const router_tile_smem: u32 = 2 * (64 + 32) * (64 + 8) * 2;
 
+/// The fewest 64 x 32 tiles a fused router call takes: three blocks on each of the GB10's 48 SMs, one full wave.
+pub const router_fuse_blocks = 144;
+
+/// Whether glue.router takes tf_glm_router_fused: TF_GLM_ROUTER_FUSE, a prompt call, aligned rows, a wave of tiles.
+pub fn routerFused(set: Set, x: u64, x_stride: usize, m: usize, ne: usize) bool {
+    if (!set.prompt or !set.glue.router_fuse or x % 16 != 0 or x_stride % 8 != 0) return false;
+    return @as(usize, cdiv(m, 64)) * cdiv(ne, 32) >= router_fuse_blocks;
+}
+
 /// glue.router: out [m][ne] fp32 = x . w rows; d a multiple of router_ks x 64, rows on 16 bytes; K slices in `part`.
 pub fn router(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, part: u64, m: usize, d: usize, ne: usize) !void {
     if (d % (router_ks * 64) != 0) return error.RouterWidth; // the Python family's single-pass _router: no GLM width
     if (x % 16 != 0 or x_stride % 8 != 0 or w % 16 != 0) return error.RowShape; // the tiles stage rows by cp.async
+    const fused = routerFused(set, x, x_stride, m, ne);
     var a: cuda.Args = .{};
-    inline for (.{ x, w, part, i64of(m), i64of(x_stride), i64of(d), i64of(ne), @as(c_int, router_ks) }) |v| a.add(v);
+    inline for (.{ x, w, if (fused) out else part, i64of(m), i64of(x_stride), i64of(d), i64of(ne), @as(c_int, router_ks) }) |v| a.add(v);
+    // the slices in order in each block, straight into out; expert tiles along x, so a row tile's blocks run together
+    if (fused) return cuda_pdl.launch(set.glue.router_fused, .{ .grid = .{ .x = cdiv(ne, 32), .y = cdiv(m, 64) }, .block = .{ .x = 128 } }, stream, &a);
     try cuda_pdl.launch(set.glue.router_tile, .{ .grid = .{ .x = cdiv(m, 64), .y = cdiv(ne, 32), .z = router_ks }, .block = .{ .x = 128 }, .shared = router_tile_smem }, stream, &a);
     try sliceSum(set, stream, part, out, m * ne, router_ks, true);
 }
@@ -285,6 +302,11 @@ pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale:
         a.add(i64of(rows));
         try cuda_pdl.launch(set.glue.hc_partial, .{ .grid = .{ .x = cdiv(rows, 4), .y = hc_blocks }, .block = .{ .x = 128 } }, stream, &a);
     }
+    try hcFinish(set, stream, x, base, scale, norm, out, xs, post, comb, part, eps, hc_eps, iters, rows);
+}
+
+/// hc_pre's second launch alone, on the K blocks' partials already in `part` (hcPre's first, or hcPostPartial).
+pub fn hcFinish(set: Set, stream: cuda.Stream, x: u64, base: u64, scale: u64, norm: Norm, out: u64, xs: u64, post: u64, comb: u64, part: u64, eps: f32, hc_eps: f32, iters: usize, rows: usize) !void {
     const split = set.glue.hc_split and rows < hc_prompt_rows;
     const f, const w = switch (norm) {
         .bf16 => |p| .{ if (split) set.glue.hc_finish_split orelse set.glue.hc_finish else set.glue.hc_finish, p },
@@ -293,6 +315,26 @@ pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale:
     var b: cuda.Args = .{};
     inline for (.{ x, part, base, scale, w, out, xs, post, comb, eps, hc_eps, @as(c_int, hc_blocks), cint(iters) }) |v| b.add(v);
     try cuda_pdl.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &b);
+}
+
+/// TF_GLM_HC_FUSE: hcPost, then the next site's hc_partial (`fn_w`) into `part` for hcFinish; same bytes, x read once.
+pub fn hcPostPartial(set: Set, stream: cuda.Stream, x: u64, xout: u64, g: u64, post: u64, comb: u64, fn_w: u64, part: u64, rows: usize, d: usize, s: usize, world: usize) !void {
+    if (d != 4096 or s != 4) return error.HcShape;
+    if (rows < hc_prompt_rows) return error.HcFuseRows; // hcPre's decode rows run hc_partial8
+    inline for (.{ x, xout, g, fn_w }) |p| if (p % 16 != 0) return error.RowsUnaligned;
+    var a: cuda.Args = .{};
+    inline for (.{ x, xout, g, post, comb, fn_w, part, i64of(rows * d), cint(world), i64of(rows) }) |v| a.add(v);
+    try cuda_pdl.launch(set.glue.hc_post_partial, .{ .grid = .{ .x = cdiv(rows, 4), .y = @intCast(d / 1024) }, .block = .{ .x = 512 } }, stream, &a);
+}
+
+/// Split prefill's TF_GLM_HC_FUSE: hcPostOwn then hc_partial (`fn_w`), rank me reading `own` in place.
+pub fn hcPostPartialOwn(set: Set, stream: cuda.Stream, x: u64, xout: u64, g: u64, post: u64, comb: u64, fn_w: u64, part: u64, rows: usize, d: usize, s: usize, world: usize, own: u64, me: usize) !void {
+    if (d != 4096 or s != 4) return error.HcShape;
+    if (rows < hc_prompt_rows) return error.HcFuseRows;
+    inline for (.{ x, xout, g, fn_w, own }) |p| if (p % 16 != 0) return error.RowsUnaligned;
+    var a: cuda.Args = .{};
+    inline for (.{ x, xout, g, post, comb, fn_w, part, i64of(rows * d), cint(world), i64of(rows), own, cint(me) }) |v| a.add(v);
+    try cuda_pdl.launch(set.glue.hc_post_partial_own, .{ .grid = .{ .x = cdiv(rows, 4), .y = @intCast(d / 1024) }, .block = .{ .x = 512 } }, stream, &a);
 }
 
 /// glue.hc_post: branch = bf16(`g`, rank 0 first); xout[s] = bf16(post[s] branch + sum_t comb[t][s] x[t]); x may alias.
@@ -373,6 +415,16 @@ test "the wrappers' shape rules as glue.py's" {
     try std.testing.expectError(error.NoSwigluBlock, swigluBlock(96));
     try std.testing.expectEqual(@as(i64, 512), pow2(288 + 1)); // _topk's BLOCK for 288 experts
     try std.testing.expectEqual(@as(i64, 16), pow2(8 + 1)); // its SLOTP for top-8 and the shared slot
+}
+
+test "hcPostPartial takes prompt calls of 4 streams of 4096 on 16-byte rows only, before any launch" {
+    const set: Set = .{ .glue = undefined };
+    const s: cuda.Stream = undefined;
+    try std.testing.expectError(error.HcFuseRows, hcPostPartial(set, s, 0, 0, 0, 0, 0, 0, 0, hc_prompt_rows - 1, 4096, 4, 2));
+    try std.testing.expectError(error.HcShape, hcPostPartial(set, s, 0, 0, 0, 0, 0, 0, 0, hc_prompt_rows, 2048, 4, 2));
+    try std.testing.expectError(error.RowsUnaligned, hcPostPartial(set, s, 8, 8, 0, 0, 0, 0, 0, hc_prompt_rows, 4096, 4, 2));
+    try std.testing.expectError(error.HcFuseRows, hcPostPartialOwn(set, s, 0, 0, 0, 0, 0, 0, 0, hc_prompt_rows - 1, 4096, 4, 2, 0, 0));
+    try std.testing.expectError(error.RowsUnaligned, hcPostPartialOwn(set, s, 0, 0, 0, 0, 0, 0, 0, hc_prompt_rows, 4096, 4, 2, 8, 0));
 }
 
 test "Kernels.load resolves optional tf_glm_top1_rows when present and leaves it null on older fatbins" {

@@ -35,6 +35,8 @@ pub const Sets = struct {
     glm_mm: *@import("contract_glm_mm.zig").Prompts,
     glm_fp8_attn: *@import("contract_glm_fp8_attn.zig").Group,
     glm_fused_attn: *@import("contract_glm_fused_attn.zig").Group,
+    glm_hc_fuse: *@import("contract_glm_hc_fuse.zig").Group,
+    glm_router_fuse: *@import("contract_glm_router_fuse.zig").Group,
     zonos3: *@import("contract_zonos3.zig").Set,
     hy4_ihc_hc: *@import("contract_hy4_hc.zig").Set,
     topk_rows: *@import("contract_topk_rows.zig").Set,
@@ -103,6 +105,10 @@ pub const Sets = struct {
         errdefer glm_fp8_attn.destroy(a);
         const glm_fused_attn = try @import("contract_glm_fused_attn.zig").Group.create(a, gpu, s, glm_fns, list);
         errdefer glm_fused_attn.destroy(a);
+        const glm_hc_fuse = try @import("contract_glm_hc_fuse.zig").Group.create(a, gpu, s, glm_fns, controls, list);
+        errdefer glm_hc_fuse.destroy(a);
+        const glm_router_fuse = try @import("contract_glm_router_fuse.zig").Group.create(a, gpu, s, glm_fns, controls, list);
+        errdefer glm_router_fuse.destroy(a);
         const zonos3, const hy4_ihc_hc = try initPair(
             @import("contract_zonos3.zig").Set,
             @import("contract_hy4_hc.zig").Set,
@@ -144,6 +150,8 @@ pub const Sets = struct {
             .glm_mm = glm_mm,
             .glm_fp8_attn = glm_fp8_attn,
             .glm_fused_attn = glm_fused_attn,
+            .glm_hc_fuse = glm_hc_fuse,
+            .glm_router_fuse = glm_router_fuse,
             .zonos3 = zonos3,
             .hy4_ihc_hc = hy4_ihc_hc,
             .topk_rows = topk_rows,
@@ -158,6 +166,8 @@ pub const Sets = struct {
         sets.topk_rows.deinit();
         sets.hy4_ihc_hc.deinit();
         sets.zonos3.deinit();
+        sets.glm_router_fuse.destroy(sets.a);
+        sets.glm_hc_fuse.destroy(sets.a);
         sets.glm_fused_attn.destroy(sets.a);
         sets.glm_fp8_attn.destroy(sets.a);
         sets.glm_mm.destroy();
