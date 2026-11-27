@@ -85,9 +85,14 @@ pub const Kernels = struct {
     side: ?Side = null, // TF_GLM_SHARED_SIDE: decode window shared expert on its own stream (null: inline)
 };
 
-/// Whether the block forks its shared expert: a decode window with a side stream and side partials (prompts inline).
-pub fn forks(k: Kernels, s: Scratch, prompt: bool) bool {
-    return k.side != null and !prompt and s.side_part != 0;
+fn isTfq3(p: projection.Proj) bool {
+    return p == .tfq3 or p == .tfq3_pair;
+}
+
+/// Whether the block forks its shared expert: decode window with side stream/partials and non-TFQ3 layer.
+pub fn forks(k: Kernels, l: Layer, s: Scratch, prompt: bool) bool {
+    // TFQ3 dense() and moe() share Kernels.xrot, so TFQ3 layers stay inline on the main stream.
+    return k.side != null and !prompt and s.side_part != 0 and l.tfq3 == null and !isTfq3(l.shared_gu) and !isTfq3(l.shared_down);
 }
 
 /// TF_GLM_MOE_DIRECT=1: a decode window's EXL3 experts on flat picks, their slot rows summed in place (no copies).
@@ -115,7 +120,7 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     const d = l.routed.dims;
     const slots = l.top_k + 1;
     const shared_id: i32 = @intCast(l.count);
-    const forked = forks(k, s, prompt);
+    const forked = forks(k, l, s, prompt);
     if (forked) try fork(k, stream, l, s, x, x_stride, rows);
     errdefer if (forked) k.side.?.s.synchronize() catch {}; // a later failure drains the forked side work
     const flat = direct(k, l, rows, prompt);
@@ -201,7 +206,7 @@ pub fn combine(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize,
 pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize, prompt: bool, out: u64) !void {
     const stamp = prof_mod.span(k.prof, stream, .shared_expert);
     defer stamp.end();
-    const forked = forks(k, s, prompt);
+    const forked = forks(k, l, s, prompt);
     errdefer if (forked) k.side.?.s.synchronize() catch {}; // no side work outlives a failed join or combine
     if (forked) { // forked in body: TF_GLM_PROF's decode `shared` is then the wait and the combine alone
         if (lo != 0) return error.BadWindow;

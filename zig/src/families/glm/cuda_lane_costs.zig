@@ -179,7 +179,7 @@ fn keyShape(e: *const engine.Engine, sm: usize, driver: c_int, shape: []u8, pin:
     const draft_hex = std.fmt.bytesToHex(if (e.drafter) |dr| dr.checkpoint_digest else @as([32]u8, @splat(0)), .lower);
     const tail: []const u8 = if (pin) |f| (if (f) " form factored" else " form classic") else "";
     var p2_buf: [128]u8 = undefined;
-    const p2 = try std.fmt.bufPrint(&p2_buf, " ext{d}/{d} tiles{d}/{d} first{d} exl3{d}/{d} fuse{d} skda{d}{s}{s}", .{
+    const p2 = try std.fmt.bufPrint(&p2_buf, " ext{d}/{d} tiles{d}/{d} first{d} exl3{d}/{d} fuse{d} skda{d} p2b{d}/{d}/{d}/{d}/{d}{s}{s}", .{
         @intFromBool(set.dflash_only),
         @intFromBool(set.dflash_q4_down),
         @intFromBool(set.verify_tiles.mla),
@@ -189,6 +189,11 @@ fn keyShape(e: *const engine.Engine, sm: usize, driver: c_int, shape: []u8, pin:
         @intFromBool(set.exl3_nmajor),
         @intFromBool(set.roce_fuse),
         @intFromBool(set.shared_kda_wide),
+        @intFromBool(set.shared_side),
+        @intFromBool(e.m.glue.hc_split),
+        @intFromBool(e.m.glue.hc_part),
+        e.m.kda.step_warps,
+        @intFromBool(e.m.kda.segs),
         if (e.drafter != null and e.m.priced_windows) " pricedWindows" else "",
         tail,
     });
@@ -290,13 +295,17 @@ test "GLM cost identity: the consumed key includes drafter precision and all tim
     e.m.dsel = true;
     e.m.experts.wide_tile = false;
     e.m.priced_windows = false;
+    e.m.glue.hc_split = true;
+    e.m.glue.hc_part = true;
+    e.m.kda.step_warps = 0;
+    e.m.kda.segs = true;
     var dr: dflash.Drafter = undefined;
     dr.bits = 4;
     dr.checkpoint_digest = @splat(2);
     e.drafter = &dr;
     var base: [512]u8 = undefined;
     const before = try keyShape(&e, 121, 13000, &base, null);
-    for (0..25) |which| {
+    for (0..30) |which| {
         const original = e.settings;
         switch (which) {
             0 => dr.bits = 0,
@@ -324,6 +333,11 @@ test "GLM cost identity: the consumed key includes drafter precision and all tim
             22 => e.settings.exl3_nmajor = true,
             23 => e.settings.roce_fuse = true,
             24 => e.m.priced_windows = true,
+            25 => e.settings.shared_side = false,
+            26 => e.m.glue.hc_split = false,
+            27 => e.m.glue.hc_part = false,
+            28 => e.m.kda.step_warps = 4,
+            29 => e.m.kda.segs = false,
             else => unreachable,
         }
         var changed: [512]u8 = undefined;
@@ -338,6 +352,10 @@ test "GLM cost identity: the consumed key includes drafter precision and all tim
         e.m.dsel = true;
         e.m.experts.wide_tile = false;
         e.m.priced_windows = false;
+        e.m.glue.hc_split = true;
+        e.m.glue.hc_part = true;
+        e.m.kda.step_warps = 0;
+        e.m.kda.segs = true;
     }
     // a named form only ends the identity, so the race's key stays as it was
     var classic: [512]u8 = undefined;
@@ -396,6 +414,10 @@ test "GLM cost identity: a record kept at one named form is not reused at the ot
     e.m.dsel = true;
     e.m.experts.wide_tile = false;
     e.m.priced_windows = false;
+    e.m.glue.hc_split = true;
+    e.m.glue.hc_part = true;
+    e.m.kda.step_warps = 0;
+    e.m.kda.segs = true;
     e.drafter = null;
     var shapes: [2][512]u8 = undefined;
     var keys: [2][32]u8 = undefined;

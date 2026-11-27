@@ -109,10 +109,10 @@ __device__ __forceinline__ void emit(const float (&c)[16], const tf_mhc::Weights
 }
 
 __device__ __forceinline__ void bar_sync(int id, int n) {
-  asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(n) : "memory");
+  asm volatile("barrier.cta.sync %0, %1;" ::"r"(id), "r"(n) : "memory");
 }
 __device__ __forceinline__ void bar_arrive(int id, int n) {
-  asm volatile("bar.arrive %0, %1;" ::"r"(id), "r"(n) : "memory");
+  asm volatile("barrier.cta.arrive %0, %1;" ::"r"(id), "r"(n) : "memory");
 }
 
 // finish's bytes with warp 0's Sinkhorn beside the collapse of warps 1..7 (warp 1 also takes warp 0's columns).

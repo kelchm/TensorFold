@@ -73,10 +73,11 @@ pub const Prof = struct {
     /// A call begins on `s` (its wall clock and its first event).
     pub fn begin(p: *Prof, s: cuda.Stream, label: []const u8) !void {
         p.n = 0;
-        p.open = true;
+        p.open = false;
         p.label = label;
         p.t0 = std.Io.Clock.awake.now(p.io).toNanoseconds();
         try p.events[0].record(s);
+        p.open = true;
     }
 
     /// The work queued on `s` since the last mark belongs to `section`.
@@ -162,6 +163,24 @@ test "a profiler destroys all 513 of its events" {
     try std.testing.expectEqual(@as(usize, 513), Counted.live);
     p.deinit();
     try std.testing.expectEqual(@as(usize, 0), Counted.live);
+}
+
+test "Prof.begin leaves open false when recording the first event fails" {
+    const FailRecord = struct {
+        fn record(_: cuda.abi.Event, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            return cuda.abi.error_not_ready;
+        }
+    };
+    var d: cuda.Driver = undefined;
+    d.api.cuEventCreate = Counted.create;
+    d.api.cuEventDestroy_v2 = Counted.destroy;
+    d.api.cuEventRecord = FailRecord.record;
+    Counted.live = 0;
+    const p = try Prof.init(&d, std.testing.io);
+    defer p.deinit();
+    p.open = true;
+    try std.testing.expectError(error.NotReady, p.begin(.{ .d = &d, .handle = null }, "verify shared"));
+    try std.testing.expect(!p.open);
 }
 
 pub inline fn span(p: ?*Prof, s: cuda.Stream, stage: prompt_trace.Stage) prompt_trace.Scope {

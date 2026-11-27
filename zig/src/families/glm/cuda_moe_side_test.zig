@@ -193,7 +193,7 @@ test "TF_GLM_SHARED_SIDE: a decode block forks its shared expert on side_part an
     const k = r.kernels(true);
     const l = layer(false);
     const s = scratch();
-    try t.expect(moe.forks(k, s, false) and !moe.forks(k, s, true));
+    try t.expect(moe.forks(k, l, s, false) and !moe.forks(k, l, s, true));
     try moe.fork(k, r.main(), l, s, 0x5000_0000, 4096, 5);
     try moe.fill(k, r.main(), l, s, 0x5000_0000, 4096, 0, 5, false, 0x6000_0000);
     try t.expectEqual(@as(usize, 11), Log.n);
@@ -267,12 +267,42 @@ test "TF_GLM_SHARED_SIDE: without side, without side_part, or in a prompt chunk 
         const k = r.kernels(c[0]);
         var s = scratch();
         if (c[0] and !c[1]) s.side_part = 0;
-        try t.expect(!moe.forks(k, s, c[1]));
+        try t.expect(!moe.forks(k, layer(false), s, c[1]));
         try moe.fill(k, r.main(), layer(false), s, 0x5000_0000, 4096, 0, 5, c[1], 0x6000_0000);
         try t.expectEqual(@as(usize, 7), Log.n);
         try expectShared(0, main_s, mm_part, true);
         try t.expectEqual(idOf("combine"), Log.ops[6].f);
     }
+}
+
+test "TF_GLM_SHARED_SIDE: TFQ3 routed or shared layers stay inline to avoid Kernels.xrot races" {
+    var r: Rig = .{};
+    const s = scratch();
+    const dw: cuda.tfq3.DenseWeight = undefined;
+    // 1. TFQ3 routed layer with bf16 shared projections: never forks; body & fill run inline on main_s.
+    r.init();
+    const k = r.kernels(true);
+    var l_routed = layer(false);
+    l_routed.tfq3 = @as(cuda.tfq3.MoeLayer, undefined);
+    try t.expect(!moe.forks(k, l_routed, s, false));
+    try t.expectError(error.FormatNotLoaded, moe.body(k, r.main(), l_routed, s, 0x5000_0000, 4096, 5, false));
+    for (Log.ops[0..Log.n]) |op| try t.expect(op.kind == .launch and op.stream == main_s);
+    r.init();
+    try moe.fill(k, r.main(), l_routed, s, 0x5000_0000, 4096, 0, 5, false, 0x6000_0000);
+    try t.expectEqual(@as(usize, 7), Log.n);
+    try expectShared(0, main_s, mm_part, true);
+    try t.expectEqual(idOf("combine"), Log.ops[6].f);
+    // 2. TFQ3 shared_gu or shared_down (dense or pair): never forks.
+    var l_gu = layer(false);
+    l_gu.shared_gu = .{ .tfq3 = dw };
+    try t.expect(!moe.forks(k, l_gu, s, false));
+    l_gu.shared_gu = .{ .tfq3_pair = .{ dw, dw } };
+    try t.expect(!moe.forks(k, l_gu, s, false));
+    var l_down = layer(false);
+    l_down.shared_down = .{ .tfq3 = dw };
+    try t.expect(!moe.forks(k, l_down, s, false));
+    l_down.shared_down = .{ .tfq3_pair = .{ dw, dw } };
+    try t.expect(!moe.forks(k, l_down, s, false));
 }
 
 test "TF_GLM_SHARED_SIDE: failures in fork, body, join wait, or combine drain the side stream" {

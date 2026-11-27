@@ -9,24 +9,30 @@ const check = @import("check.zig");
 const Rig = @import("contract_rig.zig").Rig;
 const kda = glm.kda;
 const dk = kda.dk;
-const window = 8; // fw.window_rows: a segment's most rows
+const window = 17; // covers fw.window_rows (8) and ragged multi-tile segments crossing the 16-row step boundary
 const taps = 3; // a conv window's rows
 
 /// A planted fault in chainSegs' table; each must go red at the shapes gate.
 pub const Fault = enum { none, neighbour_state, shared_scratch };
 
-/// rows: the window's rows over k segments (ragged, one to eight each); n: a rank's heads x 128 (TP 2, TP 3's widest).
+/// rows: window rows over k ragged segments (1..17 each, including 17 + 1 across the 16-row step tile); n: heads x 128.
 const served = [_]c.Shape{
     .{ .rows = 32, .n = 32 * dk, .k = 4 },
     .{ .rows = 4, .n = 32 * dk, .k = 4 },
+    .{ .rows = 18, .n = 32 * dk, .k = 2 },
     .{ .rows = 20, .n = 32 * dk, .k = 4 },
     .{ .rows = 37, .n = 22 * dk, .k = 7 },
     .{ .rows = 128, .n = 32 * dk, .k = 16 },
 };
 
-/// A window's `rows` rows over `k` segments, ragged and each one to `window` rows; false when they cannot be.
+/// A window's `rows` rows over `k` ragged segments (1..window each; 17 + 1 for k = 2, rows = 18); false if impossible.
 pub fn split(rows: usize, k: usize, out: *[kda.max_segs]usize) bool {
     if (k == 0 or k > kda.max_segs or rows < k or rows > k * window) return false;
+    if (k == 2 and rows > 16) { // ragged multi-tile split crossing the 16-row step tile boundary inside segment 0
+        out[0] = @min(window, rows - 1);
+        out[1] = rows - out[0];
+        return true;
+    }
     for (out[0..k]) |*s| s.* = 1;
     var left = rows - k;
     var pass: usize = 0;
@@ -356,7 +362,7 @@ pub const Group = struct {
     }
 };
 
-test "GLM KDA segs contract: every served window splits into ragged segments of one to eight rows" {
+test "GLM KDA segs contract: every served window splits into ragged segments including a 17 + 1 tile crossing" {
     var rows: [kda.max_segs]usize = undefined;
     for (served) |s| {
         try std.testing.expect(split(s.rows, s.k, &rows));
@@ -368,7 +374,9 @@ test "GLM KDA segs contract: every served window splits into ragged segments of 
         try std.testing.expectEqual(s.rows, sum);
         if (s.rows > s.k and s.rows < s.k * window) try std.testing.expect(std.mem.min(usize, rows[0..s.k]) != std.mem.max(usize, rows[0..s.k]));
     }
-    try std.testing.expect(!split(3, 4, &rows) and !split(33, 4, &rows) and !split(17, 17, &rows) and !split(1, 0, &rows));
+    try std.testing.expect(split(18, 2, &rows));
+    try std.testing.expectEqualSlices(usize, &.{ 17, 1 }, rows[0..2]);
+    try std.testing.expect(!split(3, 4, &rows) and !split(4 * window + 1, 4, &rows) and !split(17, 17, &rows) and !split(1, 0, &rows));
 }
 
 test "GLM KDA segs contract: every served copy window splits and copies whole 16-byte units" {
