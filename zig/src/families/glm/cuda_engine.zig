@@ -508,11 +508,7 @@ pub const Engine = struct {
         const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(false) else null, .l2pf = if (e.l2pf) |*p| p else null };
         try f.run(@ptrCast(ids[0..rows]));
         if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
-        for (parts, segs[0..parts.len]) |p, g| {
-            try e.bind(p.slot);
-            e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;
-            try e.draw(b.logits + g.row0 * e.share.vocab.len() * 2, g.rows, g.st.pos + 1, p.bits, p.out);
-        }
+        try @import("cuda_engine_pick.zig").drawShared(e, b, parts, segs[0..parts.len], rows);
     }
 
     /// DFlash2's round (every rank, the same `reqs`): each stream's kept rows into its context, then the block pass.
