@@ -382,3 +382,34 @@ test "GLM EXL3: scratch covers the path each layer takes: the prompt kernels' wh
         try testing.expectEqual([3]usize{ 4, 4, 4 }, most[1..4].*);
     }
 }
+
+test "GLM EXL3: decode kernel eligibility and scratch bounds hold across 1..shared_rows for 8- and 9-slot layouts" {
+    const shared_rows = @import("cuda_engine.zig").shared_rows;
+    const dims = 4096;
+    const width = 1024;
+    const count = 288;
+    const w: x3.Experts = .{ .banks = .{ 1, 2, 3 }, .gt = 4, .ut = 5, .dt = 6, .suh_g = 7, .suh_u = 8, .svh_g = 9, .svh_u = 10, .suh_d = 11, .svh_d = 12, .k2 = 13, .uniform_gu = 8, .uniform_d = 8, .shx = true };
+    const sc: x3.Scratch = .{ .picks = 0x1_0000_0000, .xg = 0, .xu = 0, .z = 0 };
+    try testing.expect(!x3.eligibleDecode(w, 0, count, dims, width, false));
+    try testing.expect(!x3.eligibleDecode(w, shared_rows + 1, count, dims, width, false));
+    try testing.expect(!x3.eligibleDecode(w, 8, count, dims, width, true));
+    for ([_]usize{ 1, 2, 4, 8, 16, 17, 24, shared_rows }) |rows| {
+        try testing.expect(x3.eligibleDecode(w, rows, count, dims, width, false));
+        const total = x3.scratchFor(rows, dims, width, false, w)[0];
+        const picks = x3.picksBytes(rows);
+        const decode_arena = total - picks;
+        for ([_]usize{ x3.top_k, x3.top_k + 1 }) |slots| {
+            const pairs = rows * slots;
+            const need = rows * dims * 2 + 2 * 4 * pairs * width * 4;
+            try testing.expect(pairs <= cuda.grouped.small);
+            try testing.expect(need <= decode_arena);
+            try testing.expect(need <= total);
+            if (slots == x3.top_k) {
+                const arena = sc.picks + picks;
+                const y = try x3.directOut(w, sc, rows, count, dims, width, 0);
+                try testing.expect(arena + need <= y);
+                try testing.expect(y + pairs * dims * 4 <= sc.picks + total);
+            }
+        }
+    }
+}

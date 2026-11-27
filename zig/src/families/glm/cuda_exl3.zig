@@ -320,7 +320,7 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
 }
 
 pub fn eligibleDecode(w: Experts, rows: usize, count: usize, dims: usize, width: usize, prompt: bool) bool {
-    return !prompt and rows >= 2 and rows <= 16 and count > 0 and count < cuda.grouped.max_experts and
+    return !prompt and rows >= 1 and rows <= @import("cuda_engine.zig").shared_rows and count > 0 and count < cuda.grouped.max_experts and
         dims == 4096 and width == 1024 and w.uniform_gu == 8 and w.uniform_d == 8 and w.shx and
         w.banks[0] != 0 and w.banks[1] != 0 and w.banks[2] != 0;
 }

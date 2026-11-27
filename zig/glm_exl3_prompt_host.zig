@@ -230,7 +230,7 @@ test "GLM EXL3 prompt: specialized verification uses native slot stride and opti
     const w: glm.exl3.Experts = .{ .banks = .{ 101, 102, 103 }, .gt = 104, .ut = 105, .dt = 106, .k2 = 107, .suh_g = 108, .suh_u = 109, .svh_g = 110, .svh_u = 111, .suh_d = 112, .svh_d = 113, .shx = true };
     const x3: glm.exl3.Scratch = .{ .picks = 0x100000000, .xg = 0, .xu = 0, .z = 0 };
     const plan: cuda.grouped.Plan = .{ .members = 201, .items = 202, .counts = 203, .rank = 204, .hist = 205 };
-    for (2..17) |rows| for ([_]usize{ 8, 9 }) |slots| for ([_]bool{ false, true }) |enabled| {
+    for (1..33) |rows| for ([_]usize{ 8, 9 }) |slots| for ([_]bool{ false, true }) |enabled| {
         k.glm_nmajor = enabled;
         Record.reset();
         try t.expect(glm.exl3.eligibleDecode(w, rows, 288, 4096, 1024, false));
@@ -250,8 +250,8 @@ test "GLM EXL3 prompt: specialized verification uses native slot stride and opti
         try t.expectEqual(out, Record.result);
         try t.expectEqual(@as(usize, 0), Record.copies);
     };
-    try t.expect(!glm.exl3.eligibleDecode(w, 1, 288, 4096, 1024, false));
-    try t.expect(!glm.exl3.eligibleDecode(w, 17, 288, 4096, 1024, false));
+    try t.expect(!glm.exl3.eligibleDecode(w, 0, 288, 4096, 1024, false));
+    try t.expect(!glm.exl3.eligibleDecode(w, 33, 288, 4096, 1024, false));
     try t.expect(!glm.exl3.eligibleDecode(w, 8, 288, 4096, 1024, true));
 }
 
