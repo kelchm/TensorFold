@@ -8,7 +8,7 @@ const pages = @import("cuda_snapshot_pages.zig");
 const State = st_mod.State;
 const window_rows = st_mod.window_rows;
 
-/// The image's first bytes: the format, the position, the head's rows, both ring bases, the KDA copy bits, the layout.
+/// The image's first bytes: format, position, head rows, ring bases, KDA copy bits, layout, owner and cut digest.
 pub const Words = struct {
     at: u64,
     mtp_len: u64,
@@ -18,17 +18,18 @@ pub const Words = struct {
     world: u64, // the ranks that wrote it
     layout: Layout = .unsplit,
     owner: u64 = no_owner, // the rank holding its latent rows alone (split layouts); unsplit: no_owner
+    below: u64 = 0, // cuda_prompt_cuts.below of the pass that kept it (0 on the plain grid)
 
-    pub const count = 9;
+    pub const count = 10;
     pub const bytes: u64 = count * 8;
-    const format: u64 = 1;
+    const format: u64 = 2;
 
     /// Which rows each rank's image holds: unsplit, every rank every row (the only layout written so far).
     pub const Layout = enum(u64) { unsplit = 0, _ };
     pub const no_owner: u64 = std.math.maxInt(u64);
 
     pub fn encode(w: Words) [count]u64 {
-        return .{ format, w.at, w.mtp_len, w.base, w.mtp_base, w.cur, w.world, @backingInt(w.layout), w.owner };
+        return .{ format, w.at, w.mtp_len, w.base, w.mtp_base, w.cur, w.world, @backingInt(w.layout), w.owner, w.below };
     }
 
     /// Words read back, refused by name unless this format at `at`, written by `world` ranks in this server's `layout`.
@@ -38,7 +39,7 @@ pub const Words = struct {
         const l: Layout = @fromBackingInt(@intCast(x[7]));
         if (l != layout) return error.DiskLayout;
         if (if (l == .unsplit) x[8] != no_owner else x[8] >= world) return error.DiskLayout;
-        return .{ .at = x[1], .mtp_len = x[2], .base = x[3], .mtp_base = x[4], .cur = x[5], .world = x[6], .layout = l, .owner = x[8] };
+        return .{ .at = x[1], .mtp_len = x[2], .base = x[3], .mtp_base = x[4], .cur = x[5], .world = x[6], .layout = l, .owner = x[8], .below = x[9] };
     }
 };
 
@@ -106,14 +107,14 @@ fn cache(sh: Shape, n: u64) [5]u64 {
     };
 }
 
-/// The longest state an image holds: the capacity's whole pools (`parts` takes no other position).
+/// The longest state an image holds: up to the sequence's capacity.
 pub fn longest(sh: Shape) u32 {
-    return sh.capacity - sh.capacity % sparse.pool;
+    return sh.capacity;
 }
 
-/// The image at `at` (a chunk start): the words, the prefix, each DSA layer's rows, the head's caches, the tail.
+/// The image at `at` (any cold cut): the words, the prefix, each DSA layer's rows, the head's caches, the tail.
 pub fn parts(sh: Shape, at: u32, out: *std.ArrayList(Part), a: std.mem.Allocator) !void {
-    if (at == 0 or at % sparse.pool != 0 or at > sh.capacity) return error.SnapshotShape;
+    if (at == 0 or at > sh.capacity) return error.SnapshotShape;
     try out.appendSlice(a, &.{ .{ .bytes = Words.bytes }, .{ .bytes = sh.prefix } });
     const pooled: u64 = at / sparse.pool;
     for (0..sh.layers) |_| {

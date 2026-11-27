@@ -128,12 +128,12 @@ test "GLM disk image: the longest state is a position the store's parts take, so
         defer st.deinit();
         const sh = try image.Shape.of(&st, &m.w.config, cap, true);
         const at = image.longest(sh);
-        try expect(at <= cap and cap - at < 4 and at % 4 == 0);
+        try expectEqual(@as(u32, @intCast(cap)), at);
         var parts: std.ArrayList(image.Part) = .empty;
         defer parts.deinit(a);
         try image.storeParts(sh, &.{ sh.prefix, sh.prefix }, at, &parts, a);
         try expect(parts.items.len > 0);
-        try expectError(error.SnapshotShape, image.storeParts(sh, &.{ sh.prefix, sh.prefix }, at + 4, &parts, a));
+        try expectError(error.SnapshotShape, image.storeParts(sh, &.{ sh.prefix, sh.prefix }, at + 1, &parts, a));
     }
 }
 
@@ -293,18 +293,19 @@ test "GLM disk image: a disk read's blank state is refused until sealed, and its
     }
     try expectError(error.StateKept, snaps.blankAs(&e, 7, at));
     try expectError(error.UnsealedState, snaps.restore(&e, 7));
-    try expectError(error.DiskWords, snaps.seal(&e, 7, at + @import("cuda_state.zig").window_rows + 1, .{ 0, 0 }, 0)); // a head past its verify window
-    try expectError(error.DiskWords, snaps.seal(&e, 7, at, .{ 0, 0 }, @as(u64, 1) << @intCast(e.cur.st.cur.len))); // a copy bit no layer has
-    try expectError(error.DiskWords, snaps.seal(&e, 7, at - 1, .{ at + 1, 0 }, 0)); // a main ring based past the state
-    try expectError(error.DiskWords, snaps.seal(&e, 7, at - 1, .{ 0, at }, 0)); // a head ring based past its rows
-    try snaps.seal(&e, 7, at - 1, .{ 3, 5 }, 0b01);
+    try expectError(error.DiskWords, snaps.seal(&e, 7, at + @import("cuda_state.zig").window_rows + 1, .{ 0, 0 }, 0, 0)); // a head past its verify window
+    try expectError(error.DiskWords, snaps.seal(&e, 7, at, .{ 0, 0 }, @as(u64, 1) << @intCast(e.cur.st.cur.len), 0)); // a copy bit no layer has
+    try expectError(error.DiskWords, snaps.seal(&e, 7, at - 1, .{ at + 1, 0 }, 0, 0)); // a main ring based past the state
+    try expectError(error.DiskWords, snaps.seal(&e, 7, at - 1, .{ 0, at }, 0, 0)); // a head ring based past its rows
+    try snaps.seal(&e, 7, at - 1, .{ 3, 5 }, 0b01, 0x1235);
     const s = e.snaps.get(7).?;
     const sh = try image.Shape.of(&e.cur.st, &e.c, capacity, true);
     try expectEqual(image.leaseBytes(sh, at, at - 1), @as(u64, s.len));
     try expectEqual(@as(usize, at - 1), s.mtp_len);
     try expectEqual([2]usize{ 3, 5 }, s.bases);
+    try expectEqual(@as(u64, 0x1235), s.below);
     try std.testing.expectEqualSlices(u1, &.{ 1, 0 }, s.cur);
-    try expectError(error.StateKept, snaps.seal(&e, 7, at, .{ 0, 0 }, 0));
+    try expectError(error.StateKept, snaps.seal(&e, 7, at, .{ 0, 0 }, 0, 0));
     const far: u32 = capacity - 1024; // a state past the rings' rows
     const back: u32 = far - @as(u32, @intCast(e.cur.st.ring_rows)); // the least base whose ring still holds its rows
     try snaps.blankAs(&e, 8, far);
@@ -312,25 +313,25 @@ test "GLM disk image: a disk read's blank state is refused until sealed, and its
         var held = e.snaps.get(8).?;
         snaps.free(&e, &held);
     }
-    try expectError(error.DiskWords, snaps.seal(&e, 8, far, .{ back - 1, back }, 0)); // a main ring too far back
-    try expectError(error.DiskWords, snaps.seal(&e, 8, far, .{ back, back - 1 }, 0)); // a head ring too far back
-    try snaps.seal(&e, 8, far, .{ back, back }, 0);
+    try expectError(error.DiskWords, snaps.seal(&e, 8, far, .{ back - 1, back }, 0, 0)); // a main ring too far back
+    try expectError(error.DiskWords, snaps.seal(&e, 8, far, .{ back, back - 1 }, 0, 0)); // a head ring too far back
+    try snaps.seal(&e, 8, far, .{ back, back }, 0, 0);
     try snaps.blankAs(&e, 9, far);
     defer {
         var held = e.snaps.get(9).?;
         snaps.free(&e, &held);
     }
-    try snaps.seal(&e, 9, 0, .{ back, 0 }, 0); // no head rows yet (as without drafts): the main ring holds the state's rows
+    try snaps.seal(&e, 9, 0, .{ back, 0 }, 0, 0); // no head rows yet (as without drafts): the main ring holds the state's rows
 }
 
-test "GLM disk image: the words record the world, the layout and the owner, and a read refuses another by name" {
+test "GLM disk image: the words record the world, the layout, the owner and the cut digest, and a read refuses another by name" {
     const at: u32 = 4096;
-    const w: image.Words = .{ .at = at, .mtp_len = 7, .base = 1, .mtp_base = 2, .cur = 0b1, .world = 3 };
+    const w: image.Words = .{ .at = at, .mtp_len = 7, .base = 1, .mtp_base = 2, .cur = 0b1, .world = 3, .below = 0x9876_5431 };
     const x = w.encode();
-    try expectEqual(@as(u64, 72), image.Words.bytes);
+    try expectEqual(@as(u64, 80), image.Words.bytes);
     try expectEqual(@as(usize, image.Words.bytes), @sizeOf(@TypeOf(x)));
-    // an unsplit state: every rank holds every row, so no rank owns it
-    try std.testing.expectEqualSlices(u64, &.{ 3, 0, image.Words.no_owner }, x[6..]);
+    // an unsplit state: every rank holds every row, so no rank owns it; word 9 holds the cut digest
+    try std.testing.expectEqualSlices(u64, &.{ 3, 0, image.Words.no_owner, 0x9876_5431 }, x[6..]);
     try expectEqual(w, try image.Words.decode(x, at, 3, .unsplit));
     try expectError(error.DiskWorld, image.Words.decode(x, at, 2, .unsplit)); // written by three ranks, read by two
     try expectError(error.DiskWorld, image.Words.decode(x, at, 4, .unsplit));
@@ -339,16 +340,22 @@ test "GLM disk image: the words record the world, the layout and the owner, and 
     var y = x;
     y[7] = 1; // an image of a split layout read unsplit
     try expectError(error.DiskLayout, image.Words.decode(y, at, 3, .unsplit));
-    const owned = try image.Words.decode(y[0..8].* ++ [1]u64{2}, at, 3, split);
+    var z = y;
+    z[8] = 2;
+    const owned = try image.Words.decode(z, at, 3, split);
     try expectEqual(@as(u64, 2), owned.owner);
+    try expectEqual(@as(u64, 0x9876_5431), owned.below);
     try expectError(error.DiskLayout, image.Words.decode(y, at, 3, split)); // a split image names an owner rank
-    try expectError(error.DiskLayout, image.Words.decode(y[0..8].* ++ [1]u64{3}, at, 3, split));
+    z[8] = 3;
+    try expectError(error.DiskLayout, image.Words.decode(z, at, 3, split));
     y = x;
     y[8] = 0; // an unsplit image that names an owner
     try expectError(error.DiskLayout, image.Words.decode(y, at, 3, .unsplit));
-    y = x;
-    y[0] = 2; // the format comes first: a format this server does not read is DiskWords, whatever its layout
-    try expectError(error.DiskWords, image.Words.decode(y, at, 2, .unsplit));
+    for ([_]u64{ 1, 3 }) |bad_fmt| {
+        y = x;
+        y[0] = bad_fmt; // the format comes first: a format this server does not read is DiskWords, whatever its layout
+        try expectError(error.DiskWords, image.Words.decode(y, at, 2, .unsplit));
+    }
 }
 
 /// A state's store image at `at` for two ranks, rank 1's prefix a copy of rank 0's: what the load's probe gathers.
@@ -493,7 +500,7 @@ test "GLM disk image: paged FP8 and BF16 round-trip across disjoint shuffled pag
         const in: image.Copy = .{ .d = &d, .pool = &e.snap_pages.?, .lease = &e.snaps.getPtr(1).?.lease, .segs = segs.items, .words = &back };
         try in.run(0, img, false);
         const w = try image.Words.decode(back, at, 2, .unsplit);
-        try snaps.seal(&e, 1, w.mtp_len, .{ w.base, w.mtp_base }, w.cur);
+        try snaps.seal(&e, 1, w.mtp_len, .{ w.base, w.mtp_base }, w.cur, w.below);
         try snaps.restore(&e, 1);
         try std.testing.expectEqualSlices(u8, H.bytes(sa.arena.buf.ptr, @intCast(sh.prefix)), H.bytes(e.cur.st.arena.buf.ptr, @intCast(sh.prefix)));
         try std.testing.expectEqualSlices(u8, H.bytes(sa.mtp_pos_dev, @intCast(sh.tail)), H.bytes(e.cur.st.mtp_pos_dev, @intCast(sh.tail)));
@@ -513,4 +520,40 @@ test "GLM disk image: paged FP8 and BF16 round-trip across disjoint shuffled pag
         for (H.bytes(sa.table, table_len * 4)) |b| try expectEqual(@as(u8, 0x77), b);
         for (H.bytes(e.cur.st.table, table_len * 4)) |b| try expectEqual(@as(u8, 0x88), b);
     };
+}
+
+test "GLM disk image: off-grid positions (at % 4 != 0) match Plan sizes, validate rows_image, and zero partial pools" {
+    const rows_img = @import("engine_api").prompt_cache.rows.image;
+    var m: Model = undefined;
+    try m.init();
+    var d = H.driver();
+    const a = std.testing.allocator;
+    const c = &m.w.config;
+    for ([_]bool{ false, true }) |kv8| {
+        var st = try State.initFormat(a, &d, &m.w, capacity, kv8);
+        defer st.deinit();
+        const sh = try image.Shape.of(&st, c, capacity, true);
+        for ([_]u32{ 1, 3, 255, 1027 }) |at| {
+            const mtp: u64 = at - 1;
+            const plan = try Plan.init(&st, c, at, mtp, 0);
+            try expectEqual(@as(u64, plan.len), image.leaseBytes(sh, at, mtp));
+            var list: std.ArrayList(image.Part) = .empty;
+            defer list.deinit(a);
+            try image.parts(sh, at, &list, a);
+            var rparts: std.ArrayList(rows_img.Part) = .empty;
+            defer rparts.deinit(a);
+            for (list.items) |p| try rparts.append(a, .{ .bytes = p.bytes, .row = p.row, .per = p.per });
+            try expect(rows_img.valid(rparts.items, at, 256));
+            try expectEqual(image.imageBytes(sh, at), rows_img.imageBytes(rparts.items));
+            var loose: std.ArrayList(image.Span) = .empty;
+            defer loose.deinit(a);
+            try image.unwritten(sh, &.{sh.prefix}, &.{sh.window}, at, mtp, &loose, a);
+            // Each DSA layer's partial/spare pools ([at / 4 * pooled_row, c[4])) are covered as unwritten.
+            var pooled_spans: usize = 0;
+            for (loose.items) |sp| if (sp.len == 2 * sh.pooled_row) {
+                pooled_spans += 1;
+            };
+            try expectEqual(@as(usize, sh.layers + 1), pooled_spans);
+        }
+    }
 }

@@ -24,7 +24,7 @@ pub fn wordsOf(e: *const Engine, id: u64) !image.Words {
     if (s.cur.len > 64) return error.SnapshotShape;
     var cur: u64 = 0;
     for (s.cur, 0..) |b, i| cur |= @as(u64, b) << @intCast(i);
-    return .{ .at = s.pos, .mtp_len = s.mtp_len, .base = s.bases[0], .mtp_base = s.bases[1], .cur = cur, .world = e.share.world };
+    return .{ .at = s.pos, .mtp_len = s.mtp_len, .base = s.bases[0], .mtp_base = s.bases[1], .cur = cur, .world = e.share.world, .below = s.below };
 }
 
 /// Bytes [off, off + host.len) of this rank's image of `id`, out (lease to host) or in; unsealed: before its head only.
@@ -183,9 +183,9 @@ pub fn decode(e: *const Engine, x: [image.Words.count]u64, at: u32) !image.Words
     return image.Words.decode(x, at, @intCast(e.share.world), .unsplit);
 }
 
-/// Rank 0: every rank's blank `id` sealed with `w` (its head's rows, ring bases and KDA copy bits).
+/// Rank 0: every rank's blank `id` sealed with `w` (head rows, ring bases, KDA copy bits and cut digest).
 pub fn seal(e: *Engine, id: u64, w: image.Words) !void {
-    try snapshots.seal(e, id, w.mtp_len, .{ w.base, w.mtp_base }, w.cur);
+    try snapshots.seal(e, id, w.mtp_len, .{ w.base, w.mtp_base }, w.cur, w.below);
     if (leader(e)) |x| {
         const words = w.encode();
         try x.disk(.{ .kind = kind, .flags = @backingInt(Op.seal), .a = id }, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(&words)));
@@ -223,7 +223,7 @@ pub fn step(e: *Engine, l: *follow.Link, h: follow.Header, ids: []const u32) !vo
             var x: [image.Words.count]u64 = undefined;
             @memcpy(std.mem.sliceAsBytes(&x), std.mem.sliceAsBytes(ids));
             const w = try decode(e, x, @intCast((e.snaps.get(h.a) orelse return error.NoKeptState).pos));
-            try snapshots.seal(e, h.a, w.mtp_len, .{ w.base, w.mtp_base }, w.cur);
+            try snapshots.seal(e, h.a, w.mtp_len, .{ w.base, w.mtp_base }, w.cur, w.below);
         },
         .rows => {
             try fits(ids, h.depth, l.buf.len - 64);

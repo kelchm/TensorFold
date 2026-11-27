@@ -92,10 +92,12 @@ fn scatter(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.
     const rest = Rest.of(e);
     defer rest.done();
     if (ranges.len > 0 and ranges[0].off == 0) {
-        if (ranges[0].len < img.Words.bytes) return error.DiskWords;
+        if (ranges[0].len < img.Words.bytes or in.len < img.Words.bytes) return error.DiskWords;
         var x: [img.Words.count]u64 = undefined;
         @memcpy(std.mem.sliceAsBytes(&x), in[0..img.Words.bytes]);
-        try ranks.seal(e, k.id, try ranks.decode(e, x, k.at));
+        const w = try ranks.decode(e, x, k.at);
+        try ranks.seal(e, k.id, w);
+        k.below = w.below;
     }
     var pieces: std.ArrayList(img.Piece) = .empty;
     defer pieces.deinit(e.gpa);
@@ -420,6 +422,168 @@ test "CUDA disk open: GLM gather zeros unwritten pooled-key tail and scratch spa
         try std.testing.expectEqual(glm.snapshots.targetBytes(e, at), image.blank_bytes.?(e, at));
         try std.testing.expect(image.blank_bytes.?(e, at) < glm.snapshots.bytes(e, at));
     };
+}
+
+test "CUDA disk open: off-grid TF_GLM_REQUEST_STARTS state round-trips via rows store with cut digest intact" {
+    const gpa = std.testing.allocator;
+    const Host = struct {
+        var held: [16]struct { ptr: u64 = 0, len: usize = 0 } = @splat(.{});
+        fn bytes(p: u64, n: usize) []u8 {
+            return @as([*]u8, @ptrFromInt(p))[0..n];
+        }
+        fn alloc(out: *u64, n: usize) callconv(.c) cuda.abi.Result {
+            const m = std.heap.page_allocator.alloc(u8, n) catch return 2;
+            for (&held) |*h| if (h.ptr == 0) {
+                h.* = .{ .ptr = @intFromPtr(m.ptr), .len = n };
+                out.* = h.ptr;
+                return 0;
+            };
+            std.heap.page_allocator.free(m);
+            return 2;
+        }
+        fn free(p: u64) callconv(.c) cuda.abi.Result {
+            for (&held) |*h| if (h.ptr == p) {
+                std.heap.page_allocator.free(bytes(h.ptr, h.len));
+                h.* = .{};
+                return 0;
+            };
+            return 1;
+        }
+        fn set(p: u64, v: u8, n: usize) callconv(.c) cuda.abi.Result {
+            @memset(bytes(p, n), v);
+            return 0;
+        }
+        fn dtod(dst: u64, src: u64, n: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            @memcpy(bytes(dst, n), bytes(src, n));
+            return 0;
+        }
+        fn dtoh(dst: ?*anyopaque, src: u64, n: usize) callconv(.c) cuda.abi.Result {
+            @memcpy(@as([*]u8, @ptrCast(dst.?))[0..n], bytes(src, n));
+            return 0;
+        }
+        fn htod(dst: u64, src: ?*const anyopaque, n: usize) callconv(.c) cuda.abi.Result {
+            @memcpy(bytes(dst, n), @as([*]const u8, @ptrCast(src.?))[0..n]);
+            return 0;
+        }
+        fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            return 0;
+        }
+        fn ctxDev(out: *cuda.abi.Device) callconv(.c) cuda.abi.Result {
+            out.* = 0;
+            return 0;
+        }
+        fn devAttr(out: *c_int, _: cuda.abi.DeviceAttribute, _: cuda.abi.Device) callconv(.c) cuda.abi.Result {
+            out.* = 0;
+            return 0;
+        }
+        fn driver() cuda.Driver {
+            var d: cuda.Driver = undefined;
+            d.api.cuMemAlloc_v2 = alloc;
+            d.api.cuMemFree_v2 = free;
+            d.api.cuMemsetD8_v2 = set;
+            d.api.cuMemcpyDtoDAsync_v2 = dtod;
+            d.api.cuMemcpyDtoH_v2 = dtoh;
+            d.api.cuMemcpyHtoD_v2 = htod;
+            d.api.cuStreamSynchronize = sync;
+            d.api.cuCtxGetDevice = ctxDev;
+            d.api.cuDeviceGetAttribute = devAttr;
+            return d;
+        }
+    };
+    const saved_prefixes = prefixes;
+    const saved_link = ranks.link;
+    defer {
+        prefixes = saved_prefixes;
+        ranks.link = saved_link;
+    }
+    ranks.link = null;
+    var layers: [4]glm.weights.Layer = undefined;
+    for (&layers, [_]bool{ false, true, false, true }) |*l, mla| l.mixer = if (mla) .{ .mla = undefined } else .{ .kda = undefined };
+    var w: glm.weights.Weights = undefined;
+    w.config = .{};
+    w.share = try glm.shard.Share.of(&w.config, 0, 1);
+    w.layers = &layers;
+    var d = Host.driver();
+    const cap: usize = 2048;
+    const at: u32 = 1027;
+    const Seq = @typeInfo(@FieldType(Engine, "cur")).pointer.child;
+    var seq: Seq = .{ .st = try glm.state.State.initFormat(gpa, &d, &w, cap, true) };
+    defer {
+        seq.cuts.deinit(gpa);
+        seq.st.deinit();
+    }
+    for (Host.bytes(seq.st.arena.buf.ptr, seq.st.arena.buf.len), 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    const cuts = [_]u32{ 300, at };
+    try seq.cuts.appendSlice(gpa, &cuts);
+    seq.st.pos = at;
+    seq.st.mtp_len = 0;
+    seq.st.pending = 0;
+    const e = try gpa.create(Engine);
+    defer gpa.destroy(e);
+    e.gpa = gpa;
+    e.d = &d;
+    e.stream = .{ .d = &d, .handle = null };
+    e.c = w.config;
+    e.share = w.share;
+    e.capacity = cap;
+    e.mtp = false;
+    e.settings = .{};
+    e.drafter = null;
+    e.slot = 0;
+    e.cur = &seq;
+    e.share_pages = false;
+    e.announce = 0;
+    e.dropped = .empty;
+    e.prompt_profs = @splat(null);
+    e.snaps = .empty;
+    try e.snaps.ensureTotalCapacity(gpa, 8);
+    defer e.snaps.deinit(gpa);
+    e.next_snap = 1;
+    e.snap_pages = try glm.snapshots.pages.Pool.init(gpa, &d, 128 << 20, false);
+    defer e.snap_pages.?.deinit();
+    const sh = try ranks.shape(e);
+    prefix_buf[0] = sh.prefix;
+    window_buf[0] = sh.window;
+    prefixes = prefix_buf[0..1];
+    const saved = try glm.native.snap_save(e, null, at);
+    defer glm.native.snap_drop(e, saved);
+    const orig: *Kept = @ptrCast(@alignCast(saved));
+    const expected_below = glm.engine.prompt_cuts.below(&cuts, at);
+    try std.testing.expect(expected_below != 0);
+    try std.testing.expectEqual(expected_below, orig.below);
+    try std.testing.expectEqual(expected_below, e.snaps.get(orig.id).?.below);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
+    defer gpa.free(root);
+    const vt: api.prompt_cache.Snapshots.VTable = .{ .bytes = glm.native.snap_bytes, .save = glm.native.snap_save, .restore = glm.native.snap_restore, .drop = glm.native.snap_drop, .rows = &image };
+    const r = try rows.Rows.open(gpa, .{ .ptr = e, .vtable = &vt }, .{ .root = root, .identity = 99, .cap = 1 << 30, .floor = 0, .daily = 1 << 30, .lookahead = 1, .planned = true, .grid = 2048, .sync_writes = true });
+    defer r.deinit();
+    var prompt: [1600]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(100 + i);
+    var entry: api.prompt_cache.Entry = .{ .tokens = prompt[0 .. at + 1], .at = at, .saved = saved, .bytes = 1, .born = 1600, .used = 1, .last = &prompt };
+    rows.write.queued(r, &entry, &.{ 300, at, 1500 });
+    while (rows.write.pending(r)) _ = rows.write.step(r);
+    try std.testing.expectEqual(@as(usize, 1), r.states.items.len);
+    try std.testing.expect(r.best(&prompt, &.{ 700, at, 1500 }, &.{}, 0) == null);
+    try std.testing.expect(r.best(&prompt, &.{}, &.{}, 0) == null);
+    const idx = r.best(&prompt, &.{ 300, at, 1500 }, &.{}, 0) orelse return error.DiskStateMissing;
+    const restored_saved = try rows.read.read(r, idx);
+    defer glm.native.snap_drop(e, restored_saved);
+    const restored: *Kept = @ptrCast(@alignCast(restored_saved));
+    try std.testing.expectEqual(at, restored.at);
+    try std.testing.expectEqual(expected_below, restored.below);
+    try std.testing.expectEqual(expected_below, e.snaps.get(restored.id).?.below);
+    try std.testing.expect(glm.engine.prompt_cuts.resumes(prompt.len, &.{ 300, at, 1500 }, restored.at, restored.below));
+    try std.testing.expect(!glm.engine.prompt_cuts.resumes(prompt.len, &.{ 700, at, 1500 }, restored.at, restored.below));
+    const total = img.imageBytes(sh, at);
+    const orig_img = try gpa.alloc(u8, @intCast(total));
+    defer gpa.free(orig_img);
+    const rest_img = try gpa.alloc(u8, @intCast(total));
+    defer gpa.free(rest_img);
+    try gather(e, saved, &.{.{ .off = 0, .len = total }}, orig_img);
+    try gather(e, restored_saved, &.{.{ .off = 0, .len = total }}, rest_img);
+    try std.testing.expectEqualSlices(u8, orig_img, rest_img);
 }
 
 test {

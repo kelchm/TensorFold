@@ -43,6 +43,13 @@ fn currentDraft(e: anytype, at: usize) draft.Saved {
     return .{ .end = at, .count = sl.prompt_history.rows(at) };
 }
 
+fn currentBelow(e: anytype, at: usize) u64 {
+    const C = @TypeOf(e.cur);
+    const S = if (@typeInfo(C) == .pointer) @typeInfo(C).pointer.child else C;
+    if (!@hasField(S, "cuts")) return 0;
+    return @import("cuda_prompt_cuts.zig").below(e.cur.cuts.items, @intCast(at));
+}
+
 fn targetLen(e: anytype, at: usize) ?usize {
     const head: ?usize = if (e.mtp) @min(e.capacity, std.math.add(usize, at, @import("cuda_state.zig").window_rows) catch return null) else null;
     // a paged sequence holds its request's rows: its prefix is counted to the capacity, in a window's bytes
@@ -91,7 +98,7 @@ pub fn keepAs(e: anytype, id: u64) !void {
     errdefer e.gpa.free(cur);
     try pool.move(e.stream, &lease, &plan, true);
     try e.stream.synchronize();
-    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = target_len, .packed_len = plan.len, .draft = saved, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .bases = .{ e.cur.st.base, e.cur.st.mtp_base }, .shared = plan.shared });
+    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = target_len, .packed_len = plan.len, .draft = saved, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .bases = .{ e.cur.st.base, e.cur.st.mtp_base }, .shared = plan.shared, .below = currentBelow(e, e.cur.st.pos) });
     if (saved.count != 0) std.log.info("glm draft snapshot keep rank={d} slot={d} id={d} pos={d} rows={d} bytes={d}", .{ e.share.rank, e.slot, id, saved.end, saved.count, draft.bytes(saved.count) });
     if (profiled) {
         const wall_ms: f64 = @as(f64, @floatFromInt(std.Io.Clock.awake.now(e.io).toNanoseconds() - started)) / 1e6;
@@ -116,7 +123,7 @@ fn ringHolds(base: usize, len: usize, rows: usize) bool {
 }
 
 /// A blank state made whole from its image's words (its bytes are in or follow): a restore takes it from here.
-pub fn seal(e: anytype, id: u64, mtp_len: usize, bases: [2]usize, cur: u64) !void {
+pub fn seal(e: anytype, id: u64, mtp_len: usize, bases: [2]usize, cur: u64, below: u64) !void {
     const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
     if (s.len != 0) return error.StateKept;
     if (s.cur.len > 64 or (s.cur.len < 64 and cur >> @intCast(s.cur.len) != 0)) return error.DiskWords;
@@ -131,6 +138,7 @@ pub fn seal(e: anytype, id: u64, mtp_len: usize, bases: [2]usize, cur: u64) !voi
     s.packed_len = n;
     s.mtp_len = mtp_len;
     s.bases = bases;
+    s.below = below;
 }
 
 pub fn restore(e: anytype, id: u64) !void {

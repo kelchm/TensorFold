@@ -298,7 +298,7 @@ test "GLM snapshots: disk blankAs/seal/restore stays target-only and cold-restar
     try (glm.disk_image.Copy{ .d = &d, .pool = &f.e.snap_pages.?, .lease = &ram.lease, .segs = segs.items, .words = &words }).run(0, img_buf, true);
     try glm.snapshots.blankAs(&f.e, 2, at);
     try (glm.disk_image.Copy{ .d = &d, .pool = &f.e.snap_pages.?, .lease = &f.e.snaps.getPtr(2).?.lease, .segs = segs.items, .words = &words }).run(0, img_buf, false);
-    try glm.snapshots.seal(&f.e, 2, 0, .{ 0, 0 }, 0);
+    try glm.snapshots.seal(&f.e, 2, 0, .{ 0, 0 }, 0, 0);
     const disk = f.e.snaps.get(2).?;
     try t.expectEqual(ram.len, disk.len);
     try t.expectEqual(disk.len, disk.packed_len);
@@ -372,7 +372,7 @@ test "GLM snapshots: disk blankAs/seal/restore fits a pool sized strictly for ta
     const leased = f.e.snaps.get(1).?.lease.ids.items.len * glm.snapshots.pages.page;
     try t.expectEqual(target_budget, leased);
     try (glm.disk_image.Copy{ .d = &d, .pool = &f.e.snap_pages.?, .lease = &f.e.snaps.getPtr(1).?.lease, .segs = segs.items, .words = &words }).run(0, img_buf, false);
-    try glm.snapshots.seal(&f.e, 1, 0, .{ 0, 0 }, 0);
+    try glm.snapshots.seal(&f.e, 1, 0, .{ 0, 0 }, 0, 0);
     try f.e.restoreState(1);
     try t.expectEqual(@as(i64, at), dr.slots.items[0].from);
     try t.expectEqual(@as(usize, 0), dr.slots.items[0].prompt_history.rows(at));

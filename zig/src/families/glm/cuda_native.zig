@@ -52,7 +52,7 @@ pub const Options = struct {
     drafter: ?[]const u8 = null, // --drafter: DFlash2's folder (the same on every rank; needs drafts on)
     drafter_bits: u8 = 4, // --drafter-bits: 4 (default) or 0 (bf16)
     mtp_confidence: ?f64 = null, // --mtp-confidence: rank 0's lanes stop an MTP chain where its chance falls under it
-    learn_conversations: bool = false, // --learn-conversations: refused with TF_GLM_REQUEST_STARTS=1 (cuda_env)
+    learn_conversations: bool = false, // --learn-conversations: conversation states on disk (cuda_glm_disk)
     rank: u32 = 0, // the launch's, resolved from --tp/--rank and TF_GLM_* (native/cuda_launch.zig)
     tp: u32 = 1,
     master: ?[]const u8 = null,
@@ -178,7 +178,7 @@ const paging = startup.paging;
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
     _ = kernels; // our own kernels: a captured set is not used
     try @import("cuda_env.zig").startup();
-    try @import("cuda_env.zig").requestStartsAlone(o.learn_conversations); // before any rank opens
+    try @import("cuda_env.zig").requestStartsAlone(); // before any rank opens
     try cuda.rendezvous.fromMaster(o, cuda.rendezvous.Process{}, cuda.rendezvous.Process{}); // NCCL's root, before anything reads it
     const p = try place_mod.place(o);
     const roce_bytes = try roceBytes((@import("sys").environment.Process{}).get("TF_ROCE_MAX_KB"));
@@ -509,7 +509,6 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.BadKvShare => "TF_KV_SHARE: give how many states the prompt store over the KV pages keeps, or 0 or unset for off",
         error.GlmKvShareMoved => "TF_GLM_KV_SHARE is now TF_KV_SHARE, the prompt store every family on the KV pool shares: set that instead",
         error.GlmRequestStartsWithSharedKv => "TF_GLM_REQUEST_STARTS=1 cannot be used with TF_KV_SHARE above 0: unset request starts or disable shared KV",
-        error.GlmRequestStartsWithLearnConversations => "TF_GLM_REQUEST_STARTS=1 cannot be used with --learn-conversations: unset request starts or serve without it",
         error.GlmDraftSnapshotWithSharedKv => "TF_GLM_DFLASH_SNAP_CONTEXT=1 requires copied snapshots: set TF_KV_SHARE=0",
         error.GlmDraftSnapshotWithoutDrafter => "TF_GLM_DFLASH_SNAP_CONTEXT=1 requires enabled drafts and --drafter",
         error.GlmShareNeedsPages => "TF_KV_SHARE keeps prompts as KV pool pages: set TF_KV_PAGES=on as well",

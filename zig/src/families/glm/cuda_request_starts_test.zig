@@ -43,19 +43,18 @@ test "glm request starts: shared KV refuses at startup before any rank opens, by
     try t.expect(std.mem.indexOf(u8, reason, "TF_KV_SHARE") != null);
 }
 
-test "glm request starts: --learn-conversations refuses at startup before any rank opens, by name" {
+test "glm request starts: --learn-conversations is allowed at startup alongside TF_GLM_REQUEST_STARTS=1" {
     var saved = try Saved.take();
     defer saved.restore();
     try put("TF_GLM_REQUEST_STARTS", "1");
     try put("TF_KV_SHARE", null);
+    try glm_env.requestStartsAlone();
     var ctx: cuda.Context = undefined;
     const o: native.Options = .{ .context = 8192, .drafts = false, .learn_conversations = true };
-    try t.expectError(error.GlmRequestStartsWithLearnConversations, native.open(t.allocator, t.io, &ctx, "missing-request-starts-checkpoint", null, o));
-    const reason = native.explain(null, error.GlmRequestStartsWithLearnConversations) orelse return error.MissingNamedRefusal;
-    try t.expect(std.mem.indexOf(u8, reason, "TF_GLM_REQUEST_STARTS=1") != null);
-    try t.expect(std.mem.indexOf(u8, reason, "--learn-conversations") != null);
+    const opened = native.open(t.allocator, t.io, &ctx, "missing-request-starts-checkpoint", null, o);
+    if (opened) |_| return error.ExpectedMissingCheckpoint else |err| try t.expect(err != error.GlmRequestStartsWithSharedKv);
     try put("TF_GLM_REQUEST_STARTS", null);
-    try glm_env.requestStartsAlone(true); // the switch off: --learn-conversations starts as today
+    try glm_env.requestStartsAlone();
 }
 
 test "glm request starts: only exact 1 with a shared store above 0 refuses; other values keep today's startup" {
@@ -64,17 +63,17 @@ test "glm request starts: only exact 1 with a shared store above 0 refuses; othe
     try put("TF_KV_SHARE", "32");
     for ([_]?[:0]const u8{ null, "", "0", "off", "on", "true", "2" }) |v| {
         try put("TF_GLM_REQUEST_STARTS", v);
-        try glm_env.requestStartsAlone(false);
+        try glm_env.requestStartsAlone();
     }
     try put("TF_GLM_REQUEST_STARTS", "1");
     for ([_]?[:0]const u8{ null, "0", "00" }) |v| {
         try put("TF_KV_SHARE", v);
-        try glm_env.requestStartsAlone(false);
+        try glm_env.requestStartsAlone();
     }
     for ([_][:0]const u8{ "1", "32", "00032" }) |v| {
         try put("TF_KV_SHARE", v);
-        try t.expectError(error.GlmRequestStartsWithSharedKv, glm_env.requestStartsAlone(false));
+        try t.expectError(error.GlmRequestStartsWithSharedKv, glm_env.requestStartsAlone());
     }
     try put("TF_KV_SHARE", "bad");
-    try t.expectError(error.BadKvShare, glm_env.requestStartsAlone(false));
+    try t.expectError(error.BadKvShare, glm_env.requestStartsAlone());
 }

@@ -108,8 +108,8 @@ drafted at one stream, and about 1,430 prompt tokens a second from 2,048 to 65,5
 - `TF_GLM_REQUEST_STARTS=1` on rank 0 (opt-in, off by default) cuts each prompt pass at the request's message starts
   too, and every 2,048 rows from the last cut, so a chat's next turn resumes where its previous turn's history ends
   instead of at the last 2,048-row point. Rank 0 sends the cuts to the other ranks. A pass with starts takes no solo
-  or batched pass. GLM refuses the switch at startup with `TF_KV_SHARE` above 0 or with `--learn-conversations`
-  (#2404, part of #2396).
+  or batched pass. GLM refuses the switch at startup with `TF_KV_SHARE` above 0; with `--learn-conversations`, each kept
+  state's cut digest is stored in its disk header so off-grid cuts restore cleanly (#2404, part of #2396).
 - `TF_GLM_DENSE_BITS=4` (EXL3 at TP=2, off by default) repacks the BF16 dense layers to 4 bits at load. Decode is
   faster (24.8 to 35.0 tok/s in one user's run), but replies differ from the default, so it is lossy and stays opt-in
   (#1761).

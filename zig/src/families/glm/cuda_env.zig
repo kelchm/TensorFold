@@ -8,10 +8,9 @@ pub fn startup() !void {
     try environment.checkScope(.glm, environment.Process{});
 }
 
-/// TF_GLM_REQUEST_STARTS=1 cuts off the rows TF_KV_SHARE and --learn-conversations keep on: refused with either.
-pub fn requestStartsAlone(learn_conversations: bool) !void {
+/// TF_GLM_REQUEST_STARTS=1 cuts off the rows TF_KV_SHARE keeps on: refused with shared KV.
+pub fn requestStartsAlone() !void {
     const on = if (@import("core").profile.get(.TF_GLM_REQUEST_STARTS)) |v| std.mem.eql(u8, v, "1") else false;
-    if (on and learn_conversations) return error.GlmRequestStartsWithLearnConversations;
     if (on and try kp.sharing() > 0) return error.GlmRequestStartsWithSharedKv;
 }
 

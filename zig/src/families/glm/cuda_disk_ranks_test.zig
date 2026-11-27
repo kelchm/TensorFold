@@ -182,7 +182,7 @@ test "GLM disk ranks: a blank state takes bytes past its words and front only on
     try ranks.copy(x.e, id, 0, buf[0..front], false);
     try t.expectError(error.DiskOrder, ranks.copy(x.e, id, front - 8, buf[0..16], false)); // across the front
     try t.expectError(error.DiskOrder, ranks.copy(x.e, id, front, buf[0..1], true)); // read out, too
-    try snapshots.seal(x.e, id, at - 1, .{ 0, 0 }, 0);
+    try snapshots.seal(x.e, id, at - 1, .{ 0, 0 }, 0, 0);
     try ranks.copy(x.e, id, front - 8, buf[0..16], false);
     try ranks.copy(x.e, id, front, buf[0..1], true);
 }
@@ -293,4 +293,29 @@ test "GLM disk ranks: a follower copies its pieces and the shared ones from the 
     try ranks.copy(x.e, 3, w, &after, true);
     try t.expectEqualSlices(u8, before[0..8], after[0..8]); // rank 2's piece at w did not land here
     try t.expectEqual(@as(usize, 1), Wire.casts);
+}
+
+test "GLM disk ranks: seal carries the cut digest across ranks at off-grid positions" {
+    var x: Rig = undefined;
+    try x.init();
+    defer x.deinit();
+    const at: u32 = 1027;
+    const digest = @import("cuda_prompt_cuts.zig").below(&.{ 300, at }, at);
+    try t.expect(digest != 0);
+    // Rank 0 seals locally and emits the 10-word seal payload.
+    ranks.link = &x.link;
+    const id = try ranks.blank(x.e, at);
+    const w: image.Words = .{ .at = at, .mtp_len = at - 1, .base = 0, .mtp_base = 0, .cur = 0b10, .world = 2, .below = digest };
+    try ranks.seal(x.e, id, w);
+    try t.expectEqual(digest, x.e.snaps.get(id).?.below);
+    try t.expectEqual(digest, (try ranks.wordsOf(x.e, id)).below);
+    try t.expectEqual(@as(u32, image.Words.count * 2), Wire.sent[1].n);
+    // A follower replays the same encoded words and restores the cut digest on its Snap.
+    x.e.share.rank = 1;
+    try snapshots.blankAs(x.e, 9, at);
+    const enc = w.encode();
+    const words_u32 = std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(&enc));
+    try ranks.step(x.e, &x.link, .{ .kind = disk, .flags = op(.seal), .a = 9 }, words_u32);
+    try t.expectEqual(digest, x.e.snaps.get(9).?.below);
+    try t.expectEqual(digest, (try ranks.wordsOf(x.e, 9)).below);
 }
