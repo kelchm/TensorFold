@@ -34,7 +34,7 @@ pub const Scratch = struct {
     wts: u64, // fp32 [rows][top_k + 1]
     plan: cuda.grouped.Plan,
     eact: u64, // bf16 [rows (top_k + 1)][width]
-    ey: u64, // [rows][top_k + 1][dims]: fp32, bf16 in a prompt chunk
+    ey: u64, // [rows][top_k + 1][dims]: fp32, bf16 in a prompt chunk (bf16Slots)
     sgu: u64, // bf16 [rows][2 shared]
     sact: u64, // bf16 [rows][shared]
     sxs: u64, // fp32 [rows][shared / 64]
@@ -83,7 +83,15 @@ pub const Kernels = struct {
     early_shared: bool = false,
     direct: bool = false, // TF_GLM_MOE_DIRECT=1 (opt-in): see `direct`
     side: ?Side = null, // TF_GLM_SHARED_SIDE: decode window shared expert on its own stream (null: inline)
+    exl3_b16: bool = false, // TF_GLM_EXL3_BF16_SLOTS: uniform 4-bit EXL3 prompt slot rows as bf16
 };
+
+/// The slot rows' type: bf16 in an NVFP4 prompt chunk, and in a uniform 4-bit EXL3 one with TF_GLM_EXL3_BF16_SLOTS=1.
+pub fn bf16Slots(k: Kernels, l: Layer, prompt: bool) bool {
+    if (l.tfq3 != null) return false;
+    if (l.exl3) |w| return prompt and k.exl3_b16 and exl3.bf16Eligible(w, l.routed.dims, l.routed.width);
+    return prompt;
+}
 
 fn isTfq3(p: projection.Proj) bool {
     return p == .tfq3 or p == .tfq3_pair;
@@ -140,7 +148,7 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
         }
         return exl3.runDirect(k.exl3, stream, w, s.x3, x, x_stride, rows, l.count, d, l.routed.width, l.routed.limit);
     }
-    if (l.exl3) |w| return exl3.run(k.exl3, k.experts, stream, w, s.x3, s.plan, x, x_stride, s.pick, slots, rows, l.count, d, l.routed.width, l.routed.limit, prompt, s.ey, s.eact);
+    if (l.exl3) |w| return exl3.run(k.exl3, k.experts, stream, w, s.x3, s.plan, x, x_stride, s.pick, slots, rows, l.count, d, l.routed.width, l.routed.limit, prompt, bf16Slots(k, l, prompt), s.ey, s.eact);
     if (l.tfq3) |tl| {
         const tk = k.tfq3 orelse return error.FormatNotLoaded;
         return tk.moe(stream, tl, x, x_stride, s.pick, @intCast(slots), s.ey, @intCast(slots), rows, @intCast(l.top_k), l.routed.limit, 0, true);
@@ -186,7 +194,7 @@ pub fn fork(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
 
 /// Shared expert and its slot, before the slot sum; paired passes call this on the original exchange pieces.
 pub fn shared(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize, prompt: bool) !void {
-    const bf16_slots = prompt and l.exl3 == null and l.tfq3 == null;
+    const bf16_slots = bf16Slots(k, l, prompt);
     const flat = direct(k, l, hi, prompt);
     if (flat and lo != 0) return error.BadWindow;
     if (!k.early_shared) {
@@ -207,7 +215,7 @@ pub fn shared(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_s
 
 /// The already-filled slot rows, summed in slot order into out fp32 (any range, same bits).
 pub fn combine(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize, hi: usize, prompt: bool, out: u64) !void {
-    const bf16_slots = prompt and l.exl3 == null and l.tfq3 == null;
+    const bf16_slots = bf16Slots(k, l, prompt);
     const eb: usize = if (bf16_slots) 2 else 4;
     try glue.combine(k.set, stream, s.ey + lo * (l.top_k + 1) * l.routed.dims * eb, !bf16_slots, s.wts + lo * (l.top_k + 1) * 4, out, hi - lo, l.routed.dims, l.top_k + 1);
 }
@@ -228,4 +236,34 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
         return glue.combineTail(k.set, stream, y, s.sy, s.wts, out, hi - lo, d, l.top_k + 1);
     }
     try combine(k, stream, l, s, lo, hi, prompt, out);
+}
+
+test "slot rows: bf16 in NVFP4 prompt and uniform 4-bit EXL3 prompt with TF_GLM_EXL3_BF16_SLOTS, fp32 elsewhere" {
+    const t = std.testing;
+    var k: Kernels = undefined;
+    var l: Layer = undefined;
+    for ([_]bool{ false, true }) |opted| {
+        k.exl3_b16 = opted;
+        l.routed.dims = 4096;
+        l.routed.width = 1024;
+        l.exl3 = null;
+        l.tfq3 = null;
+        try t.expect(bf16Slots(k, l, true) and !bf16Slots(k, l, false));
+        l.tfq3 = std.mem.zeroes(cuda.tfq3.MoeLayer);
+        try t.expect(!bf16Slots(k, l, true) and !bf16Slots(k, l, false));
+        l.tfq3 = null;
+        var w = std.mem.zeroes(exl3.Experts);
+        w.uniform_gu = 8;
+        w.uniform_d = 8;
+        l.exl3 = w;
+        try t.expectEqual(opted, bf16Slots(k, l, true));
+        try t.expect(!bf16Slots(k, l, false));
+        w.uniform_gu = 6; // 3-bit gate/up stays on common fp32 kernels
+        l.exl3 = w;
+        try t.expect(!bf16Slots(k, l, true));
+        w.uniform_gu = 8;
+        l.exl3 = w;
+        l.routed.width = 1000; // not the GLM prompt kernels' shape: fp32 rows
+        try t.expect(!bf16Slots(k, l, true));
+    }
 }

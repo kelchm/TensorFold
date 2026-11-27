@@ -257,6 +257,12 @@ cold 64K prompts in 36.5 s and decode at 73.1 / 60.8 tok/s (code / chat, tempera
 (`TF_GLM_PREFILL_REDUCE`) and the RoCE gathers (`TF_ROCE`: on at two ranks, `TF_ROCE=1` at three or more) are in
 [placement](../multi-rank-receipts.md#the-settings-the-ranks-agreed-on).
 
+## Prompt MLA experiment
+
+The fork-only [MLA port](glm-prompt-mla.md) adds the default-off arithmetic switch
+`TF_GLM_ABSORB_MMA=1` and bit-preserving FP8 tile-load and fused sparse merge changes. Device qualification is pending.
+`TF_GLM_EXL3_BF16_SLOTS=1` (default off) keeps a uniform 4-bit EXL3 prompt chunk's MoE slot rows in bf16, as NVFP4 prompt chunks do; see [environment](../environment.md#glm-cuda-prompt-arithmetic).
+
 ## Prompt chunk size
 
 A prompt runs in passes of 2,048 rows. Kept prompt states sit on that grid, and a stream decoding beside a prompt waits

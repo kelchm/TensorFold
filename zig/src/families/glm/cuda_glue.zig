@@ -24,6 +24,8 @@ pub const Set = struct {
     mla: ?*const cuda.mla.Mla = null,
     /// TFQ3 (3/4/5-bit 2D-FWHT) dense matmul kernels when loaded for a TFQ3 checkpoint.
     tfq3: ?*const cuda.tfq3.Kernels = null,
+    /// TF_GLM_ABSORB_MMA=1: prompt MLA absorb/expand on tensor cores (different FP32 sum order).
+    absorb_mma: bool = false,
 };
 
 /// A hidden-size norm's weight: bf16, or float32 (FP4-Local's) read as float32 by the _f32w kernels.
@@ -100,6 +102,8 @@ pub const Kernels = struct {
     chunks_32_fp8_paged_fused: cuda.Function,
     merge: cuda.Function,
     scores: cuda.Function,
+    latent_mma_kn: cuda.Function,
+    latent_mma_nk: cuda.Function,
     hc_split: bool = true, // TF_GLM_HC_SPLIT: a decode window's hc_finish on the split schedule (the same bits)
     hc_part: bool = true, // TF_GLM_HC_PART: decode windows to hc_part_rows rows take tf_glm_hc_partial8_o2
     dense_prune: bool = true, // TF_GLM_DENSE_PRUNE: dense attention skips rows sparse attention writes (dsa_block)
@@ -133,6 +137,8 @@ pub const Kernels = struct {
         try k.chunks_32_fp8_fused.allowDynamicShared(chunksSmem(32));
         try k.chunks_16_fp8_paged_fused.allowDynamicShared(chunksSmem(16));
         try k.chunks_32_fp8_paged_fused.allowDynamicShared(chunksSmem(32));
+        try k.latent_mma_kn.allowDynamicShared(latent_mma_smem[0]);
+        try k.latent_mma_nk.allowDynamicShared(latent_mma_smem[1]);
         return k;
     }
 };
@@ -219,6 +225,8 @@ pub fn swiglu(set: Set, stream: cuda.Stream, gu: u64, out: u64, xs: u64, limit: 
 pub const bmm_tile_smem: u32 = 3 * (128 + 64) * 64 * 2;
 /// tf_glm_bmm_tile1's [bf16, fp32 out]: 3 stages of 128 x and 128 w rows, 32 bf16 a row, or the fp32 tile if larger.
 pub const bmm_tile1_smem = [2]u32{ 3 * (128 + 128) * 32 * 2, 128 * (128 + 4) * 4 };
+/// glm_glue_num.cuh's three-stage [absorb, expand] dynamic shared bytes.
+pub const latent_mma_smem = [2]u32{ 3 * (128 * 40 + 32 * 136) * 2, 3 * (128 * 40 + 128 * 40) * 2 };
 /// common/mla.cuh's wide_smem<hb>(): q (hb x 512), two 32-key tiles, p (hb x 32) in bf16, then max/sum scratch.
 pub fn chunksSmem(comptime hb: u32) u32 {
     return (hb * 512 + 2 * 32 * 512 + hb * 32) * 2 + (hb * 4 + 2 * hb) * 4;

@@ -98,6 +98,8 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
 | `TF_GLM_HC_FUSE` | Exactly `0` or `1`; default off. `1` has a 4-stream prompt call's `hc_post` (64 rows or more) also compute the next site's `hc_pre` partials (`tf_glm_hc_post_partial` and split-prefill `tf_glm_hc_post_partial_own`) from the streams it just wrote, leaving `hc_pre` to run `hc_finish` alone with the same output bytes |
 | `TF_GLM_ROUTER_FUSE` | Exactly `0` or `1`; default off. `1` adds a prompt router call's eight K slices in registers inside one launch (`tf_glm_router_fused`, when at least 144 64×32 tiles run on aligned rows), keeping `tf_glm_router_tile` then `tf_glm_slice_sum`'s exact bytes |
 | `TF_EXL3_PROMPT_GU` | GLM on CUDA: `0` or `pc` (unset or blank is `0`). `pc` runs uniform 4-bit EXL3 prompt gate/up (shared input rotation only) on 128-member items with `tf_exl3_prompt_gu_glm_pc` (640 threads, 96,832 bytes opt-in shared; three decoder warps decode each weight tile once per k step into shared memory for 16 MMA warps via mbarriers) and down via `tf_exl3_prompt_down_glm_h`; separate rotations and 3-bit/mixed layers keep 64-member items |
+| `TF_GLM_ABSORB_MMA` | Exactly `0` or `1`, agreed across ranks; default off. `1` selects tensor-core prompt MLA absorb/expand GEMMs (`tf_glm_latent_mma_kn`, `tf_glm_latent_mma_nk`) for aligned prompt calls of at least 64 rows (non-roped GLM-5.3-Flash); decode windows, short tails and unaligned pointers keep the SIMT kernels. Changes FP32 accumulation order, so registered as arithmetic; see [GLM CUDA prompt MLA](recipes/glm-prompt-mla.md) |
+| `TF_GLM_EXL3_BF16_SLOTS` | Exactly `0` or `1`, agreed across ranks; default off. `1` has uniform 4-bit EXL3 prompt chunks write their MoE slot rows (routed via `tf_exl3_prompt_down_glm_b16` / `tf_exl3_prompt_down_glm_h_b16` and shared) as bf16, as NVFP4 prompt chunks already do, halving slot-row memory traffic; decode windows, TFQ3, 3-bit/mixed EXL3 and NVFP4 checkpoints are unchanged. Changes rounding before the combine, so registered as arithmetic |
 | `TF_GLM_DSEL` | Exactly `0` or `1`; default on (a GLM decode window's DSA select runs on many CTAs; 0 keeps one CTA a row) |
 | `TF_GLM_DSCORES` | Exactly `0` or `1`; default on (a GLM decode window's DSA index scores run on glm_index_scores; 0 keeps tf_glm_scores) |
 | `TF_GLM_MOE_DIRECT` | Exactly `0` or `1`; default off. On, a GLM decode window's EXL3 experts read the top-k kernel's flat picks and leave their slot rows in place, summed with the shared expert's row by one kernel: no row copies and no slot write, the same bytes (#3570) |
@@ -314,3 +316,13 @@ The default path, with the switch unset, retains its existing plan, allocations 
 This is a capacity tradeoff, not a speed claim: attention reads mapped host KV over the device interconnect.
 Set `--prompt-cache-gib` explicitly to bound the separate host prompt cache.
 Host-on inference equality and performance on a discrete GPU remain device checks, not host-test results.
+
+## GLM CUDA prompt arithmetic
+
+`TF_GLM_ABSORB_MMA` accepts `0` or `1`; unset or blank keeps it off. GLM checks it
+before rank placement, NCCL or weights; other CUDA families do not check this GLM-only scope.
+`1` selects arithmetic-changing prompt absorb/expand GEMMs, registered as arithmetic in the
+profile and agreed in every rank's fingerprint. See the [experiment and pending gates](recipes/glm-prompt-mla.md).
+
+`TF_GLM_EXL3_BF16_SLOTS` accepts `0` or `1` with the same checks, scope and rank agreement; unset or blank keeps it off.
+`1` has a uniform 4-bit EXL3 checkpoint's prompt chunks write their MoE slot rows (the eight routed experts' and the shared expert's) as bf16, as NVFP4 prompt chunks already do, so the combine reads half the bytes. Each routed value is the fp32 kernel's rounded once to bf16 (`tf_exl3_prompt_down_glm_b16`, or `tf_exl3_prompt_down_glm_h_b16` under `TF_EXL3_PROMPT_GU=pc`); decode windows, TFQ3, 3-bit/mixed EXL3 and NVFP4 checkpoints are unchanged. It can change tokens, so it is registered as arithmetic; device qualification is pending.

@@ -19,6 +19,7 @@ const fw = struct {
     pub const Rank = struct { w: *u8, st: *State, b: *Buffers, segs: []const Seg = &.{} };
     pub var observed_ring = false;
     pub var observed_taps = false;
+    pub var observed_numerics: glm.ranks.Numerics = .{};
     pub var observed_propose: ?bool = null;
     pub const Forward = struct {
         d: u8,
@@ -31,10 +32,12 @@ const fw = struct {
         kda_wide: bool,
         shared_kda_wide: bool = true,
         hc_fuse: bool = false,
+        numerics: glm.ranks.Numerics = .{},
         ring: bool = false,
         taps: ?Taps = null,
         pub fn run(f: *Forward, ids: []const i32) !void {
             observed_ring = f.ring;
+            observed_numerics = f.numerics;
             observed_taps = f.taps != null;
             if (f.taps) |taps| if (taps.out != 0) {
                 for (ids, 0..) |id, i| {
@@ -76,7 +79,7 @@ const engine = struct {
         seqs: [32]Seq = @splat(.{}),
         bp: fw.Buffers,
         share: struct { vocab: Vocab = .{} } = .{},
-        settings: struct { split: bool = true, ring: bool = true, kda_wide: bool = true, shared_kda_wide: bool = true, hc_fuse: bool = false } = .{},
+        settings: struct { split: bool = true, ring: bool = true, kda_wide: bool = true, shared_kda_wide: bool = true, hc_fuse: bool = false, numerics: glm.ranks.Numerics = .{} } = .{},
         d: u8 = 0,
         m: u8 = 0,
         stream: u8 = 0,
@@ -422,4 +425,15 @@ test "GLM prompt workflow: a paired step feeds DFlash2 the rows and positions of
     try t.expectError(error.BadPromptContext, df.ingestPromptIn(&d, {}, 0, C, C, 2 * C + 1, 0));
     try t.expectError(error.DrafterContextTooWide, df.ingestPromptIn(&d, {}, 0, 2 * C, C, 3 * C, 1));
     try t.expectEqual(PairDrafter.cin0, d.cin);
+}
+
+test "GLM prompt workflow: a batched prompt carries the arithmetic opt-in into its forward" {
+    var b: Box = .{};
+    var e = b.make();
+    e.settings.numerics = .{ .absorb_mma = true, .exl3_bf16_slots = true };
+    try pass(&e, &.{.{ .slot = 4, .ids = &.{ 31, 32 } }});
+    try t.expect(fw.observed_numerics.absorb_mma and fw.observed_numerics.exl3_bf16_slots);
+    e.settings.numerics = .{};
+    try pass(&e, &.{.{ .slot = 9, .ids = &.{ 61, 62 } }});
+    try t.expectEqual(@as(u32, 0), fw.observed_numerics.bits());
 }

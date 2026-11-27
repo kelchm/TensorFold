@@ -270,11 +270,10 @@ extern "C" __global__ void __launch_bounds__(PTH, 1) tf_exl3_prompt_gu_glm_pc(co
 }
 
 // The 64-member down kernel on 128-member items: block y takes half y % 2 of item y / 2 (a 64-member plan's members).
-extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_glm_h(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+template <typename Y>
+__device__ __forceinline__ void prompt_down_glm_h(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
-        float* __restrict__ y, int K, int D, int skip) {
-    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<8>()];
-    __shared__ int rows_sh[TPM];
+        Y* __restrict__ y, int K, int D, int skip, unsigned char* smem_raw, int* rows_sh) {
     const int cb = blockIdx.x, item = blockIdx.y >> 1, hf = blockIdx.y & 1;
     if (item >= counts[0]) return;
     const int e = items[3 * item];
@@ -285,7 +284,24 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_glm_h(c
     if (threadIdx.x < TPM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    prompt_down<8>(Xd, Td, svh_d, y, K, D, smem_raw, rows_sh, cb, e, cnt, warp, lane);
+    prompt_down<8, Y>(Xd, Td, svh_d, y, K, D, smem_raw, rows_sh, cb, e, cnt, warp, lane);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_glm_h(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+        float* __restrict__ y, int K, int D, int skip) {
+    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<8>()];
+    __shared__ int rows_sh[TPM];
+    prompt_down_glm_h<float>(Xd, Td, items, counts, members, svh_d, y, K, D, skip, smem_raw, rows_sh);
+}
+
+// TF_GLM_EXL3_BF16_SLOTS with TF_EXL3_PROMPT_GU=pc: half-item down slot rows as bf16.
+extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_glm_h_b16(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+        __nv_bfloat16* __restrict__ y, int K, int D, int skip) {
+    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<8>()];
+    __shared__ int rows_sh[TPM];
+    prompt_down_glm_h<__nv_bfloat16>(Xd, Td, items, counts, members, svh_d, y, K, D, skip, smem_raw, rows_sh);
 }
 
 }  // namespace tf_exl3_prompt_glm

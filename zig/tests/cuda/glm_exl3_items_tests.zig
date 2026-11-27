@@ -104,7 +104,7 @@ fn items(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, w:
     const sc: glm.exl3.Scratch = .{ .picks = try r.zeros(sz[0]), .xg = try r.zeros(sz[1]), .xu = try r.zeros(sz[2]), .z = try r.zeros(sz[3]) };
     const ey = try r.zeros(rows * slots * dims * 4);
     const xd = try r.zeros(P * n * 2);
-    try glm.exl3.run(k, ek, r.s, w, sc, plan, try r.dev(std.mem.sliceAsBytes(x)), dims, try r.dev(std.mem.sliceAsBytes(pk)), slots, rows, E, dims, n, limit, false, ey, xd);
+    try glm.exl3.run(k, ek, r.s, w, sc, plan, try r.dev(std.mem.sliceAsBytes(x)), dims, try r.dev(std.mem.sliceAsBytes(pk)), slots, rows, E, dims, n, limit, false, false, ey, xd);
     return packSlots(r, ey, rows, dims);
 }
 

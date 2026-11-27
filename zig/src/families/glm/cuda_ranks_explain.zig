@@ -33,6 +33,7 @@ pub fn explain(f: anytype) []const u8 {
         .solo => "TF_GLM_CHUNK_SOLO",
         .l2pf => "TF_GLM_L2PF, _SHARED_FIRST, _MB, _CTAS or _PACE_GBPS",
         .bits => "TF_GLM_DENSE_BITS, TF_GLM_HEAD_BITS or TF_GLM_PACKED_PROMPT_S2",
+        .numerics => "TF_GLM_ABSORB_MMA or TF_GLM_EXL3_BF16_SLOTS",
         .capacity => "the sequence capacity (the context)",
         .drafter_bits => "--drafter-bits",
         .heat_high => "TF_HEAT_HIGH",
@@ -42,4 +43,11 @@ pub fn explain(f: anytype) []const u8 {
         .checkpoint => "checkpoint metadata or shard bytes",
         .drafter_checkpoint => "--drafter checkpoint metadata or shard bytes",
     };
+}
+
+/// Logs rank 0 startup warnings when opt-in prompt arithmetic switches are active.
+pub fn logNumerics(n: anytype, rank: usize) void {
+    if (rank != 0) return;
+    if (n.absorb_mma) @import("std").log.warn("TF_GLM_ABSORB_MMA: prompt absorb/expand uses tensor cores with a different FP32 accumulation order", .{});
+    if (n.exl3_bf16_slots) @import("std").log.warn("TF_GLM_EXL3_BF16_SLOTS: EXL3 prompt chunks round their MoE slot rows to bf16 before the combine", .{});
 }

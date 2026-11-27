@@ -31,6 +31,7 @@ pub const Settings = struct {
     heat: ?heat.Bands = null, // TF_HEAT_HIGH and TF_HEAT_LOW (upstream's names): a prompt chunk waits on every rank's hottest zone
     layers: u32 = 0, // TF_GLM_LAYERS: the first this many layers only, a thin model for one-GPU checks (0: all)
     dense_bits: u8 = 16, // TF_GLM_DENSE_BITS: the dense linears packed at load to 4, 6 or 8 bits (16: bf16)
+    numerics: Numerics = .{},
     head_bits: u8 = 16, // TF_GLM_HEAD_BITS: the head, likewise
     roce_multi: bool = false, // TF_GLM_ROCE_MULTI: 1 (three ranks or more: small all-gathers on fabric/tp's multirank RoCE beside NCCL) or 0
     roce_fuse: bool = false, // TF_GLM_ROCE_FUSE=1: TP2 whole-window gather + HC post or MTP residual in one kernel
@@ -179,6 +180,12 @@ pub const Settings = struct {
                 },
             };
         };
+        inline for (.{ .{ "TF_GLM_ABSORB_MMA", "absorb_mma" }, .{ "TF_GLM_EXL3_BF16_SLOTS", "exl3_bf16_slots" } }) |flag| {
+            @field(s.numerics, flag[1]) = @import("sys").environment.value(bool, flag[0], get(flag[0]), false) catch {
+                problem.* = flag[0] ++ ": 0 or 1";
+                return error.BadSetting;
+            };
+        }
         s.heat = heat.bandsFrom(get("TF_HEAT_HIGH"), get("TF_HEAT_LOW")) catch {
             problem.* = "TF_HEAT_HIGH and TF_HEAT_LOW: both or neither, in degrees, with low at or under high";
             return error.BadSetting;
@@ -252,6 +259,16 @@ pub const Settings = struct {
     }
 };
 
+/// Off-by-default prompt arithmetic, agreed by every rank before weights load.
+pub const Numerics = packed struct(u32) {
+    absorb_mma: bool = false, // TF_GLM_ABSORB_MMA: prompt MLA absorb/expand on tensor cores
+    exl3_bf16_slots: bool = false, // TF_GLM_EXL3_BF16_SLOTS: EXL3 prompt MoE slot rows in bf16
+    unused: u30 = 0,
+    pub fn bits(n: Numerics) u32 {
+        return @bitCast(n);
+    }
+};
+
 /// The most ranks a world holds: rank 0's greedy pick gathers every rank's top-1 into one host array of this size.
 pub const max_world = 16;
 
@@ -279,7 +296,7 @@ pub fn toolPieces(s: *Settings, comptime get: *const fn ([:0]const u8) ?[]const 
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 34, // 33, plus solo as row width and pair_solo bit in pair
+    layout: u32 = 35, // 34, plus opt-in prompt arithmetic (numerics)
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -308,6 +325,7 @@ pub const Fingerprint = extern struct {
     keep_seqs: u32 = 0, // TF_GLM_KEEP_SEQS: every rank keeps a released slot's sequence alike
     l2pf: [4]u32 = @splat(0), // TF_GLM_L2PF's words: every rank prefetches alike, so none waits on a slower one's windows
     bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
+    numerics: u32 = 0,
     capacity: u64, // tokens a sequence holds
     drafter_bits: u64 = 0, // --drafter-bits (0: no drafter, 16: bf16, 4: q4)
     roce_fuse: u64 = 0, // TF_GLM_ROCE_FUSE: whole-window posts fuse only where every rank enabled TP2 RoCE fusion
@@ -349,6 +367,7 @@ pub const Fingerprint = extern struct {
         solo,
         l2pf,
         bits,
+        numerics,
         capacity,
         drafter_bits,
         roce_fuse,
@@ -397,6 +416,7 @@ pub const Fingerprint = extern struct {
             .keep_seqs = @intFromBool(s.keep_seqs),
             .l2pf = s.l2pf.words(),
             .bits = (@as(u32, @intFromBool(s.prompt_s2)) << 16) | (@as(u32, s.dense_bits) << 8) | s.head_bits,
+            .numerics = s.numerics.bits(),
             .capacity = capacity,
             .heat_high = if (s.heat) |b| b.high_c else 0,
             .heat_low = if (s.heat) |b| b.low_c else 0,
@@ -443,6 +463,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "keep_seqs",
             "l2pf",
             "bits",
+            "numerics",
             "capacity",
             "drafter_bits",
             "roce_fuse",

@@ -8,6 +8,14 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
     b.step("test-glm-solo-host", "Solo widths, marks, ring agreement and startup memory refusals without devices").dependOn(&solo_run.step);
     step.dependOn(&solo_run.step);
     const host = b.graph.host;
+    const mla_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{ "GLM MLA:", "TF_GLM_EXL3_BF16_SLOTS:", "slot rows:" } }));
+    const mla_step = b.step("test-glm-mla-host", "MLA/EXL3 arithmetic opt-ins, rank agreement, launch fallbacks and FP64 fixtures without devices");
+    mla_step.dependOn(&mla_run.step);
+    step.dependOn(&mla_run.step);
+    const mla_contract = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_mla_host.zig"), .target = host, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{ .{ .name = "glm_cuda", .module = glm }, .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } });
+    const mla_contract_run = b.addRunArtifact(b.addTest(.{ .root_module = mla_contract, .filters = &.{"GLM MLA:"} }));
+    mla_step.dependOn(&mla_contract_run.step);
+    step.dependOn(&mla_contract_run.step);
     @import("glm_wide_expert_host.zig").steps(b, cuda, glm, mods.core, step);
     @import("glm_priced_windows_host.zig").steps(b, cuda, glm, mods.lanes, step);
     const pdl = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM PDL policy:"} }));

@@ -91,6 +91,10 @@ const Record = struct {
 };
 
 fn run(rows: usize, prompt: bool, shared: bool, count: usize) !void {
+    return runAs(rows, prompt, shared, count, false);
+}
+
+fn runAs(rows: usize, prompt: bool, shared: bool, count: usize, b16: bool) !void {
     Record.reset();
     var d: cuda.Driver = undefined;
     d.api.cuLaunchKernel = Record.launch;
@@ -99,19 +103,19 @@ fn run(rows: usize, prompt: bool, shared: bool, count: usize) !void {
     var k: glm.exl3.Kernels = undefined;
     inline for (.{ "group", "rot_in", "gateup", "down_combine" }, .{ 9, 5, 13, 14 }) |field, id| @field(k, field) = Record.function(&d, id);
     k.grouped = .{ Record.function(&d, 10), Record.function(&d, 11), Record.function(&d, 12) };
-    k.prompt = .{ .rotate = Record.function(&d, 6), .gateup = Record.function(&d, 7), .down = Record.function(&d, 8), .gateup_k6 = Record.function(&d, 21), .down_k6 = Record.function(&d, 22), .gateup_m = @splat(Record.function(&d, 23)), .down_m = @splat(Record.function(&d, 24)), .gateup_glm = Record.function(&d, 7), .down_glm = Record.function(&d, 8) };
+    k.prompt = .{ .rotate = Record.function(&d, 6), .gateup = Record.function(&d, 7), .down = Record.function(&d, 8), .gateup_k6 = Record.function(&d, 21), .down_k6 = Record.function(&d, 22), .gateup_m = @splat(Record.function(&d, 23)), .down_m = @splat(Record.function(&d, 24)), .gateup_glm = Record.function(&d, 7), .down_glm = Record.function(&d, 8), .down_glm_b16 = Record.function(&d, 8) };
     var ek: glm.experts.Kernels = undefined;
     inline for (.{ "plan_small", "plan_rows", "plan_rank", "plan_offsets", "plan_scatter", "plan_rank_rows", "plan_scatter_rows" }, .{ 1, 18, 2, 3, 4, 19, 20 }) |field, id| @field(ek.router, field) = Record.function(&d, id);
     const w = glm.exl3.Experts{ .gt = 101, .ut = 102, .dt = 103, .k2 = 104, .suh_g = 105, .suh_u = 106, .svh_g = 107, .svh_u = 108, .suh_d = 109, .svh_d = 110, .shx = shared };
     const sc = glm.exl3.Scratch{ .picks = 0x100000000, .xg = 0, .xu = 0, .z = 0 };
     const plan = cuda.grouped.Plan{ .members = 201, .items = 202, .counts = 203, .rank = 204, .hist = 205 };
-    try glm.exl3.run(&k, &ek, .{ .d = &d, .handle = null }, w, sc, plan, 0x200000000, 512, 0x300000000, 9, rows, count, 512, 256, 7, prompt, 0x400000000, 0);
+    try glm.exl3.run(&k, &ek, .{ .d = &d, .handle = null }, w, sc, plan, 0x200000000, 512, 0x300000000, 9, rows, count, 512, 256, 7, prompt, b16, 0x400000000, 0);
 }
 
 test "GLM EXL3 prompt: a whole pass makes one expert call and no 2D copies" {
     const cap = glm.exl3.prompt_rows;
-    for ([_]bool{ false, true }) |shared| for ([_]usize{ 2048, 1, 17, 1024, 4096, cap, cap + 6 }) |rows| {
-        try run(rows, true, shared, 288);
+    for ([_]bool{ false, true }) |b16| for ([_]bool{ false, true }) |shared| for ([_]usize{ 2048, 1, 17, 1024, 4096, cap, cap + 6 }) |rows| {
+        try runAs(rows, true, shared, 288, b16);
         try t.expectEqual(@as(usize, 0), Record.copies);
         const calls = (rows + cap - 1) / cap;
         try t.expectEqual(calls, Record.up);
@@ -124,7 +128,7 @@ test "GLM EXL3 prompt: a whole pass makes one expert call and no 2D copies" {
             try t.expectEqual(@as(i32, 289), Record.experts[j]);
             try t.expectEqual(@as(i32, if (shared) 9 else 1), Record.divisor[j]);
             try t.expectEqual(@as(i32, 288), Record.skip[j]);
-            try t.expectEqual(@as(u64, 0x400000000 + j * cap * 9 * 512 * 4), Record.outputs[j]);
+            try t.expectEqual(@as(u64, 0x400000000 + j * cap * 9 * 512 * @as(usize, if (b16) 2 else 4)), Record.outputs[j]);
         }
     };
 }

@@ -298,19 +298,30 @@ fn copyRows(stream: cuda.Stream, dst: u64, dpitch: usize, src: u64, spitch: usiz
     const m: cuda.abi.Memcpy2D = .{ .src = src, .src_pitch = spitch, .dst = dst, .dst_pitch = dpitch, .width = width, .height = height };
     try stream.d.check(stream.d.api.cuMemcpy2DAsync_v2(&m, stream.handle), what);
 }
-pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, plan_buf: cuda.grouped.Plan, x: u64, x_stride: usize, picks: u64, slots: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32, prompt: bool, ey: u64, xd: u64) !void {
+/// Whether an EXL3 prompt call runs the GLM 4-bit kernels (which can write bf16 slot rows directly).
+pub fn bf16Eligible(w: Experts, dims: usize, width: usize) bool {
+    const l = layer(w, cuda.grouped.max_experts, dims, width, 0);
+    const ws = common.prompt.widths(l);
+    return common.prompt.eligible(l) and ws.gu == 8 and ws.d == 8;
+}
+
+pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, plan_buf: cuda.grouped.Plan, x: u64, x_stride: usize, picks: u64, slots: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32, prompt: bool, b16: bool, ey: u64, xd: u64) !void {
     if (slots != top_k + 1) return error.UnsupportedTopK;
     if (dims % 256 != 0 or width % 128 != 0) return error.UnreadableExl3;
     const l = layer(w, count, dims, width, limit);
+    const direct = prompt and common.prompt.eligible(l);
+    if (b16 and (!direct or !bf16Eligible(w, dims, width))) return error.UnreadableExl3;
+    const eb: usize = if (b16) 2 else 4; // ey's element: TF_GLM_EXL3_BF16_SLOTS
     if (eligibleDecode(w, rows, count, dims, width, prompt) and k.glm_decode) {
         return runDecode(k, ek.router, stream, w, sc.picks, plan_buf, x, x_stride, picks, slots, rows, count, limit, ey, xd);
     }
-    if (prompt and common.prompt.eligible(l)) {
-        const scratch = try common.prompt.scratch(sc.picks, l, @min(rows, prompt_rows), slots);
+    if (direct) {
+        var scratch = try common.prompt.scratch(sc.picks, l, @min(rows, prompt_rows), slots);
+        scratch.b16 = b16;
         var at: usize = 0;
         while (at < rows) : (at += prompt_rows) {
             const n: usize = @min(prompt_rows, rows - at);
-            try k.prompt.runGlm(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, picks + at * slots * 4, n, scratch, plan_buf, ey + at * slots * dims * 4, count);
+            try k.prompt.runGlm(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, picks + at * slots * 4, n, scratch, plan_buf, ey + at * slots * dims * eb, count);
         }
         return;
     }

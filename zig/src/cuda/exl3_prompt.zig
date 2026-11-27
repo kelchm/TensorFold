@@ -15,7 +15,8 @@ pub const Geometry = struct { tile: usize, threads: u32, shared: u32 = 0, halves
 pub const narrow: Geometry = .{ .tile = tile, .threads = 256 };
 /// pc: 128-member items, 640 threads, PSMEM bytes (exl3_prompt_glm_pc.cuh); down takes each 64-member half.
 pub const pc: Geometry = .{ .tile = 2 * tile, .threads = 640, .shared = 96832, .halves = 2 };
-pub const Scratch = struct { xg: u64, xu: u64, xd: u64, rows: usize, slots: usize };
+/// b16: write routed slot rows as bf16 (runGlm 4-bit GLM kernels only; common run refuses b16).
+pub const Scratch = struct { xg: u64, xu: u64, xd: u64, rows: usize, slots: usize, b16: bool = false };
 /// A group's verified half-bit width: its own field, else uniform_k2; 0 when unverified or the two disagree.
 fn verified(group: u32, uniform: u32) u32 {
     if (group == 0) return uniform;
@@ -87,8 +88,10 @@ pub const Kernels = struct {
     down_m: [3]Function,
     gateup_glm: ?Function = null,
     down_glm: ?Function = null,
+    down_glm_b16: ?Function = null,
     gateup_glm_pc: ?Function = null, // TF_EXL3_PROMPT_GU=pc, and the half-item down kernel
     down_glm_h: ?Function = null,
+    down_glm_h_b16: ?Function = null,
     gu: Gu = .plain,
     pub fn resolve(mod: Module) !Kernels {
         const wide = try mod.function("tf_exl3_prompt_gu_glm_pc");
@@ -103,28 +106,36 @@ pub const Kernels = struct {
             .down_m = .{ try mod.function("tf_exl3_prompt_down_m4"), try mod.function("tf_exl3_prompt_down_m6"), try mod.function("tf_exl3_prompt_down_m8") },
             .gateup_glm = try mod.function("tf_exl3_prompt_gu_glm"),
             .down_glm = try mod.function("tf_exl3_prompt_down_glm"),
+            .down_glm_b16 = try mod.function("tf_exl3_prompt_down_glm_b16"),
             .gateup_glm_pc = wide,
             .down_glm_h = try mod.function("tf_exl3_prompt_down_glm_h"),
+            .down_glm_h_b16 = try mod.function("tf_exl3_prompt_down_glm_h_b16"),
         };
     }
     /// GLM opts into ahead-staged 4-bit prompt kernels (and TF_EXL3_PROMPT_GU=pc); 3-bit and mixed keep common kernels.
     pub fn runGlm(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan, y: u64, skip: ?usize) !void {
         const w = widths(l);
-        if (w.gu != 8 or w.d != 8) return k.run(e, router, s, l, x, stride, picks, rows, sc, p, y, skip);
-        if (y % 16 != 0 or sc.xd % 8 != 0) return error.Exl3Shape;
+        if (w.gu != 8 or w.d != 8) {
+            if (sc.b16) return error.Exl3Shape;
+            return k.run(e, router, s, l, x, stride, picks, rows, sc, p, y, skip);
+        }
+        if (y % @as(u64, if (sc.b16) 8 else 16) != 0 or sc.xd % 8 != 0) return error.Exl3Shape;
         var tuned = k;
         const wide = k.gu == .pc and l.shared_input; // separate gate and up rotations keep tf_exl3_prompt_gu_glm
         tuned.gateup = (if (wide) k.gateup_glm_pc else k.gateup_glm) orelse return error.Exl3Shape;
-        tuned.down = (if (wide) k.down_glm_h else k.down_glm) orelse return error.Exl3Shape;
-        try tuned.runAt(e, router, s, l, x, stride, picks, rows, sc, p, y, skip, if (wide) pc else narrow);
+        tuned.down = (if (wide) (if (sc.b16) k.down_glm_h_b16 else k.down_glm_h) else (if (sc.b16) k.down_glm_b16 else k.down_glm)) orelse return error.Exl3Shape;
+        var plain = sc;
+        plain.b16 = false; // run/runAt refuses b16: only the GLM down kernels chosen here write bf16
+        try tuned.runAt(e, router, s, l, x, stride, picks, rows, plain, p, y, skip, if (wide) pc else narrow);
     }
     /// `skip` is the shared expert's id, equal to the routed count; its output slot stays owned by the caller.
     pub fn run(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan, y: u64, skip: ?usize) !void {
+        if (sc.b16) return error.Exl3Shape;
         return k.runAt(e, router, s, l, x, stride, picks, rows, sc, p, y, skip, narrow);
     }
     /// `g`'s items: the plan, the gate/up grid and block, and down's blocks per item.
     fn runAt(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan, y: u64, skip: ?usize, g: Geometry) !void {
-        if (!eligible(l) or rows == 0 or rows > sc.rows or stride < l.dims or stride > std.math.maxInt(i32)) return error.Exl3Shape;
+        if (!eligible(l) or sc.b16 or rows == 0 or rows > sc.rows or stride < l.dims or stride > std.math.maxInt(i32)) return error.Exl3Shape;
         _ = try bytes(l, rows, sc.slots);
         if (skip) |id| if (id != l.experts or l.experts == grouped.max_experts) return error.Exl3Shape;
         const count = l.experts + @intFromBool(skip != null);

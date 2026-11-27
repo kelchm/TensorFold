@@ -8,7 +8,7 @@ const ref = @import("contract_exl3_prompt_ref.zig");
 const c = core.contract.spec;
 const g = core.contract.gates;
 
-const Kind = enum { gu, down };
+const Kind = enum { gu, down, b16 }; // b16: the down kernel's slot rows rounded to bf16 (TF_GLM_EXL3_BF16_SLOTS)
 const Fault = enum { none, last_member, wrong_skip, narrow_kernel };
 
 fn depth(s: c.Shape) usize {
@@ -67,8 +67,10 @@ pub const Case = struct {
     members: u64 = 0,
     out: u64 = 0,
     base: u64 = 0,
+    rounded: std.ArrayList(u8) = .empty,
 
     pub fn deinit(self: *Case) void {
+        self.rounded.deinit(self.rig.gpu.gpa);
         self.rig.deinit();
     }
 
@@ -80,9 +82,11 @@ pub const Case = struct {
             .narrow_kernel => "control: GLM prompt 128-member items on the 64-member down kernel",
             .none => if (wide) switch (self.kind) {
                 .down => "cuda exl3 tf_exl3_prompt_down_glm_h halves of 128-member items",
+                .b16 => "cuda exl3 tf_exl3_prompt_down_glm_h_b16 halves of 128-member items, bf16 slots",
                 .gu => if (self.act == 0) "cuda exl3 tf_exl3_prompt_gu_glm_pc 128-member items, shared rotation, bf16" else "cuda exl3 tf_exl3_prompt_gu_glm_pc 128-member items, shared rotation, fp32",
             } else switch (self.kind) {
                 .down => "cuda exl3 tf_exl3_prompt_down_glm",
+                .b16 => "cuda exl3 tf_exl3_prompt_down_glm_b16 bf16 slots",
                 .gu => if (self.shared) "cuda exl3 tf_exl3_prompt_gu_glm shared rotation" else if (self.act == 0) "cuda exl3 tf_exl3_prompt_gu_glm separate bf16" else "cuda exl3 tf_exl3_prompt_gu_glm separate fp32",
             },
         };
@@ -90,10 +94,14 @@ pub const Case = struct {
             .name = name,
             .accum = .f32,
             .depth = depth,
-            .out = if (self.kind == .gu) .f16 else .f32,
+            .out = switch (self.kind) {
+                .gu => .f16,
+                .b16 => .bf16,
+                .down => .f32,
+            },
             .ops = 8,
-            .replaces = "retained common prompt kernel with shared-slot skip",
-            .nan = .{ .stated = "the retained kernel's bytes on identical NaN and infinity plants" },
+            .replaces = if (self.kind == .b16) "retained common prompt kernel with shared-slot skip, then __float2bfloat16_rn" else "retained common prompt kernel with shared-slot skip",
+            .nan = .{ .stated = if (self.kind == .b16) "the retained kernel's bytes rounded to bf16 on identical plants, NaN as 0x7fff" else "the retained kernel's bytes on identical NaN and infinity plants" },
             .served = if (wide) &wide_shapes else &shapes,
             .tiles = .{ .{ .size = self.geometry.tile }, .{ .size = 256, .step = 256, .min = 256 }, .{ .size = 128, .step = 128, .min = 128 } },
             .sums = .{ .exact = false, .bf16 = 0, .why = "balanced reduced-precision sums can retain constant terms; fp16 must overflow" },
@@ -176,14 +184,20 @@ pub const Case = struct {
             }
         }
         const bytes = self.count() * self.elemBytes();
+        const base_bytes = self.count() * self.baseBytes();
         self.out = try self.rig.output(bytes);
         try self.rig.zero(self.out, bytes);
-        self.base = try self.rig.scratch(bytes);
-        try self.rig.zero(self.base, bytes);
+        self.base = try self.rig.scratch(base_bytes);
+        try self.rig.zero(self.base, base_bytes);
         return true;
     }
 
     fn elemBytes(self: *Case) usize {
+        return if (self.kind == .gu or self.kind == .b16) 2 else 4;
+    }
+
+    /// The retained kernel's element: fp16 gate/up rows, fp32 down rows.
+    fn baseBytes(self: *Case) usize {
         return if (self.kind == .gu) 2 else 4;
     }
 
@@ -225,7 +239,14 @@ pub const Case = struct {
 
     pub fn replaced(self: *Case) ![]const u8 {
         try self.launch(self.old, self.base, true);
-        return self.rig.bytes(self.base, self.count() * self.elemBytes());
+        const src = try self.rig.bytes(self.base, self.count() * self.baseBytes());
+        if (self.kind != .b16) return src;
+        try self.rounded.resize(self.rig.gpu.gpa, self.count() * 2);
+        for (0..self.count()) |i| {
+            const v: f32 = @bitCast(std.mem.readInt(u32, src[i * 4 ..][0..4], .little));
+            std.mem.writeInt(u16, self.rounded.items[i * 2 ..][0..2], if (std.math.isNan(v)) 0x7fff else c.toBf16(v), .little);
+        }
+        return self.rounded.items;
     }
 
     pub fn check(self: *Case, _: g.Gate) !?[]const u8 {
@@ -257,7 +278,7 @@ pub const Case = struct {
 pub const Group = struct {
     a: std.mem.Allocator,
     mod: cuda.Module,
-    entries: [11]Case,
+    entries: [13]Case,
 
     pub fn create(a: std.mem.Allocator, gpu: check_.Gpu, s: cuda.Stream, kernels: *std.ArrayList(g.Kernel)) !*Group {
         const self = try a.create(Group);
@@ -281,7 +302,7 @@ pub const Group = struct {
         }
         // 6..10: TF_EXL3_PROMPT_GU=pc (gu bf16, gu fp32, down_h, last_member ctl, narrow_kernel ctl)
         const pc = cuda.exl3_experts.prompt.pc;
-        for (self.entries[6..], 0..) |*x, i| {
+        for (self.entries[6..11], 0..) |*x, i| {
             const gu = i < 2 or i == 3;
             x.* = .{
                 .rig = .{ .gpu = gpu, .s = s },
@@ -294,6 +315,9 @@ pub const Group = struct {
                 .old = if (gu) p.gateup else p.down,
             };
         }
+        // 11..12: TF_GLM_EXL3_BF16_SLOTS (narrow and pc half-item bf16 slot down kernels)
+        self.entries[11] = .{ .rig = .{ .gpu = gpu, .s = s }, .kind = .b16, .f = p.down_glm_b16.?, .old = p.down };
+        self.entries[12] = .{ .rig = .{ .gpu = gpu, .s = s }, .kind = .b16, .geometry = pc, .f = p.down_glm_h_b16.?, .old = p.down };
         errdefer for (&self.entries) |*x| x.deinit();
         for (&self.entries) |*x| try kernels.append(a, x.kernel());
         return self;
@@ -320,4 +344,10 @@ test "GLM prompt contract: every hook compiles without embedded CUDA images" {
     for (wide_shapes[0..128], 1..) |sh, r| try std.testing.expectEqual(r, sh.rows);
     x.kind = .down;
     try std.testing.expectEqualStrings("cuda exl3 tf_exl3_prompt_down_glm_h halves of 128-member items", x.kernel().spec.name);
+    x.kind = .b16;
+    const half_pc = x.kernel();
+    try std.testing.expectEqual(c.Elem.bf16, half_pc.spec.out);
+    try std.testing.expect(half_pc.spec.replaces != null and half_pc.vt.replaced != null);
+    x.geometry = cuda.exl3_experts.prompt.narrow;
+    try std.testing.expectEqual(c.Elem.bf16, x.kernel().spec.out);
 }

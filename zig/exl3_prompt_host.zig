@@ -18,7 +18,7 @@ const Capture = struct {
             5 => &.{ 8, 8, 8, 8, 8, 8, 4, 4, 4, 4, 4 },
             11 => &.{ 8, 4, 8, 8, 4 },
             12, 14, 30, 32 => &.{ 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4, 4, 4 },
-            13, 15, 31, 33 => &.{ 8, 8, 8, 8, 8, 8, 8, 4, 4, 4 },
+            13, 15, 31, 33, 34, 35 => &.{ 8, 8, 8, 8, 8, 8, 8, 4, 4, 4 },
             16, 17, 18 => &.{ 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4, 4, 4, 8 }, // the mixed: then the widths
             19, 27, 28 => &.{ 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 8 },
             20 => &.{ 8, 4, 4, 4, 8, 8, 8 }, // plan_small: picks, pairs, experts, tile, members, items, counts
@@ -54,9 +54,12 @@ fn function(d: *const cuda.Driver, id: usize) cuda.Function {
     return .{ .d = d, .handle = @ptrFromInt(id) };
 }
 fn run(rows: usize, prompt: bool, shared: bool) !void {
-    return runGu(rows, prompt, shared, .plain);
+    return runMode(rows, prompt, shared, .plain, false);
 }
 fn runGu(rows: usize, prompt: bool, shared: bool, gu: ex.prompt.Gu) !void {
+    return runMode(rows, prompt, shared, gu, false);
+}
+fn runMode(rows: usize, prompt: bool, shared: bool, gu: ex.prompt.Gu, b16: bool) !void {
     Capture.reset();
     var d: cuda.Driver = undefined;
     d.api.cuLaunchKernel = Capture.launch;
@@ -64,12 +67,12 @@ fn runGu(rows: usize, prompt: bool, shared: bool, gu: ex.prompt.Gu) !void {
     d.api.cuMemcpy2DAsync_v2 = Capture.copy;
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     var k: ex.Experts = .{ .mod = undefined, .group = function(&d, 1), .rot_in = function(&d, 2), .grouped = @splat(function(&d, 3)), .gateup = function(&d, 4), .down_combine = function(&d, 5) };
-    if (comptime @hasField(ex.Experts, "prompt")) k.prompt = .{ .rotate = function(&d, 11), .gateup = function(&d, 12), .down = function(&d, 13), .gateup_k6 = function(&d, 14), .down_k6 = function(&d, 15), .gateup_m = @splat(function(&d, 16)), .down_m = @splat(function(&d, 17)), .gateup_glm = function(&d, 30), .down_glm = function(&d, 31), .gateup_glm_pc = function(&d, 32), .down_glm_h = function(&d, 33), .gu = gu };
+    if (comptime @hasField(ex.Experts, "prompt")) k.prompt = .{ .rotate = function(&d, 11), .gateup = function(&d, 12), .down = function(&d, 13), .gateup_k6 = function(&d, 14), .down_k6 = function(&d, 15), .gateup_m = @splat(function(&d, 16)), .down_m = @splat(function(&d, 17)), .gateup_glm = function(&d, 30), .down_glm = function(&d, 31), .down_glm_b16 = function(&d, 34), .gateup_glm_pc = function(&d, 32), .down_glm_h = function(&d, 33), .down_glm_h_b16 = function(&d, 35), .gu = gu };
     const ek: glm.experts.Kernels = .{ .nvfp4 = undefined, .b32 = null, .router = .{ .plan_small = function(&d, 20), .plan_rank = function(&d, 21), .plan_offsets = function(&d, 22), .plan_scatter = function(&d, 23), .plan_rows = function(&d, 24), .plan_rank_rows = function(&d, 25), .plan_scatter_rows = function(&d, 26) } };
     const w: glm.exl3.Experts = .{ .gt = 100, .ut = 200, .dt = 300, .k2 = 400, .suh_g = 500, .suh_u = 600, .svh_g = 700, .svh_u = 800, .suh_d = 900, .svh_d = 1000, .shx = shared };
     const sc: glm.exl3.Scratch = .{ .picks = 0x100000000, .xg = 0, .xu = 0, .z = 0 };
     const plan: cuda.grouped.Plan = .{ .items = 10000, .members = 20000, .counts = 30000, .rank = 40000, .hist = 50000 };
-    try glm.exl3.run(&k, &ek, s, w, sc, plan, 0x200000000, 520, 0x300000000, 9, rows, 9, 512, 256, 10, prompt, 0x400000000, 0);
+    try glm.exl3.run(&k, &ek, s, w, sc, plan, 0x200000000, 520, 0x300000000, 9, rows, 9, 512, 256, 10, prompt, b16, 0x400000000, 0);
 }
 
 test "exl3 prompt: dispatch rotates once per row only with verified shared scales, with GLM ahead-staged kernels" {
@@ -140,12 +143,20 @@ test "exl3 prompt: GLM refuses unaligned vector outputs before any driver call a
     try std.testing.expectError(error.Exl3Shape, k.prompt.runGlm(&k, router, s, l, 0, 512, 0, 1, sc, plan, 24, 9));
     sc.xd = 9;
     try std.testing.expectError(error.Exl3Shape, k.prompt.runGlm(&k, router, s, l, 0, 512, 0, 1, sc, plan, 16, 9));
+    // bf16 slot rows: 8-byte aligned, GLM kernel resolved, refused on common run and non-4-bit layers
+    sc.xd = 8;
+    sc.b16 = true;
+    try std.testing.expectError(error.Exl3Shape, k.prompt.runGlm(&k, router, s, l, 0, 512, 0, 1, sc, plan, 20, 9));
+    try std.testing.expectError(error.Exl3Shape, k.prompt.runGlm(&k, router, s, l, 0, 512, 0, 1, sc, plan, 24, 9));
+    try std.testing.expectError(error.Exl3Shape, k.prompt.run(&k, router, s, l, 0, 512, 0, 1, sc, plan, 24, 9));
     try std.testing.expectEqual(@as(usize, 0), Capture.count);
-    // 3-bit gate/up with 4-bit down delegates to common kernels
+    // 3-bit gate/up with 4-bit down delegates to common kernels (and refuses b16)
     l.uniform_k2 = 0;
     l.uniform_k2_gu = 6;
     l.uniform_k2_d = 8;
     sc.xd = 256;
+    try std.testing.expectError(error.Exl3Shape, k.prompt.runGlm(&k, router, s, l, 0, 512, 0, 1, sc, plan, 256, 9));
+    sc.b16 = false;
     try k.prompt.runGlm(&k, router, s, l, 0, 512, 0, 1, sc, plan, 256, 9);
     try std.testing.expectEqual(@as(usize, 1), Capture.by(14).len);
     try std.testing.expectEqual(@as(usize, 1), Capture.by(13).len);
@@ -167,26 +178,37 @@ test "exl3 prompt: scratch omits global split partials and shared rotation stora
     } else try std.testing.expect(false);
 }
 
-test "exl3 prompt: 4096-row calls keep input and output offsets on both sides of the boundary" {
-    try run(4102, true, true);
-    try std.testing.expectEqual(@as(usize, 0), Capture.copied);
-    var rotations: usize = 0;
-    var outputs: usize = 0;
-    for (Capture.calls[0..Capture.count]) |call| {
-        if (call.id == 11) {
-            const at: u64 = if (rotations == 0) 0 else 4096;
-            try std.testing.expectEqual(@as(u64, 0x200000000 + at * 520 * 2), call.args[0]);
-            rotations += 1;
+test "exl3 prompt: whole-pass boundary calls keep input and fp32/bf16 output offsets (plain and pc)" {
+    const cap = glm.exl3.prompt_rows;
+    for ([_]ex.prompt.Gu{ .plain, .pc }) |gu| for ([_]bool{ false, true }) |b16| {
+        try runMode(cap + 6, true, true, gu, b16);
+        try std.testing.expectEqual(@as(usize, 0), Capture.copied);
+        const down_id: usize = if (gu == .pc) (if (b16) 35 else 33) else (if (b16) 34 else 31);
+        const eb: u64 = if (b16) 2 else 4;
+        var rotations: usize = 0;
+        var outputs: usize = 0;
+        for (Capture.calls[0..Capture.count]) |call| {
+            if (call.id == 11) {
+                const at: u64 = if (rotations == 0) 0 else cap;
+                try std.testing.expectEqual(@as(u64, 0x200000000 + at * 520 * 2), call.args[0]);
+                rotations += 1;
+            }
+            if (call.id == down_id) {
+                const at: u64 = if (outputs == 0) 0 else cap;
+                try std.testing.expectEqual(@as(u64, 0x400000000 + at * 9 * 512 * eb), call.args[6]);
+                try std.testing.expectEqual(@as(u64, 9), call.args[9]);
+                outputs += 1;
+            }
         }
-        if (call.id == 31) {
-            const at: u64 = if (outputs == 0) 0 else 4096;
-            try std.testing.expectEqual(@as(u64, 0x400000000 + at * 9 * 512 * 4), call.args[6]);
-            try std.testing.expectEqual(@as(u64, 9), call.args[9]);
-            outputs += 1;
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 2), rotations);
-    try std.testing.expectEqual(@as(usize, 2), outputs);
+        try std.testing.expectEqual(@as(usize, 2), rotations);
+        try std.testing.expectEqual(@as(usize, 2), outputs);
+    };
+}
+
+test "exl3 prompt: bf16 slot rows refuse decode before any launch" {
+    Capture.reset();
+    try std.testing.expectError(error.UnreadableExl3, runMode(4, false, true, .plain, true));
+    try std.testing.expectEqual(@as(usize, 0), Capture.count);
 }
 
 test "exl3 prompt: decode uses item plans and keeps slot and input offsets across chunks" {

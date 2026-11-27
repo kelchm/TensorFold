@@ -7,7 +7,7 @@ fn smem(hb: u32) u32 {
 }
 
 pub const records = blk: {
-    var out: [10]registry.CudaRecord = undefined;
+    var out: [14]registry.CudaRecord = undefined;
     var n: usize = 0;
     for (.{ 16, 32 }) |hb| for (.{ "", "_fp8", "_fp8_paged" }) |kind| {
         const symbol = std.fmt.comptimePrint("tf_glm_chunks_{d}{s}_fused", .{ hb, kind });
@@ -27,5 +27,18 @@ pub const records = blk: {
         };
         n += 1;
     };
+    for ([_][]const u8{ "kn", "nk" }, 0..) |suffix, i| {
+        const dynamic: u32 = if (i == 0) 56832 else 61440;
+        for ([_]bool{ false, true }) |control| {
+            const symbol = (if (control) "tf_ctl_glm_mma_" else "tf_glm_latent_mma_") ++ suffix;
+            const image = if (control) "contract_controls" else "glm_glue";
+            out[n] = .{
+                .launch = .{ .name = image ++ " " ++ symbol, .symbol = symbol, .image = image, .threads = 256, .dynamic = dynamic, .opt_in = true, .min_sm = 80 },
+                .usage = registry.none,
+                .later_pending = true,
+            };
+            n += 1;
+        }
+    }
     break :blk out;
 };

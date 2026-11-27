@@ -203,6 +203,7 @@ pub const Forward = struct {
     l2pf: ?*const l2pf_mod.L2pf = null, // TF_GLM_L2PF: a decode window's sites read their next weights into L2
     side: ?moe.Side = null, // TF_GLM_SHARED_SIDE: decode window shared expert on its own stream (same bytes)
     hc_fuse: bool = false, // TF_GLM_HC_FUSE: a prompt call's hc_post writes the next hc_pre's partials (same bytes)
+    numerics: @import("cuda_ranks.zig").Numerics = .{}, // opt-in prompt arithmetic (TF_GLM_ABSORB_MMA, TF_GLM_EXL3_BF16_SLOTS)
 
     /// TF_GLM_L2PF on this forward: a decode window of this process's one rank (a prompt chunk reads at full rate).
     pub fn prefetch(f: *const Forward) ?*const l2pf_mod.L2pf {
@@ -210,7 +211,7 @@ pub const Forward = struct {
     }
 
     pub fn set(f: *const Forward) glue.Set {
-        return .{ .verify_tiles = f.verify_tiles, .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .dsel = f.m.dsel, .dscore = if (f.m.dscore) |*x| x else null, .mla = if (f.m.mla) |*x| x else null, .tfq3 = if (f.m.tfq3) |*x| x else null };
+        return .{ .verify_tiles = f.verify_tiles, .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .dsel = f.m.dsel, .dscore = if (f.m.dscore) |*x| x else null, .mla = if (f.m.mla) |*x| x else null, .tfq3 = if (f.m.tfq3) |*x| x else null, .absorb_mma = f.numerics.absorb_mma and f.ranks[0].b.prefill };
     }
 
     /// The layer sums' boundary; true means its optional post already ran in the gather kernel.
@@ -297,7 +298,7 @@ pub const Forward = struct {
     }
 
     pub fn moeKernels(f: *const Forward) moe.Kernels {
-        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .tfq3 = if (f.m.tfq3) |*x| x else null, .put_slot = f.m.put_slot, .prof = f.prof, .direct = f.m.moe_direct, .side = f.side };
+        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .tfq3 = if (f.m.tfq3) |*x| x else null, .put_slot = f.m.put_slot, .prof = f.prof, .direct = f.m.moe_direct, .side = f.side, .exl3_b16 = f.numerics.exl3_bf16_slots };
     }
 
     pub const Site = enum { mixer, ffn };

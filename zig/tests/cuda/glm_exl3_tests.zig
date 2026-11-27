@@ -112,12 +112,12 @@ fn picks(r: *Rig, rows: usize) ![]i32 {
 
 const Run = struct { ey: u64, rows: usize };
 
-/// The family's dispatch on `x` (bf16 [rows][D]) and `pk`: ey [rows][slots][D] fp32, the shared slot left as filled.
+/// The family's dispatch on `x` (bf16 [rows][D]) and `pk`: ey [rows][slots][D] fp32 or bf16, shared slot untouched.
 fn run(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, s: Set, x: []const u16, pk: []const i32, rows: usize, prompt: bool) !Run {
-    return runMode(r, k, ek, s, x, pk, rows, prompt, false, null);
+    return runMode(r, k, ek, s, x, pk, rows, prompt, false, false, null);
 }
 
-fn runMode(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, s: Set, x: []const u16, pk: []const i32, rows: usize, prompt: bool, legacy: bool, sentinel: ?u32) !Run {
+fn runMode(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, s: Set, x: []const u16, pk: []const i32, rows: usize, prompt: bool, b16: bool, legacy: bool, sentinel: ?u32) !Run {
     const P = rows * slots;
     const tile: usize = if (prompt) glm.experts.staged_tile else glm.experts.tile;
     const wide = P > cuda.grouped.small;
@@ -140,7 +140,7 @@ fn runMode(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, 
     const picks_dev = try r.dev(std.mem.sliceAsBytes(pk));
     if (legacy) {
         try compact_prompt.run(k, ek, r.s, s.experts(), sc, plan, xp, D, picks_dev, slots, rows, E, D, N, limit, ey);
-    } else try glm.exl3.run(k, ek, r.s, s.experts(), sc, plan, xp, D, picks_dev, slots, rows, E, D, N, limit, prompt, ey, xd);
+    } else try glm.exl3.run(k, ek, r.s, s.experts(), sc, plan, xp, D, picks_dev, slots, rows, E, D, N, limit, prompt, b16, ey, xd);
     try r.s.synchronize();
     return .{ .ey = ey, .rows = rows };
 }
@@ -151,8 +151,8 @@ fn largeBytes(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernel
     for ([_]usize{ 2054, 4102 }) |rows| {
         const x = try r.bfs(rows * D, 1.0);
         const pk = try picks(r, rows);
-        const direct = try runMode(r, k, ek, s, x, pk, rows, true, false, sentinel);
-        const legacy = try runMode(r, k, ek, s, x, pk, rows, true, true, sentinel);
+        const direct = try runMode(r, k, ek, s, x, pk, rows, true, false, false, sentinel);
+        const legacy = try runMode(r, k, ek, s, x, pk, rows, true, false, true, sentinel);
         const got = try r.back(direct.ey, rows * slots * D * 4);
         const want = try r.back(legacy.ey, rows * slots * D * 4);
         for (0..rows) |m| {
@@ -303,6 +303,26 @@ pub fn run_(gpu: Gpu) !void {
                 const plain = try r.back((try run(&r, &k, &ek, s, x, pk, rows, true)).ey, n);
                 const got = try r.back((try run(&r, &pc, &ek, s, x, pk, rows, true)).ey, n);
                 try check.expect(std.mem.eql(u8, plain, got), "glm-exl3 TF_EXL3_PROMPT_GU=pc: {d} rows, {s} match ahead-staged bytes", .{ rows, if (one) "one rotation" else "a rotation an expert" });
+            }
+        }
+    }
+    // TF_GLM_EXL3_BF16_SLOTS: routed slots match fp32 rounded to bf16 (plain and pc); shared slot stays untouched
+    {
+        var pc = k;
+        pc.prompt.gu = .pc;
+        const s = try weights(&r, true, .{ 8, 8, 8 });
+        for ([_]usize{ 40, glm.exl3.chunk_rows + 6 }) |rows| {
+            const x = try r.bfs(rows * D, 1.0);
+            const pk = try picks(&r, rows);
+            const wide = try r.back((try runMode(&r, &k, &ek, s, x, pk, rows, true, false, false, null)).ey, rows * slots * D * 4);
+            for ([_]*const glm.exl3.Kernels{ &k, &pc }) |kk| {
+                const half = try r.back((try runMode(&r, kk, &ek, s, x, pk, rows, true, true, false, null)).ey, rows * slots * D * 2);
+                for (0..rows) |row| for (0..slots) |j| for (0..D) |c| {
+                    const i = (row * slots + j) * D + c;
+                    const got = std.mem.readInt(u16, half[i * 2 ..][0..2], .little);
+                    const want: u16 = if (j == slots - 1) 0xffff else core.bf16_round.bits(@bitCast(std.mem.readInt(u32, wide[i * 4 ..][0..4], .little)));
+                    try check.expect(got == want, "glm-exl3 bf16 slots: row {d} slot {d} column {d} is the fp32 value rounded", .{ row, j, c });
+                };
             }
         }
     }

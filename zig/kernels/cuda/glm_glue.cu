@@ -11,4 +11,5 @@
 #include "glm_glue_index.cuh"
 #include "glm_glue_bmm.cuh"
 #include "glm_glue_attn.cuh"
+#include "glm_glue_num.cuh"
 #include "glm_index_decode.cuh"

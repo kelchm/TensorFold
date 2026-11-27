@@ -235,7 +235,7 @@ pub fn run(gpu: Gpu, dir: []const u8, layer_s: []const u8, rank_s: []const u8, w
         const sz = glm.exl3.scratchFor(cs.rows, D, W, cs.prompt, w);
         const sc: glm.exl3.Scratch = .{ .picks = try r.zeros(sz[0]), .xg = try r.zeros(sz[1]), .xu = try r.zeros(sz[2]), .z = try r.zeros(sz[3]) };
         const ey = try r.zeros(cs.rows * slots * D * 4);
-        try glm.exl3.run(&k, &ek, stream, w, sc, plan, try r.dev(std.mem.sliceAsBytes(x.*)), D, try r.dev(std.mem.sliceAsBytes(pk.*)), slots, cs.rows, E, D, W, limit, cs.prompt, ey, 0);
+        try glm.exl3.run(&k, &ek, stream, w, sc, plan, try r.dev(std.mem.sliceAsBytes(x.*)), D, try r.dev(std.mem.sliceAsBytes(pk.*)), slots, cs.rows, E, D, W, limit, cs.prompt, false, ey, 0);
         out.* = try r.back(ey, cs.rows * slots * D * 4);
     }
 

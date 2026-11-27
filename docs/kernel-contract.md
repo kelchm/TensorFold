@@ -777,7 +777,14 @@ GLM's uniform 4-bit EXL3 prompt replacements (`tf_exl3_prompt_gu_glm`, `tf_exl3_
 from 1 through 64 (and 1 through 128 for `pc`), multiple items, shared and separate rotations, both activation modes,
 nonfinite inputs, untouched skipped slots, and constant-weight FP64 accumulator stress (`contract_exl3_prompt_ref.zig`).
 Planted controls drop the last active member (narrow and `pc`), pass the active expert id as `skip`, or hand 128-member
-items to the 64-member down kernel.
+items to the 64-member down kernel. `tf_exl3_prompt_down_glm_b16` and `tf_exl3_prompt_down_glm_h_b16`
+(`TF_GLM_EXL3_BF16_SLOTS=1`) register as byte replacements of `tf_exl3_prompt_down` rounded on the host with
+`__float2bfloat16_rn`'s rule (NaN as `0x7fff`).
+
+GLM's opt-in prompt MLA tensor-core GEMMs (`tf_glm_latent_mma_kn`, `tf_glm_latent_mma_nk`, `TF_GLM_ABSORB_MMA=1`)
+register in `contract_glm_mma.zig` against independent FP64 head projections (`glm_mla_ref.zig`), alongside SIMT
+entries on the same fixtures, with accumulator stress distinguishing FP16/BF16 sums across all three reduction orders
+and next-head weight controls (`tf_ctl_glm_mma_kn`, `tf_ctl_glm_mma_nk`) that fail gate 3.
 
 GLM's packed two-stage prompt projections (`glm_mm{4,6,8}_128s2`), 4-bit BF16-subtraction decode (`glm_mm4_128s2f`,
 `TF_GLM_MM_FAST4=1`), and strided shared-slot writers (`glm_mm16_rows_ld`, `glm_mm{4,6,8}_128s2_ld`, `glm_mm4_128s2f_ld`,
