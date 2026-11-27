@@ -89,7 +89,7 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
 | `TF_GLM_DSEL` | Exactly `0` or `1`; default on (a GLM decode window's DSA select runs on many CTAs; 0 keeps one CTA a row) |
 | `TF_GLM_DSCORES` | Exactly `0` or `1`; default on (a GLM decode window's DSA index scores run on glm_index_scores; 0 keeps tf_glm_scores) |
 | `TF_GLM_MOE_DIRECT` | Exactly `0` or `1`; default off. On, a GLM decode window's EXL3 experts read the top-k kernel's flat picks and leave their slot rows in place, summed with the shared expert's row by one kernel: no row copies and no slot write, the same bytes (#3570) |
-| `TF_GLM_EXL3_N_MAJOR` | Exactly `0` or `1`; default off. On (with `TF_GLM_EXL3_DECODE=1`), specialized 4-bit TP2 routed expert decode kernels traverse output tiles first across all 1..32 decode rows with bit-identical outputs |
+| `TF_GLM_EXL3_N_MAJOR` | Exactly `0` or `1`; default off. On (with `TF_GLM_EXL3_DECODE=1`), specialized 4-bit TP2 routed expert decode kernels traverse output tiles first at decode rows 4 and 8..32 with bit-identical outputs |
 | `TF_GLM_ROCE_FUSE` | Exactly `0` or `1`; default off. On, fuses TP2 RoCE whole-window gather with the rank-ordered FP32 sum and BF16 HC/residual epilogue when eligible (`docs/roce-gather.md`) |
 | `TF_GLM_DFLASH2_LOG` | Whole unsigned 64-bit count of DFlash2 rounds whose drafts are logged; default 0 |
 | `TF_GLM_DRAFT_CONFIDENCE` | Finite number 0 through 1 where a DFlash2 chain's chance product stops it; default 0.7 on CUDA, 0.5 on Metal |

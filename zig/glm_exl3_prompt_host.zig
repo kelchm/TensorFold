@@ -238,7 +238,7 @@ test "GLM EXL3 prompt: specialized verification uses native slot stride and opti
         const arena = if (flat) x3.picks + glm.exl3.picksBytes(rows) else x3.picks;
         const out: u64 = if (flat) try glm.exl3.directOut(w, x3, rows, 288, 4096, 1024, 7) else 0x700000000;
         try glm.exl3.runDecode(&k, router, .{ .d = &d, .handle = null }, w, arena, plan, 0x200000000, 4096, if (flat) x3.picks else 0x300000000, slots, rows, 288, 7, out, 0x400000000);
-        const reordered = enabled;
+        const reordered = enabled and (rows == 4 or rows >= 8);
         const expected_gate: usize = if (flat) 31 else 30;
         try t.expectEqual(expected_gate + @as(usize, if (reordered) 3 else 0), Record.gate_layout);
         try t.expectEqual(@as(usize, if (reordered) 35 else 32), Record.down_layout);

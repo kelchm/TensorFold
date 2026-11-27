@@ -23,7 +23,7 @@ pub const Settings = struct {
     pair: bool = true, // TF_GLM_PROMPT_PAIR: 1 (while no stream decodes, a prompt step takes two chunks, each one's exchanges under the other's sites) or 0
     pair_dflash: bool = false, // TF_GLM_PAIR_DFLASH=1: opt into paired prompt steps beside DFlash2
     exl3_decode: bool = false, // TF_GLM_EXL3_DECODE=1: specialized uniform 4-bit TP2 routed experts for short verify windows
-    exl3_nmajor: bool = false, // TF_GLM_EXL3_N_MAJOR=1: output-major CTA traversal across 1..32 decode rows
+    exl3_nmajor: bool = false, // TF_GLM_EXL3_N_MAJOR=1: output-major CTA traversal at rows 4 and 8..32
     pair_experts: bool = false, // TF_GLM_PAIR_EXPERTS=1: paired chunks share 128-pair NVFP4 routed-expert items (0: two 64-pair passes)
     index_split: u32 = 2048, // TF_GLM_INDEX_SPLIT: from this position on, rank 0 splits a prompt chunk's indexer rows (0: never)
     heat: ?heat.Bands = null, // TF_HEAT_HIGH and TF_HEAT_LOW (upstream's names): a prompt chunk waits on every rank's hottest zone
