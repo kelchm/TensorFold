@@ -146,5 +146,5 @@ pub fn fused(r: *Rig, set: glue.Set) !void {
             try ref.sameRows(r, try std.fmt.bufPrint(&name, "hc fuse own, {d} rows: {s} equal hc_pre's", .{ m, label }), want, got_own, m * n);
         }
     }
-    check.pass("hc fuse: hc_post_partial{,_own} then hc_finish give hc_post then hc_pre's bytes (64, 65, 70, 130 rows)", .{});
+    check.pass("hc fuse: hc_post_partial and hc_post_partial_own then hc_finish give hc_post then hc_pre's bytes (64, 65, 70, 130 rows)", .{});
 }

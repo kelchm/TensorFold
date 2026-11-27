@@ -233,7 +233,8 @@ extern "C" __global__ void __launch_bounds__(PTH, 1) tf_exl3_prompt_gu_glm_pc(co
         const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
         const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
         half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode, int skip) {
-    extern __shared__ __align__(128) unsigned char pc_smem[];
+    // static shared is 0 so dynamic shared starts at address 0; __align__(16) avoids padding other TU kernels to 128 B
+    extern __shared__ __align__(16) unsigned char pc_smem[];
     (void)Xu; // the shared rotation: gate and up read Xg's rows
     const int cb = blockIdx.x, item = blockIdx.y;
     if (item >= counts[0]) return;
