@@ -7,6 +7,9 @@
 namespace glm_attn {
 
 constexpr int LW = 512, KT = 32, CH = 512, KPAD = LW + 8;
+// The eight-warp split and FP8 tile ownership require cuda_latent.chunk_threads exactly.
+constexpr int CHUNK_THREADS = 256;
+static_assert(KT * (LW / 8) % CHUNK_THREADS == 0, "FP8 units must split evenly over the chunk block");
 
 // p fp32 summed as Triton's tile does: a thread's two columns, the quad (xor 2, 1), then warps (w0 + w2) + (w1 + w3).
 __device__ __forceinline__ float quad_sum(float v) {
@@ -43,12 +46,14 @@ constexpr int wide_smem() {
   return (HB * (LW + RW) + 2 * KT * (LW + RW) + HB * KT) * 2 + (HB * 4 + 2 * HB) * 4;
 }
 
-// RW roped cols follow latent; SPLIT: z*sw+sr; PAGED8: E4M3 codes+scales paged via pt/pstep (sparse looks up pt).
+// Chunk c of row r into fresh m, l, o (`load_q` stages queries); RW roped, SPLIT, PAGED8 (paged E4M3 via pt/pstep).
 template <int HB, bool FP8 = false, int RW = 0, bool SPLIT = false, bool PAGED8 = false>
-__device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
-                            const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
-                            float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr,
-                            int sw = 1, int sr = 0) {
+__device__ __forceinline__ void chunk_softmax(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* tok,
+                                              int64_t r, int64_t h0, int64_t c, int64_t n, int64_t limit,
+                                              int64_t heads, int64_t w, float scale, int sparse, const int* pt,
+                                              int64_t pstep, const float* scales, int sw, int sr, bool load_q,
+                                              float (&m)[HB / 16][2], float (&l)[HB / 16][2],
+                                              float (&o)[HB / 16][8][4]) {
   static_assert(!(FP8 && RW != 0), "the E4M3 cache holds the latent alone");
   static_assert(!(SPLIT && FP8), "a split cache holds BF16 rows");
   static_assert(!(PAGED8 && !FP8), "PAGED8 requires FP8");
@@ -59,10 +64,9 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   __nv_bfloat16* ps = kvs + 2 * KT * KW;
   float* red = reinterpret_cast<float*>(ps + HB * KT);
   float* stat = red + HB * 4;
+  if (blockDim.x != CHUNK_THREADS) __trap();
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, q = lane & 3;
   const int kg = warp & 3, hh = warp >> 2;
-  const int64_t r = blockIdx.x, h0 = (int64_t)blockIdx.y * HB, c = blockIdx.z;
-  const int64_t n = sparse ? cnt[r] : 0, limit = sparse ? 0 : (int64_t)pos[0] + r;
   const int64_t start = (SPLIT ? c * sw + sr : c) * CH;
   const bool live = sparse ? start < n : start <= limit;
   // a dense chunk's 512 keys are one page, its rows from that page's; a sparse key's row comes as the token list has it
@@ -77,7 +81,63 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       scales8 = reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(scales) + page);
     }
   }
+  // Fetch tile + 2 as 8-code units before this tile's math; convert afterwards with the original BF16 rounding.
+  constexpr int UPT = KT * (LW / 8) / CHUNK_THREADS;
+  uint2 raw[FP8 ? UPT : 1];
+  float rsc[FP8 ? UPT : 1];
+  auto fetch8 = [&](int tile) {
+    const int64_t first = start + tile * KT;
+#pragma unroll
+    for (int i = 0; i < UPT; ++i) {
+      const int idx = t + i * CHUNK_THREADS, key = idx / (LW / 8), u = idx % (LW / 8);
+      const int64_t ki = first + key;
+      const bool ok = sparse ? ki < n : ki <= limit;
+      const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+      const unsigned char* code_base = codes8;
+      int64_t code_row = src;
+      float row_scale = 1.0f;
+      if constexpr (PAGED8) {
+        if (sparse) {
+          const int s = ok ? (int)src : 0;
+          const int64_t page = ok ? (int64_t)pt[s >> 9] * pstep : 0;
+          const int row = s & (CH - 1);
+          code_base = codes8 + page;
+          code_row = row;
+          row_scale = ok ? *reinterpret_cast<const float*>(
+                               reinterpret_cast<const unsigned char*>(scales) + page + row * 4)
+                         : 1.0f;
+        } else {
+          code_row = ok ? src - start : 0;
+          row_scale = ok ? scales8[code_row] : 1.0f;
+        }
+      } else {
+        row_scale = ok ? scales8[src] : 1.0f;
+      }
+      raw[i] = ok ? *reinterpret_cast<const uint2*>(code_base + code_row * LW + u * 8) : make_uint2(0u, 0u);
+      rsc[i] = row_scale;
+    }
+  };
+  auto store8 = [&](int tile) {
+    __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
+#pragma unroll
+    for (int i = 0; i < UPT; ++i) {
+      const int idx = t + i * CHUNK_THREADS, key = idx / (LW / 8), u = idx % (LW / 8);
+      const uint32_t wv[2] = {raw[i].x, raw[i].y};
+#pragma unroll
+      for (int j = 0; j < 8; j += 2) {
+        const uint16_t bits = (uint16_t)((wv[j / 4] >> (8 * (j % 4))) & 0xffffu);  // codes j, j + 1 (little-endian)
+        const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
+        dst[wide(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, rsc[i]));
+        dst[wide(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, rsc[i]));
+      }
+    }
+  };
   auto load_kv = [&](int tile) {
+    if constexpr (FP8) {
+      fetch8(tile);
+      store8(tile);
+      return;
+    }
     __nv_bfloat16* dst = kvs + (tile & 1) * KT * KW;
     const int64_t first = start + tile * KT;
     for (int idx = t; idx < KT * (KW / 8); idx += blockDim.x) {
@@ -85,41 +145,9 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       const int64_t ki = first + key;
       const bool ok = sparse ? ki < n : ki <= limit;
       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
-      if constexpr (FP8) {
-        const unsigned char* code_base = codes8;
-        int64_t code_row = src;
-        float row_scale = 1.0f;
-        if constexpr (PAGED8) {
-          if (sparse) {
-            const int s = ok ? (int)src : 0;
-            const int64_t page = ok ? (int64_t)pt[s >> 9] * pstep : 0;
-            const int row = s & (CH - 1);
-            code_base = codes8 + page;
-            code_row = row;
-            row_scale = ok ? *reinterpret_cast<const float*>(
-                                 reinterpret_cast<const unsigned char*>(scales) + page + row * 4)
-                           : 1.0f;
-          } else {
-            code_row = ok ? src - start : 0;
-            row_scale = ok ? scales8[code_row] : 1.0f;
-          }
-        } else {
-          row_scale = ok ? scales8[src] : 1.0f;
-        }
-#pragma unroll
-        for (int j = 0; j < 8; j += 2) {
-          const uint16_t bits = ok ? (uint16_t)code_base[code_row * LW + u * 8 + j] |
-                                        ((uint16_t)code_base[code_row * LW + u * 8 + j + 1] << 8) : 0;
-          const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
-          dst[wide(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, row_scale));
-          dst[wide(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, row_scale));
-        }
-      } else {
-        cp16(dst + wide<KW>(key, u), keys_at + src * KW + u * 8, ok);
-      }
+      cp16(dst + wide<KW>(key, u), keys_at + src * KW + u * 8, ok);
     }
   };
-  float m[MT][2], l[MT][2], o[MT][8][4];
   for (int i = 0; i < MT; ++i)
     for (int e = 0; e < 2; ++e) m[i][e] = -INFINITY, l[i][e] = 0.0f;
   for (int i = 0; i < MT; ++i)
@@ -127,7 +155,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       for (int e = 0; e < 4; ++e) o[i][j][e] = 0.0f;
   constexpr int tiles = CH / KT;
   if (live) {
-    for (int idx = t; idx < HB * (KW / 8); idx += blockDim.x) {
+    for (int idx = t; load_q && idx < HB * (KW / 8); idx += blockDim.x) {
       const int hd = idx / (KW / 8), u = idx % (KW / 8);
       const bool ok = h0 + hd < heads;
       cp16(qs + wide<KW>(hd, u), qa + (r * heads + (ok ? h0 + hd : 0)) * KW + u * 8, ok);
@@ -147,6 +175,9 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
         wait<0>();
     }
     __syncthreads();
+    if constexpr (FP8) {
+      if (tile + 2 < tiles) fetch8(tile + 2);  // in flight during this tile's math
+    }
     const __nv_bfloat16* kv = kvs + (tile & 1) * KT * KW;
     const int64_t first = start + tile * KT;
     float sc[4];
@@ -228,9 +259,28 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
     __syncthreads();
     for (int i = 0; i < MT; ++i)
       for (int hf = 0; hf < 2; ++hf) l[i][hf] = __fmaf_rn(l[i][hf], alpha[i][hf], stat[HB + i * 16 + hf * 8 + g]);
-    if (tile + 2 < tiles) load_kv(tile + 2);
+    if constexpr (FP8) {
+      if (tile + 2 < tiles) store8(tile + 2);
+    } else if (tile + 2 < tiles) {
+      load_kv(tile + 2);
+    }
     commit();
   }
+}
+
+// A block's chunk_softmax into the fp32 partials po [nch][rows][heads][LW], pm and pl [nch][rows][heads].
+template <int HB, bool FP8 = false, int RW = 0, bool SPLIT = false, bool PAGED8 = false>
+__device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
+                            const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
+                            float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr,
+                            int sw = 1, int sr = 0) {
+  constexpr int MT = HB / 16;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, q = lane & 3;
+  const int64_t r = blockIdx.x, h0 = (int64_t)blockIdx.y * HB, c = blockIdx.z;
+  const int64_t n = sparse ? cnt[r] : 0, limit = sparse ? 0 : (int64_t)pos[0] + r;
+  float m[MT][2], l[MT][2], o[MT][8][4];
+  chunk_softmax<HB, FP8, RW, SPLIT, PAGED8>(qa, lc, tok, r, h0, c, n, limit, heads, w, scale, sparse, pt, pstep,
+                                            scales, sw, sr, true, m, l, o);
   for (int i = 0; i < MT; ++i)
     for (int e = 0; e < 4; ++e) {
       const int64_t hd = h0 + i * 16 + g + (e / 2) * 8;
@@ -241,6 +291,51 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
         pm[base] = m[i][e / 2];
         pl[base] = l[i][e / 2];
       }
+    }
+}
+
+// Sparse chunks_wide then tf_glm_merge in a block (row, HB heads): each chunk folds in by the merge's steps, in order.
+template <int HB, bool FP8, bool PAGED8 = false>
+__device__ void chunks_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const float* scales, const int* tok,
+                             const int* cnt, __nv_bfloat16* out, int64_t heads, int64_t w, float scale, int nch,
+                             const int* pt = nullptr, int64_t pstep = 0) {
+  constexpr int MT = HB / 16;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, q = lane & 3;
+  const int64_t r = blockIdx.x, h0 = (int64_t)blockIdx.y * HB, n = cnt[r];
+  if (n == 0) return;  // tf_glm_merge leaves a count-0 row alone
+  float om[MT][8][4], mm[MT][2], lm[MT][2];
+  for (int c = 0; c < nch; ++c) {
+    float m[MT][2], l[MT][2], o[MT][8][4];
+    chunk_softmax<HB, FP8, 0, false, PAGED8>(qa, lc, tok, r, h0, c, n, 0, heads, w, scale, 1, pt, pstep, scales, 1, 0,
+                                             c == 0, m, l, o);
+    // tf_glm_merge's step for chunk c: m and l are what pm and pl hold, o this thread's elements of po
+    for (int i = 0; i < MT; ++i)
+      for (int hf = 0; hf < 2; ++hf) {
+        const float cm = m[i][hf], cl = l[i][hf], was = c == 0 ? -INFINITY : mm[i][hf];
+        const bool active = cl > 0.0f;
+        const float nm = active ? fmaxf(was, cm) : was;
+        const float b = active ? glm_triton::exp_approx(cm - nm) : 0.0f;
+        if (c == 0) {
+          for (int j = 0; j < 8; ++j)
+            for (int e = 0; e < 2; ++e) om[i][j][hf * 2 + e] = __fmaf_rn(b, o[i][j][hf * 2 + e], 0.0f);
+          lm[i][hf] = __fmaf_rn(b, cl, 0.0f);
+        } else {
+          const float a = active ? (was == -INFINITY ? 0.0f : glm_triton::exp_approx(was - nm)) : 1.0f;
+          for (int j = 0; j < 8; ++j)
+            for (int e = 0; e < 2; ++e)
+              om[i][j][hf * 2 + e] = __fmaf_rn(om[i][j][hf * 2 + e], a, __fmul_rn(b, o[i][j][hf * 2 + e]));
+          lm[i][hf] = __fmaf_rn(lm[i][hf], a, __fmul_rn(b, cl));
+        }
+        mm[i][hf] = nm;
+      }
+  }
+  for (int i = 0; i < MT; ++i)
+    for (int e = 0; e < 4; ++e) {
+      const int64_t hd = h0 + i * 16 + g + (e / 2) * 8;
+      if (hd >= heads) continue;
+      for (int j = 0; j < 8; ++j)
+        out[(r * heads + hd) * LW + warp * 64 + j * 8 + q * 2 + e % 2] =
+            __float2bfloat16_rn(glm_triton::div_full(om[i][j][e], lm[i][e / 2]));
     }
 }
 

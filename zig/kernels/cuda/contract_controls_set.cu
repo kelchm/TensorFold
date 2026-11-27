@@ -16,3 +16,4 @@
 #include "contract_glm_vision_controls.cuh"
 #include "contract_hy4_hc_controls.cuh"
 #include "contract_glm_mm_controls.cuh"
+#include "contract_glm_attn_baseline.cuh"

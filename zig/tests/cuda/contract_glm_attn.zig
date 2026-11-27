@@ -96,7 +96,7 @@ pub const Chunks = struct {
     }
 
     /// Queries and rows in [-1, 1); dense from row k - rows / 2, across a page edge; sparse tokens under 4,096.
-    pub fn prepare(self: *Chunks, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
+    pub fn prepareRows(self: *Chunks, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
         if (shape.n != heads * lw or shape.rows == 0 or shape.k == 0) return false;
         self.free();
         self.rig.reset();
@@ -122,6 +122,15 @@ pub const Chunks = struct {
             };
             if (fill == .nonfinite and shape.rows > 1) self.cache[self.keys[shape.k] * lw + 9] = c.toBf16(std.math.inf(f32));
         }
+        return true;
+    }
+
+    pub fn prepare(self: *Chunks, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
+        if (!try self.prepareRows(shape, fill, seed)) return false;
+        const a = self.rig.gpu.gpa;
+        var prng = std.Random.DefaultPrng.init(seed ^ 0x7061676573);
+        const rng = prng.random();
+        const span = self.cache.len / lw;
         const n_pages = (span + pages.rows_a_page - 1) / pages.rows_a_page;
         self.ids = try pages.shuffled(a, rng, n_pages);
         const arena = try a.alloc(u8, (n_pages + 3) * pages.page_bytes);
@@ -164,7 +173,7 @@ pub const Chunks = struct {
         var a: cuda.Args = .{};
         inline for (.{ self.in[0], self.in[1], self.pos, self.in[2], self.in[3], self.parts[0], self.parts[1], self.parts[2], rows, @as(i64, heads), w, @as(f32, @floatCast(scale)), @as(c_int, @intFromBool(self.form.sparse)), self.pt, @as(i64, pages.page_bytes) }) |v| a.add(v);
         const shared = if (self.form.hb == 32) glm.glue.chunksSmem(32) else glm.glue.chunksSmem(16);
-        try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast(self.shape.rows), .y = (heads + self.form.hb - 1) / self.form.hb, .z = @intCast(self.nch) }, .block = .{ .x = 256 }, .shared = shared }, self.rig.s, &a);
+        try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast(self.shape.rows), .y = (heads + self.form.hb - 1) / self.form.hb, .z = @intCast(self.nch) }, .block = .{ .x = glm.latent.chunk_threads }, .shared = shared }, self.rig.s, &a);
         var m: cuda.Args = .{};
         inline for (.{ self.parts[0], self.parts[1], self.parts[2], self.out, self.in[3], rows, @as(i64, heads), @as(c_int, @intCast(self.nch)), @as(c_int, @intFromBool(self.form.sparse)) }) |v| m.add(v);
         try cuda.launch.launch(self.merge, .{ .grid = .{ .x = @intCast(self.shape.rows), .y = heads }, .block = .{ .x = 128 } }, self.rig.s, &m);

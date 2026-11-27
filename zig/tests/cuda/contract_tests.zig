@@ -560,7 +560,7 @@ fn registered(gpu: check.Gpu, only: []const []const u8, t0: *i96) !g.Tally {
     defer mtp_rows.destroy();
     const weight_only = try @import("contract_weight_only_suite.zig").Suite.create(a, gpu, s, &kernels);
     defer weight_only.destroy(a);
-    const families = try @import("contract_family_sets.zig").Sets.init(gpu, s, a, &kernels, &affine4, mods[5], cap);
+    const families = try @import("contract_family_sets.zig").Sets.init(gpu, s, a, &kernels, &affine4, mods[5], &glm_fns, cap);
     defer families.deinit();
     var t: g.Tally = .{};
     try @import("contract_dump.zig").run(a, kernels.items);

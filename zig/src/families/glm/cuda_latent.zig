@@ -12,6 +12,8 @@ pub const heads_tile = 16;
 pub const heads_tile_wide = 32;
 pub const prompt_rows = 64;
 pub const prompt_rb = 64;
+/// common/mla.cuh CHUNK_THREADS: the chunk kernels trap unless their eight warps launch together.
+pub const chunk_threads = 256;
 
 /// latent.head_block: a rank's 32 heads a program in prompt chunks (each key read once), 16 in decode windows.
 pub fn headBlock(rows: usize) usize {
@@ -116,7 +118,12 @@ pub fn latentWrite(set: glue.Set, stream: cuda.Stream, lat: u64, lat_stride: usi
 }
 
 /// The chunk partials of one attention call: po fp32 [nch][rows][heads][512], pm and pl fp32 [nch][rows][heads].
-pub const Partials = struct { po: u64, pm: u64, pl: u64 };
+pub const Partials = struct {
+    po: u64,
+    pm: u64,
+    pl: u64,
+    rows: usize = 0, // the nch x rows they hold (0: every call fits); a sparse call past them merges in the kernel
+};
 
 /// latent.attention: causal qa over the cache in `nch` 512-key chunks into out bf16; `dummy`: the merge's count i32.
 pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, t: Table, pos: u64, p: Partials, out: u64, dummy: u64, rows: usize, heads: usize, lw: usize, nch: usize, scale: f32, hb: usize) !void {
@@ -156,7 +163,7 @@ fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, 
         a.add(@as(i64, @intCast(t.ps)));
     }
     const shared = if (hb == heads_tile_wide) glue.chunksSmem(heads_tile_wide) else glue.chunksSmem(heads_tile);
-    try cuda_pdl.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = 256 }, .shared = shared }, stream, &a);
+    try cuda_pdl.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = chunk_threads }, .shared = shared }, stream, &a);
 }
 
 /// latent.sparse_attention: rows with counts > 0 over their selected tokens (i32 [rows][w]); others left alone.
@@ -167,8 +174,38 @@ pub fn sparseAttention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, 
 pub fn sparseAttentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, tokens: u64, counts: u64, w: usize, p: Partials, out: u64, rows: usize, heads: usize, lw: usize, scale: f32) !void {
     const nch = chunksFor(w);
     const hb = if (!set.prompt and set.verify_tiles.wide(rows, heads, lw, w, scales, t.pt, t.logical)) heads_tile_wide else headBlockFor(rows, lw);
+    if (fuses(p, nch, rows, lw)) return fused(set, stream, qa, cache, scales, t, tokens, counts, w, out, rows, heads, lw, nch, scale, hb);
     try chunks(set, stream, qa, cache, scales, t, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, hb, true);
     try merge(set, stream, p, out, counts, rows, heads, lw, nch, true);
+}
+
+/// Whether a sparse call of `rows` rows over `nch` chunks merges in its chunk kernel: its partials would not fit `p`.
+pub fn fuses(p: Partials, nch: usize, rows: usize, lw: usize) bool {
+    return lw == latent_width and p.rows != 0 and nch * rows > p.rows;
+}
+
+/// tf_glm_chunks_*_fused: block (row, hb heads) over the row's nch chunks, merged as tf_glm_merge merges them.
+fn fused(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, tokens: u64, counts: u64, w: usize, out: u64, rows: usize, heads: usize, lw: usize, nch: usize, scale: f32, hb: usize) !void {
+    if (lw != latent_width) return error.LatentShape;
+    const kv8 = scales != 0;
+    const paged8 = kv8 and t.pt != 0;
+    if (t.pt != 0 and t.logical != paged8) return error.TokenUnits;
+    const f = switch (hb) {
+        heads_tile => if (!kv8) set.glue.chunks_16_fused else if (paged8) set.glue.chunks_16_fp8_paged_fused else set.glue.chunks_16_fp8_fused,
+        heads_tile_wide => if (!kv8) set.glue.chunks_32_fused else if (paged8) set.glue.chunks_32_fp8_paged_fused else set.glue.chunks_32_fp8_fused,
+        else => return error.HeadBlock,
+    };
+    var a: cuda.Args = .{};
+    a.add(qa);
+    a.add(cache);
+    if (kv8) a.add(scales);
+    inline for (.{ tokens, counts, out, @as(i64, @intCast(heads)), @as(i64, @intCast(w)), scale, @as(c_int, @intCast(nch)) }) |v| a.add(v);
+    if (paged8) {
+        a.add(t.pt);
+        a.add(@as(i64, @intCast(t.ps)));
+    }
+    const shared = if (hb == heads_tile_wide) glue.chunksSmem(heads_tile_wide) else glue.chunksSmem(heads_tile);
+    try cuda_pdl.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb) }, .block = .{ .x = chunk_threads }, .shared = shared }, stream, &a);
 }
 
 /// The partials and out hold the latent alone (the roped columns score, the values are the latent's).
@@ -177,6 +214,15 @@ fn merge(set: glue.Set, stream: cuda.Stream, p: Partials, out: u64, counts: u64,
     var a: cuda.Args = .{};
     inline for (.{ p.po, p.pm, p.pl, out, counts, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(c_int, @intCast(nch)), @as(c_int, @intFromBool(sparse)) }) |v| a.add(v);
     try cuda_pdl.launch(set.glue.merge, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(heads) }, .block = .{ .x = 128 } }, stream, &a);
+}
+
+test "GLM MLA: a sparse call merges in its chunk kernel only past its partials' rows and only at lw 512" {
+    const p: Partials = .{ .po = 1, .pm = 2, .pl = 3, .rows = 13 * 512 }; // a 4,096-row prompt buffer's dense calls
+    try std.testing.expect(!fuses(p, chunksFor(2051), 1331, 512));
+    try std.testing.expect(fuses(p, chunksFor(2051), 1332, 512));
+    try std.testing.expect(fuses(p, chunksFor(2051), 4096, 512));
+    try std.testing.expect(!fuses(p, chunksFor(2051), 4096, roped_row)); // roped full GLM-5.3 keeps cuda.mla
+    try std.testing.expect(!fuses(.{ .po = 1, .pm = 2, .pl = 3 }, chunksFor(2051), 4096, 512)); // rows 0: all fit
 }
 
 test "latent.py's tiling rules" {

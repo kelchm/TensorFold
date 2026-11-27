@@ -536,7 +536,10 @@ sparse). Its prompt indexer (`tf_glm_index_scores`, `tf_glm_index_pools`) is bit
 `tf_glm_select_rows`, its decode windows' scores (`tf_glm_index_scores` at the decode tiling) to `tf_glm_scores`,
 and its decode select at a 1,024-thread block a row (`tf_glm_select_rows_wide`) and in spans over many blocks
 (`tf_glm_dsel_scan`, then `tf_glm_dsel_merge` a block a row) to `tf_glm_select_rows`; both stated
-rules rank any NaN above +inf, as the GPU's `s + 0` makes every NaN one positive NaN.
+rules rank any NaN above +inf, as the GPU's `s + 0` makes every NaN one positive NaN. The FP8 tile loads
+(`tf_glm_chunks_{16,32}_fp8`) are bit-equal to the frozen byte reader including FP32 partials, and the sparse chunks
+with their merge in the kernel (`tf_glm_chunks_{16,32}{,_fp8,_fp8_paged}_fused`) are bit-equal to the chunk kernels
+then `tf_glm_merge`.
 Full GLM-5.3's indexer values run on the same kernels (`contract_glm_full.zig`): `tf_glm_scores` at pools of 1 with
 64 roped query dims against float64 (allowing the roped queries' bf16 rounding), `tf_glm_index_scores` bit-equal to
 it, `tf_glm_dsa_tokens` at pools of 1, and `tf_glm_index_write`'s LayerNormed keys roped on 64 dims, with four

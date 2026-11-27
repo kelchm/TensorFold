@@ -9,7 +9,7 @@
 #include "glm_index_rope.cuh"
 
 // The 16-head form (decode windows) and 32-head form (prompt chunks), each in glm_attn::wide_smem<HB>() bytes of smem.
-extern "C" __global__ void __launch_bounds__(256)
+extern "C" __global__ void __launch_bounds__(glm_attn::CHUNK_THREADS)
     tf_glm_chunks_16(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
                      float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse,
                      const int* pt, int64_t pstep) {
@@ -17,7 +17,7 @@ extern "C" __global__ void __launch_bounds__(256)
   glm_attn::chunks_wide<16>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, pt, pstep);
 }
 
-extern "C" __global__ void __launch_bounds__(256)
+extern "C" __global__ void __launch_bounds__(glm_attn::CHUNK_THREADS)
     tf_glm_chunks_32(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
                      float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse,
                      const int* pt, int64_t pstep) {
@@ -26,7 +26,7 @@ extern "C" __global__ void __launch_bounds__(256)
 }
 
 // E4M3 cache variants reconstruct the existing BF16 shared tile before the unchanged attention math.
-extern "C" __global__ void __launch_bounds__(256)
+extern "C" __global__ void __launch_bounds__(glm_attn::CHUNK_THREADS)
     tf_glm_chunks_16_fp8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
                          const int* tok, const int* cnt, float* po, float* pm, float* pl,
                          int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
@@ -34,7 +34,7 @@ extern "C" __global__ void __launch_bounds__(256)
   glm_attn::chunks_wide<16, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
                                  po, pm, pl, rows, heads, w, scale, sparse, nullptr, 0, scales);
 }
-extern "C" __global__ void __launch_bounds__(256)
+extern "C" __global__ void __launch_bounds__(glm_attn::CHUNK_THREADS)
     tf_glm_chunks_32_fp8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
                          const int* tok, const int* cnt, float* po, float* pm, float* pl,
                          int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
@@ -44,7 +44,7 @@ extern "C" __global__ void __launch_bounds__(256)
 }
 
 // The E4M3 variants on KV pages: the stream's table `pt`, its pages `pstep` bytes apart (codes and scales in each).
-extern "C" __global__ void __launch_bounds__(256)
+extern "C" __global__ void __launch_bounds__(glm_attn::CHUNK_THREADS)
     tf_glm_chunks_16_fp8_paged(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
                                const int* tok, const int* cnt, float* po, float* pm, float* pl, int64_t rows,
                                int64_t heads, int64_t w, float scale, int sparse, const int* pt, int64_t pstep) {
@@ -52,13 +52,57 @@ extern "C" __global__ void __launch_bounds__(256)
   glm_attn::chunks_wide<16, true, 0, false, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
                                                  po, pm, pl, rows, heads, w, scale, sparse, pt, pstep, scales);
 }
-extern "C" __global__ void __launch_bounds__(256)
+extern "C" __global__ void __launch_bounds__(glm_attn::CHUNK_THREADS)
     tf_glm_chunks_32_fp8_paged(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
                                const int* tok, const int* cnt, float* po, float* pm, float* pl, int64_t rows,
                                int64_t heads, int64_t w, float scale, int sparse, const int* pt, int64_t pstep) {
   glm_pdl::enter();
   glm_attn::chunks_wide<32, true, 0, false, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
                                                  po, pm, pl, rows, heads, w, scale, sparse, pt, pstep, scales);
+}
+
+// A sparse call past its partials (latent.fuses): grid (rows, heads / HB), the merged rows tf_glm_merge would write.
+extern "C" __global__ void __launch_bounds__(glm_attn::CHUNK_THREADS)
+    tf_glm_chunks_16_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* tok, const int* cnt,
+                           __nv_bfloat16* out, int64_t heads, int64_t w, float scale, int nch) {
+  glm_pdl::enter();
+  glm_attn::chunks_fused<16, false>(qa, lc, nullptr, tok, cnt, out, heads, w, scale, nch);
+}
+extern "C" __global__ void __launch_bounds__(glm_attn::CHUNK_THREADS)
+    tf_glm_chunks_32_fused(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* tok, const int* cnt,
+                           __nv_bfloat16* out, int64_t heads, int64_t w, float scale, int nch) {
+  glm_pdl::enter();
+  glm_attn::chunks_fused<32, false>(qa, lc, nullptr, tok, cnt, out, heads, w, scale, nch);
+}
+extern "C" __global__ void __launch_bounds__(glm_attn::CHUNK_THREADS)
+    tf_glm_chunks_16_fp8_fused(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* tok,
+                               const int* cnt, __nv_bfloat16* out, int64_t heads, int64_t w, float scale, int nch) {
+  glm_pdl::enter();
+  glm_attn::chunks_fused<16, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), scales, tok, cnt, out, heads, w,
+                                   scale, nch);
+}
+extern "C" __global__ void __launch_bounds__(glm_attn::CHUNK_THREADS)
+    tf_glm_chunks_32_fp8_fused(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* tok,
+                               const int* cnt, __nv_bfloat16* out, int64_t heads, int64_t w, float scale, int nch) {
+  glm_pdl::enter();
+  glm_attn::chunks_fused<32, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), scales, tok, cnt, out, heads, w,
+                                   scale, nch);
+}
+extern "C" __global__ void __launch_bounds__(glm_attn::CHUNK_THREADS)
+    tf_glm_chunks_16_fp8_paged_fused(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales,
+                                     const int* tok, const int* cnt, __nv_bfloat16* out, int64_t heads, int64_t w,
+                                     float scale, int nch, const int* pt, int64_t pstep) {
+  glm_pdl::enter();
+  glm_attn::chunks_fused<16, true, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), scales, tok, cnt, out, heads,
+                                         w, scale, nch, pt, pstep);
+}
+extern "C" __global__ void __launch_bounds__(glm_attn::CHUNK_THREADS)
+    tf_glm_chunks_32_fp8_paged_fused(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales,
+                                     const int* tok, const int* cnt, __nv_bfloat16* out, int64_t heads, int64_t w,
+                                     float scale, int nch, const int* pt, int64_t pstep) {
+  glm_pdl::enter();
+  glm_attn::chunks_fused<32, true, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), scales, tok, cnt, out, heads,
+                                         w, scale, nch, pt, pstep);
 }
 
 // latent._merge, block (row, head), 128 threads: chunks merged in order, o / l by div.full; skips sparse count-0 rows.

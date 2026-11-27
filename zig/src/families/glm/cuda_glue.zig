@@ -89,10 +89,17 @@ pub const Kernels = struct {
     chunks_32_fp8: cuda.Function,
     chunks_16_fp8_paged: cuda.Function,
     chunks_32_fp8_paged: cuda.Function,
+    chunks_16_fused: cuda.Function, // a sparse call past its partials: the chunks and their merge in one launch
+    chunks_32_fused: cuda.Function,
+    chunks_16_fp8_fused: cuda.Function,
+    chunks_32_fp8_fused: cuda.Function,
+    chunks_16_fp8_paged_fused: cuda.Function,
+    chunks_32_fp8_paged_fused: cuda.Function,
     merge: cuda.Function,
     scores: cuda.Function,
     hc_split: bool = true, // TF_GLM_HC_SPLIT: a decode window's hc_finish on the split schedule (the same bits)
     hc_part: bool = true, // TF_GLM_HC_PART: decode windows to hc_part_rows rows take tf_glm_hc_partial8_o2
+    dense_prune: bool = true, // TF_GLM_DENSE_PRUNE: dense attention skips rows sparse attention writes (dsa_block)
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
@@ -106,6 +113,7 @@ pub const Kernels = struct {
         const env = @import("sys").environment;
         k.hc_split = try env.read(bool, "TF_GLM_HC_SPLIT", true);
         k.hc_part = try env.read(bool, "TF_GLM_HC_PART", true);
+        k.dense_prune = try env.read(bool, "TF_GLM_DENSE_PRUNE", true);
         try k.bmm_tile.allowDynamicShared(bmm_tile_smem);
         try k.bmm_tile1.allowDynamicShared(bmm_tile1_smem[1]);
         try k.chunks_16.allowDynamicShared(chunksSmem(16));
@@ -114,6 +122,12 @@ pub const Kernels = struct {
         try k.chunks_32_fp8.allowDynamicShared(chunksSmem(32));
         try k.chunks_16_fp8_paged.allowDynamicShared(chunksSmem(16));
         try k.chunks_32_fp8_paged.allowDynamicShared(chunksSmem(32));
+        try k.chunks_16_fused.allowDynamicShared(chunksSmem(16));
+        try k.chunks_32_fused.allowDynamicShared(chunksSmem(32));
+        try k.chunks_16_fp8_fused.allowDynamicShared(chunksSmem(16));
+        try k.chunks_32_fp8_fused.allowDynamicShared(chunksSmem(32));
+        try k.chunks_16_fp8_paged_fused.allowDynamicShared(chunksSmem(16));
+        try k.chunks_32_fp8_paged_fused.allowDynamicShared(chunksSmem(32));
         return k;
     }
 };

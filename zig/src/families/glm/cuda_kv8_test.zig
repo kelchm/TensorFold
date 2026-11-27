@@ -85,7 +85,7 @@ const Launch = struct {
         const id = @intFromPtr(f);
         ids[n] = id;
         blocks[n] = bx;
-        scales[n] = if (id == 2) @as(*const u64, @ptrCast(@alignCast(args.?[3].?))).* else if (id == 4 or id == 6)
+        scales[n] = if (id == 2) @as(*const u64, @ptrCast(@alignCast(args.?[3].?))).* else if (id == 4 or id == 6 or id == 11)
             @as(*const u64, @ptrCast(@alignCast(args.?[2].?))).*
         else
             0;
@@ -135,6 +135,15 @@ test "GLM FP8 KV: real launchers preserve BF16 ABI and pass FP8 scale pointers f
     Launch.n = 0;
     try latent.sparseAttentionFormat(set, stream, 100, 200, 400, .{}, 500, 600, 2051, p, 700, 3, 32, 512, 0.125);
     try t.expectEqual(@as(usize, 4), Launch.ids[0]);
+    try t.expectEqual(@as(u64, 400), Launch.scales[0]);
+    ks.chunks_16_fp8_fused = .{ .d = &d, .handle = @ptrFromInt(11) };
+    var past = p;
+    past.rows = 1; // a sparse call past its partials: the chunks and merge in one launch
+    Launch.n = 0;
+    try latent.sparseAttentionFormat(set, stream, 100, 200, 400, .{}, 500, 600, 2051, past, 700, 3, 32, 512, 0.125);
+    try t.expectEqual(@as(usize, 1), Launch.n);
+    try t.expectEqual(@as(usize, 11), Launch.ids[0]);
+    try t.expectEqual(@as(u32, 256), Launch.blocks[0]);
     try t.expectEqual(@as(u64, 400), Launch.scales[0]);
 }
 
@@ -215,6 +224,8 @@ test "GLM FP8 KV: on pages an FP8 cache's dense and sparse chunks take the _page
     Rec.arity[kid(ks.chunks_32_fp8)] = 14;
     Rec.arity[kid(ks.chunks_16_fp8_paged)] = 16;
     Rec.arity[kid(ks.chunks_32_fp8_paged)] = 16;
+    Rec.arity[kid(ks.chunks_16_fp8_paged_fused)] = 12;
+    Rec.arity[kid(ks.chunks_32_fp8_paged_fused)] = 12;
     Rec.arity[kid(ks.merge)] = 9;
     const set: glue.Set = .{ .glue = &ks };
     const stream: cuda.Stream = .{ .d = &d, .handle = null };
@@ -261,6 +272,18 @@ test "GLM FP8 KV: on pages an FP8 cache's dense and sparse chunks take the _page
     try t.expectEqual(@as(u32, 1), Rec.word(2, 13));
     try t.expectEqualSlices(u64, &.{ 900, 6_684_672 }, Rec.args[4][13..15]);
     try t.expectEqualSlices(u64, &.{ 900, 6_684_672 }, Rec.args[6][13..15]);
+    const past: latent.Partials = .{ .po = 1000, .pm = 2000, .pl = 3000, .rows = 1 };
+    for ([_]usize{ 3, 64 }) |rows| { // fused sparse on paged E4M3 passes pt and ps
+        Rec.n = 0;
+        try latent.sparseAttentionFormat(set, stream, 100, 200, 200 + 262_144, paged, 500, 600, 2051, past, 700, rows, 32, 512, scale);
+        try t.expectEqual(@as(usize, 1), Rec.n);
+        try t.expectEqual(kid(if (rows < 64) ks.chunks_16_fp8_paged_fused else ks.chunks_32_fp8_paged_fused), Rec.ids[0]);
+        try t.expectEqualSlices(u64, &.{ 100, 200, 200 + 262_144, 500, 600, 700, 32, 2051 }, Rec.args[0][0..8]);
+        try t.expectEqual(@as(u32, @bitCast(scale)), Rec.word(0, 8));
+        try t.expectEqual(@as(u32, 5), Rec.word(0, 9));
+        try t.expectEqualSlices(u64, &.{ 900, ps }, Rec.args[0][10..12]);
+        try t.expectEqual([3]u32{ @intCast(rows), if (rows < 64) 2 else 1, 1 }, Rec.grid[0]);
+    }
 }
 
 test "GLM FP8 KV: a paged sparse list in the other cache's units refuses before any launch" {
@@ -274,6 +297,9 @@ test "GLM FP8 KV: a paged sparse list in the other cache's units refuses before 
     const p: latent.Partials = .{ .po = 1000, .pm = 2000, .pl = 3000 };
     try t.expectError(error.TokenUnits, latent.sparseAttentionFormat(set, stream, 100, 200, 400, .{ .pt = 900, .ps = 3_266_560, .page_rows = 3_190 }, 500, 600, 2051, p, 700, 3, 32, 512, 0.125));
     try t.expectError(error.TokenUnits, latent.sparseAttentionFormat(set, stream, 100, 200, 0, .{ .pt = 900, .ps = 6_684_672, .page_rows = 6_528, .logical = true }, 500, 600, 2051, p, 700, 3, 32, 512, 0.125));
+    const past: latent.Partials = .{ .po = 1000, .pm = 2000, .pl = 3000, .rows = 1 };
+    try t.expectError(error.TokenUnits, latent.sparseAttentionFormat(set, stream, 100, 200, 400, .{ .pt = 900, .ps = 3_266_560, .page_rows = 3_190 }, 500, 600, 2051, past, 700, 3, 32, 512, 0.125));
+    try t.expectError(error.TokenUnits, latent.sparseAttentionFormat(set, stream, 100, 200, 0, .{ .pt = 900, .ps = 6_684_672, .page_rows = 6_528, .logical = true }, 500, 600, 2051, past, 700, 3, 32, 512, 0.125));
     try t.expectEqual(@as(usize, 0), Rec.n);
     try latent.attentionFormat(set, stream, 100, 200, 400, .{ .pt = 900, .ps = 3_266_560, .page_rows = 3_190 }, 300, p, 500, 600, 3, 32, 512, 1, 0.125, 16);
     try latent.sparseAttentionFormat(set, stream, 100, 200, 400, .{ .logical = true }, 500, 600, 2051, p, 700, 3, 32, 512, 0.125);
@@ -312,10 +338,10 @@ test "GLM FP8 KV: a logical table keeps the assembled token lists positions, whi
 test "GLM FP8 KV: the glue resolves the paged symbols and opts their chunks into the window's shared memory" {
     const glue = @import("cuda_glue.zig");
     const Res = struct {
-        var names: [96][]const u8 = undefined;
+        var names: [128][]const u8 = undefined;
         var n: usize = 0;
-        var set_on: [16]usize = undefined;
-        var set_bytes: [16]c_int = undefined;
+        var set_on: [32]usize = undefined;
+        var set_bytes: [32]c_int = undefined;
         var sets: usize = 0;
         fn function(out: *cuda.abi.Function, _: cuda.abi.Module, name: [*:0]const u8) callconv(.c) c_int {
             names[n] = std.mem.span(name);
