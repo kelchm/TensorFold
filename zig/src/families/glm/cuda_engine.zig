@@ -112,6 +112,7 @@ pub const Engine = struct {
     share_pages: bool = false, // TF_KV_SHARE: a kept state leaves its prefix's pages to the shared store that holds them
     keep_seqs: bool = false, // TF_GLM_KEEP_SEQS: a released slot keeps its sequence for its next request
     l2pf: ?l2pf_mod.L2pf = null, // TF_GLM_L2PF: the prefetch's side stream, kernels and table, made after the weights tile
+    side: ?@import("cuda_moe.zig").Side = null, // TF_GLM_SHARED_SIDE: decode shared-expert stream (not L2PF's)
     local: []held_shares.Local = &.{}, // full GLM-5.3 at TP=1: the other shares this process runs (cuda_engine_shares)
     rank_buf: [held_shares.max_held]fw.Rank = undefined, // those shares as the forward's ranks
 
@@ -138,16 +139,7 @@ pub const Engine = struct {
         const config_hash = try ranks.hashFile(a, io, cfg_path);
         const program_hash = try ranks.hashFile(a, io, "/proc/self/exe");
         const checkpoint_digest = try ranks.artifact(a, io, checkpoint);
-        var fp = ranks.Fingerprint.of(
-            world,
-            rank,
-            o.settings,
-            o.capacity,
-            o.mtp,
-            config_hash,
-            program_hash,
-            checkpoint_digest,
-        );
+        var fp = ranks.Fingerprint.of(world, rank, o.settings, o.capacity, o.mtp, config_hash, program_hash, checkpoint_digest);
         if (o.vision) |lim| ranks.mediaFingerprint(&fp, lim);
         fp.mtp += @intFromBool(o.drafter);
         if (o.drafter) ranks.drafterFingerprint(&fp, o.drafter_bits, if (o.drafter_dir) |dd| try ranks.artifact(a, io, dd) else @splat(0));
@@ -233,6 +225,8 @@ pub const Engine = struct {
         errdefer e.prompt_out.free();
         e.shared_buf = try cuda.DeviceBuffer.alloc(d, 8);
         errdefer e.shared_buf.free();
+        if (o.settings.shared_side) e.side = try @import("cuda_moe.zig").Side.init(d);
+        errdefer if (e.side) |*x| x.deinit(); // drained before the buffers and weights its work reads go
         errdefer @import("cuda_load_owner.zig").drain(stream, d);
         try e.stream.synchronize();
         return e;
@@ -240,6 +234,7 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         e.stream.synchronize() catch {};
+        if (e.side) |*x| x.deinit(); // drained: shared-expert work in flight reads buffers and weights freed below
         held_shares.deinit(e);
         e.gpa.free(e.packs.ptrs);
         e.gpa.free(e.packs.bits);
@@ -291,7 +286,7 @@ pub const Engine = struct {
     pub fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
         const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = if (e.local.len > 0) held_shares.ranks(e, b) else out, .exchange = e.exchange(), .pieces = prompt_pair.piecesOf(e, b), .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .shared_kda_wide = e.settings.shared_kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .l2pf = if (e.l2pf) |*p| p else null, .pair_experts = e.pair != null and e.settings.pair_experts };
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = if (e.local.len > 0) held_shares.ranks(e, b) else out, .exchange = e.exchange(), .pieces = prompt_pair.piecesOf(e, b), .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .shared_kda_wide = e.settings.shared_kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .l2pf = if (e.l2pf) |*p| p else null, .side = e.side, .pair_experts = e.pair != null and e.settings.pair_experts };
     }
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
@@ -505,7 +500,7 @@ pub const Engine = struct {
             rows += p.ids.len;
         }
         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .shared_kda_wide = e.settings.shared_kda_wide, .taps = if (e.drafter) |dr| dr.taps(false) else null, .l2pf = if (e.l2pf) |*p| p else null };
+        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .shared_kda_wide = e.settings.shared_kda_wide, .taps = if (e.drafter) |dr| dr.taps(false) else null, .l2pf = if (e.l2pf) |*p| p else null, .side = e.side };
         try f.run(@ptrCast(ids[0..rows]));
         if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
         try @import("cuda_engine_pick.zig").drawShared(e, b, parts, segs[0..parts.len], rows);

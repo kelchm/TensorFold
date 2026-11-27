@@ -200,6 +200,7 @@ pub const Forward = struct {
     taps: ?taps_mod.Taps = null, // DFlash2 (--drafter): the tapped layers' rows, after each such layer
     index_split: bool = false, // TF_GLM_INDEX_SPLIT: this prompt chunk's indexer rows split across the ranks (rank 0's choice)
     l2pf: ?*const l2pf_mod.L2pf = null, // TF_GLM_L2PF: a decode window's sites read their next weights into L2
+    side: ?moe.Side = null, // TF_GLM_SHARED_SIDE: decode window shared expert on its own stream (same bytes)
 
     /// TF_GLM_L2PF on this forward: a decode window of this process's one rank (a prompt chunk reads at full rate).
     pub fn prefetch(f: *const Forward) ?*const l2pf_mod.L2pf {
@@ -295,6 +296,7 @@ pub const Forward = struct {
             .moe => |m| {
                 const pf = f.prefetch();
                 var kernels = f.moeKernels();
+                if (out == null) kernels.side = null;
                 kernels.early_shared = f.scheduled_l2 and pf != null and pf.?.o.front(rows) and out != null and m.exl3 != null;
                 try moe.body(kernels, f.stream, m, b.moe, b.normed, c.hidden, rows, b.prefill);
                 if (out) |o| try moe.fill(kernels, f.stream, m, b.moe, b.normed, c.hidden, 0, rows, b.prefill, o);
@@ -307,7 +309,7 @@ pub const Forward = struct {
     }
 
     pub fn moeKernels(f: *const Forward) moe.Kernels {
-        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .tfq3 = if (f.m.tfq3) |*x| x else null, .put_slot = f.m.put_slot, .prof = f.prof, .direct = f.m.moe_direct };
+        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .tfq3 = if (f.m.tfq3) |*x| x else null, .put_slot = f.m.put_slot, .prof = f.prof, .direct = f.m.moe_direct, .side = f.side };
     }
 
     pub const Site = enum { mixer, ffn };

@@ -77,6 +77,7 @@ test {
     _ = @import("cuda_taps_tp_test.zig");
     _ = @import("cuda_pdl.zig");
     _ = @import("cuda_glue_hc_test.zig");
+    _ = @import("cuda_moe_side_test.zig");
     _ = @import("cuda_resolve_test.zig");
     _ = @import("cuda_boundary.zig");
     _ = @import("cuda_roce_multi.zig");

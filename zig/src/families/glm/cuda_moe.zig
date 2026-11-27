@@ -8,6 +8,7 @@ const experts = @import("cuda_experts.zig");
 const exl3 = @import("cuda_exl3.zig");
 const prof_mod = @import("cuda_prof.zig");
 const projection = @import("cuda_proj.zig");
+const b16 = @import("cuda_b16.zig");
 
 /// One MoE layer on a rank: router (bf16 [count][dims]) and fp32 bias, routed experts, shared [gate | up] and down.
 pub const Layer = struct {
@@ -39,8 +40,37 @@ pub const Scratch = struct {
     sxs: u64, // fp32 [rows][shared / 64]
     sy: u64, // fp32 [rows][dims]
     mm_part: u64, // fp32 split-K partials of the shared expert's matmuls
+    side_part: u64 = 0, // and on Side's stream: a decode buffer's own, apart from every main-stream matmul's (0: none)
     x3: exl3.Scratch = .{ .picks = 0, .xg = 0, .xu = 0, .z = 0 }, // EXL3 experts (eact holds their down inputs)
 };
+
+/// TF_GLM_SHARED_SIDE: a decode window's shared expert on its own stream; `fork` after the input, `join` the combine.
+pub const Side = struct {
+    s: cuda.Stream,
+    fork: cuda.Event,
+    join: cuda.Event,
+
+    pub fn init(d: *const cuda.Driver) !Side {
+        var s = try cuda.Stream.init(d, true);
+        errdefer s.deinit();
+        var f = try cuda.Event.init(d, false);
+        errdefer f.deinit();
+        return .{ .s = s, .fork = f, .join = try cuda.Event.init(d, false) };
+    }
+
+    /// Stream.deinit drains it first: its work reads buffers and weights freed after it.
+    pub fn deinit(x: *Side) void {
+        x.s.deinit();
+        x.join.deinit();
+        x.fork.deinit();
+        x.* = undefined;
+    }
+};
+
+/// The split-K partials of a decode window's shared expert ([gate | up], then down) on its side stream (Side).
+pub fn sidePart(rows: usize, shared_w: usize, dims: usize) usize {
+    return @max(b16.partBytes(rows, 2 * shared_w, dims), b16.partBytes(rows, dims, shared_w));
+}
 
 /// The kernels the block runs: the captured Triton set, the grouped NVFP4 experts, the plan, and glm_ops.
 pub const Kernels = struct {
@@ -52,7 +82,13 @@ pub const Kernels = struct {
     prof: ?*prof_mod.Prof = null,
     early_shared: bool = false,
     direct: bool = false, // TF_GLM_MOE_DIRECT=1 (opt-in): see `direct`
+    side: ?Side = null, // TF_GLM_SHARED_SIDE: decode window shared expert on its own stream (null: inline)
 };
+
+/// Whether the block forks its shared expert: a decode window with a side stream and side partials (prompts inline).
+pub fn forks(k: Kernels, s: Scratch, prompt: bool) bool {
+    return k.side != null and !prompt and s.side_part != 0;
+}
 
 /// TF_GLM_MOE_DIRECT=1: a decode window's EXL3 experts on flat picks, their slot rows summed in place (no copies).
 fn direct(k: Kernels, l: Layer, rows: usize, prompt: bool) bool {
@@ -79,9 +115,12 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     const d = l.routed.dims;
     const slots = l.top_k + 1;
     const shared_id: i32 = @intCast(l.count);
+    const forked = forks(k, s, prompt);
+    if (forked) try fork(k, stream, l, s, x, x_stride, rows);
+    errdefer if (forked) k.side.?.s.synchronize() catch {}; // a later failure drains the forked side work
     const flat = direct(k, l, rows, prompt);
     try prepare(k, stream, l, s, x, x_stride, rows, s.pick, if (flat) s.x3.picks else null);
-    if (k.early_shared) try sharedRows(k, stream, l, s, x, x_stride, 0, rows);
+    if (k.early_shared and !forked) try sharedRows(k, stream, l, s, x, x_stride, 0, rows);
     const stamp = prof_mod.span(k.prof, stream, .experts);
     defer stamp.end();
     if (k.prof) |p| p.mark(stream, .router);
@@ -115,23 +154,40 @@ fn sharedRows(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_s
     try projection.matmul(k.set, stream, l.shared_down, s.sact + lo * l.shared * 2, l.shared, s.sy + lo * d * 4, s.mm_part, n, d, l.shared, true);
 }
 
-/// Shared expert and its slot, before the slot sum; paired passes call this on the original exchange pieces.
-pub fn shared(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize, prompt: bool) !void {
+fn putSlot(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize, hi: usize, bf16_slots: bool) !void {
     const d = l.routed.dims;
     const slots = l.top_k + 1;
     const n = hi - lo;
-    const bf16_slots = prompt and l.exl3 == null and l.tfq3 == null;
     const eb: usize = if (bf16_slots) 2 else 4;
-    if (!k.early_shared) try sharedRows(k, stream, l, s, x, x_stride, lo, hi);
-    if (direct(k, l, hi, prompt)) { // body ran these rows direct: a decode window, filled whole; fill sums it (combineTail)
-        if (lo != 0) return error.BadWindow;
-        return;
-    }
     var a: cuda.Args = .{};
     a.add(s.sy + lo * d * 4);
     a.add(s.ey + lo * slots * d * eb);
     for ([_]usize{ n, d, slots, l.top_k, @intFromBool(bf16_slots) }) |v| a.add(@as(c_int, @intCast(v)));
     try cuda_pdl.launch(k.put_slot, .{ .grid = .{ .x = @intCast((n * d + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
+}
+
+/// Every row's shared expert on the side stream from the block's input as it stands now, then its join event.
+pub fn fork(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize) !void {
+    const sd = k.side.?;
+    try sd.fork.record(stream);
+    try sd.s.wait(sd.fork);
+    errdefer sd.s.synchronize() catch {}; // partial side work drains before returning an error
+    var ss = s;
+    ss.mm_part = s.side_part; // the main stream's matmuls keep mm_part
+    try sharedRows(k, sd.s, l, ss, x, x_stride, 0, rows);
+    if (!direct(k, l, rows, false)) try putSlot(k, sd.s, l, s, 0, rows, false);
+    try sd.join.record(sd.s);
+}
+
+/// Shared expert and its slot, before the slot sum; paired passes call this on the original exchange pieces.
+pub fn shared(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize, prompt: bool) !void {
+    const bf16_slots = prompt and l.exl3 == null and l.tfq3 == null;
+    if (!k.early_shared) try sharedRows(k, stream, l, s, x, x_stride, lo, hi);
+    if (direct(k, l, hi, prompt)) { // body ran these rows direct: a decode window, filled whole; fill sums it (combineTail)
+        if (lo != 0) return error.BadWindow;
+        return;
+    }
+    try putSlot(k, stream, l, s, lo, hi, bf16_slots);
 }
 
 /// The already-filled slot rows, summed in slot order into out fp32 (any range, same bits).
@@ -145,7 +201,12 @@ pub fn combine(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize,
 pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize, prompt: bool, out: u64) !void {
     const stamp = prof_mod.span(k.prof, stream, .shared_expert);
     defer stamp.end();
-    try shared(k, stream, l, s, x, x_stride, lo, hi, prompt);
+    const forked = forks(k, s, prompt);
+    errdefer if (forked) k.side.?.s.synchronize() catch {}; // no side work outlives a failed join or combine
+    if (forked) { // forked in body: TF_GLM_PROF's decode `shared` is then the wait and the combine alone
+        if (lo != 0) return error.BadWindow;
+        try stream.wait(k.side.?.join);
+    } else try shared(k, stream, l, s, x, x_stride, lo, hi, prompt);
     if (direct(k, l, hi, prompt)) { // TF_GLM_MOE_DIRECT: the routed sum straight from the flat picks, then the shared slot
         const d = l.routed.dims;
         const y = try exl3.directOut(l.exl3.?, s.x3, hi, l.count, d, l.routed.width, l.routed.limit);

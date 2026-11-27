@@ -237,7 +237,7 @@ pub const Buffers = struct {
     /// The DSA token lists and counts (dsa.tokens, dsa.counts): a shared indexer layer reads its chunk's sites later.
     const twin_lists = [_]usize{ 40, 41 };
     /// make's size count when twin_at's indexes were last checked: adding or removing a size fails the build.
-    const twin_checked = 76;
+    const twin_checked = 77;
 
     /// Whether a twin holds size `i` apart: the regular and joint ones; with `lists` (full GLM-5.3) the token lists.
     fn twinHolds(i: usize, joint: bool, lists: bool) bool {
@@ -318,6 +318,7 @@ pub const Buffers = struct {
             rows * D * 4, // part: this rank's fp32 partial rows a split exchange sends from
             x3[0], x3[1], x3[2], x3[3], // EXL3 experts: prompt rotations and activations, or compact decode picks and partials
             if (split) rows * @max(3 * n, kw - 3 * n) * 2 else 4, // a split KDA stack's part rows
+            if (prefill) 4 else @max(4, moe.sidePart(@min(rows, b16.rows_from - 1), sh, D)), // the side shared expert's slices
         };
         var held = sizes;
         if (twin != null) for (&held, 0..) |*bytes, i| { // a twin allocates its own rows only
@@ -341,28 +342,7 @@ pub const Buffers = struct {
             .gathered = p[twin_at.gathered],
             .kproj = p[8],
             .kda = .{ .p = 0, .ka = p[9], .kg = p[10], .saves = .{ .out = p[11], .state_out = 0, .k = p[12], .v = p[13], .g = p[14], .b = p[15] }, .wide = .{ .q = p[16], .y = p[17] }, .mm_part = p[42] },
-            .dsa = .{
-                .dp = p[18],
-                .qr = p[19],
-                .xs_qr = p[20],
-                .lat = p[21],
-                .xs_lat = p[22],
-                .q = p[23],
-                .ikr = p[24],
-                .igr = p[25],
-                .router_part = p[26],
-                .qa = p[27],
-                .ol = p[28],
-                .vn = p[29],
-                .qi = p[30],
-                .partials = .{ .po = p[31], .pm = p[32], .pl = p[33] },
-                .dummy = p[34],
-                .select = .{ .scores = p[35], .ls = p[36], .li = p[37], .pools = p[38], .at = p[39], .bits_rows = sel.bits_rows },
-                .tokens = p[40],
-                .counts = p[41],
-                .mm_part = p[42],
-                .at = p[43],
-            },
+            .dsa = .{ .dp = p[18], .qr = p[19], .xs_qr = p[20], .lat = p[21], .xs_lat = p[22], .q = p[23], .ikr = p[24], .igr = p[25], .router_part = p[26], .qa = p[27], .ol = p[28], .vn = p[29], .qi = p[30], .partials = .{ .po = p[31], .pm = p[32], .pl = p[33] }, .dummy = p[34], .select = .{ .scores = p[35], .ls = p[36], .li = p[37], .pools = p[38], .at = p[39], .bits_rows = sel.bits_rows }, .tokens = p[40], .counts = p[41], .mm_part = p[42], .at = p[43] },
             .dense = .{ .tmp = p[44], .gu = p[45], .act = p[46], .xs_act = p[47], .mm_part = p[42] },
             .moe = .{ .mlog = p[48], .router_part = p[26], .pick = p[49], .wts = p[50], .plan = .{ .members = p[51], .items = p[52], .counts = p[53], .rank = p[54], .hist = p[55] }, .eact = p[56], .ey = p[57], .sgu = p[58], .sact = p[59], .sxs = p[60], .sy = p[61], .mm_part = p[42] },
             .hidden = p[twin_at.hidden],
@@ -377,6 +357,7 @@ pub const Buffers = struct {
         };
         out.moe.x3 = .{ .picks = p[71], .xg = p[72], .xu = p[73], .z = p[74] };
         out.kda.tmp = p[75];
+        if (!prefill) out.moe.side_part = p[76]; // TF_GLM_SHARED_SIDE: decode windows alone fork the shared expert
         if (twin) |of| {
             var t = of.*;
             t.arena = out.arena;

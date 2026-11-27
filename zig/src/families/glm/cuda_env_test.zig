@@ -39,6 +39,7 @@ const switches = [_]Name{
     .{ .name = "TF_GLM_HC_SPLIT", .default = true },
     .{ .name = "TF_GLM_HC_PART", .default = true },
     .{ .name = "TF_GLM_KDA_SEGS", .default = true },
+    .{ .name = "TF_GLM_SHARED_SIDE", .default = true },
 };
 const counts = [_][:0]const u8{"TF_GLM_DFLASH2_LOG"};
 const reals = [_][:0]const u8{ "TF_GLM_DRAFT_CONFIDENCE", "TF_GLM_SHARED_DRAFT_CONFIDENCE" };

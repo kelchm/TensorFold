@@ -43,6 +43,7 @@ pub const Settings = struct {
     verify_tiles: @import("cuda_verify_tiles.zig").Options = .{},
     kv_live_half: bool = false, // TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone (cuda_snapshot_layout.zig)
     draft_split: bool = false, // TF_GLM_DRAFT_SPLIT=1: three ranks or more split the drafter MLP without TF_ROCE=1
+    shared_side: bool = true, // TF_GLM_SHARED_SIDE: decode window shared expert on its own stream; same bytes, ranks may differ
 
     /// Whether three ranks or more split the DFlash2 drafter's MLP (dflash.mlpSplit's `wide`); two ranks always do.
     pub fn draftWide(s: Settings) bool {
@@ -62,14 +63,6 @@ pub const Settings = struct {
     /// `read` from a lookup with no blank text, so every name below and in l2pf's reader is unset when blank.
     fn readSet(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
         var s: Settings = .{};
-        s.dflash_only = @import("sys").environment.value(bool, "TF_GLM_DFLASH_ONLY", get("TF_GLM_DFLASH_ONLY"), false) catch {
-            problem.* = "TF_GLM_DFLASH_ONLY: 0 or 1";
-            return error.BadSetting;
-        };
-        s.dflash_q4_down = @import("sys").environment.value(bool, "TF_GLM_DFLASH_Q4_DOWN", get("TF_GLM_DFLASH_Q4_DOWN"), false) catch {
-            problem.* = "TF_GLM_DFLASH_Q4_DOWN: 0 or 1";
-            return error.BadSetting;
-        };
         if (get("TF_GLM_PROMPT_K")) |v| {
             if (std.mem.eql(u8, v, "shape")) s.prompt_fixed_k = true else if (!std.mem.eql(u8, v, "one")) {
                 problem.* = "TF_GLM_PROMPT_K: one or shape";
@@ -213,12 +206,16 @@ pub const Settings = struct {
                 return error.BadSetting;
             };
         }
-        inline for (.{ .{ "TF_GLM_EXL3_DECODE", "exl3_decode" }, .{ "TF_GLM_EXL3_N_MAJOR", "exl3_nmajor" }, .{ "TF_GLM_PACKED_PROMPT_S2", "prompt_s2" }, .{ "TF_GLM_DFLASH_SNAP_CONTEXT", "dflash_snap_context" }, .{ "TF_GLM_PAIR_DFLASH", "pair_dflash" }, .{ "TF_GLM_ROCE_FUSE", "roce_fuse" } }) |flag| {
+        inline for (.{ .{ "TF_GLM_DFLASH_ONLY", "dflash_only" }, .{ "TF_GLM_DFLASH_Q4_DOWN", "dflash_q4_down" }, .{ "TF_GLM_EXL3_DECODE", "exl3_decode" }, .{ "TF_GLM_EXL3_N_MAJOR", "exl3_nmajor" }, .{ "TF_GLM_PACKED_PROMPT_S2", "prompt_s2" }, .{ "TF_GLM_DFLASH_SNAP_CONTEXT", "dflash_snap_context" }, .{ "TF_GLM_PAIR_DFLASH", "pair_dflash" }, .{ "TF_GLM_ROCE_FUSE", "roce_fuse" } }) |flag| {
             @field(s, flag[1]) = @import("sys").environment.value(bool, flag[0], get(flag[0]), false) catch {
                 problem.* = flag[0] ++ ": 0 or 1";
                 return error.BadSetting;
             };
         }
+        s.shared_side = @import("sys").environment.value(bool, "TF_GLM_SHARED_SIDE", get("TF_GLM_SHARED_SIDE"), true) catch {
+            problem.* = "TF_GLM_SHARED_SIDE: 0 or 1";
+            return error.BadSetting;
+        };
         if (get("TF_GLM_DRAFT_SPLIT")) |v| {
             if (std.mem.eql(u8, v, "1")) s.draft_split = true else if (!std.mem.eql(u8, v, "0")) {
                 problem.* = "TF_GLM_DRAFT_SPLIT: 0 or 1";
