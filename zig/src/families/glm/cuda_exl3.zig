@@ -333,7 +333,7 @@ fn launchDecode(f: cuda.Function, stream: cuda.Stream, grid: [3]usize, threads: 
 
 /// Route flat 8-slot or 9-slot picks using shared per-row rotation and the GLM gate/up epilogue.
 pub fn runDecode(k: *const Kernels, router: cuda.grouped.Router, stream: cuda.Stream, w: Experts, arena: u64, p: cuda.grouped.Plan, x: u64, stride: usize, picks: u64, slots: usize, rows: usize, count: usize, limit: f32, ey: u64, xd: u64) !void {
-    const nmajor = k.glm_nmajor and (rows == 4 or rows == 8 or rows == 16);
+    const nmajor = k.glm_nmajor;
     const gateup = (if (nmajor)
         (if (slots == top_k) k.glm_gateup_flat_nmajor else k.glm_gateup_nmajor)
     else
