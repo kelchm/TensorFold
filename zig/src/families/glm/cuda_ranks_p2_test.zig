@@ -95,6 +95,36 @@ test "TF_GLM_DFLASH_ONLY: off by default, 0 or 1, and every rank must agree" {
     try std.testing.expectEqual(Mismatch{ .field = .mtp, .rank = 1 }, mismatch(&all).?);
 }
 
+test "TF_GLM_DFLASH_Q4_DOWN: off by default, 0 or 1, and every rank must agree" {
+    const Reader = struct {
+        fn absent(_: [:0]const u8) ?[]const u8 {
+            return null;
+        }
+        fn on(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_DFLASH_Q4_DOWN")) "1" else null;
+        }
+        fn off(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_DFLASH_Q4_DOWN")) "0" else null;
+        }
+        fn bad(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_DFLASH_Q4_DOWN")) "4" else null;
+        }
+    };
+    var problem: []const u8 = "";
+    try std.testing.expect(!(try Settings.read(Reader.absent, &problem)).dflash_q4_down);
+    const on = try Settings.read(Reader.on, &problem);
+    try std.testing.expect(on.dflash_q4_down);
+    try std.testing.expect(!(try Settings.read(Reader.off, &problem)).dflash_q4_down);
+    try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
+    try std.testing.expectEqualStrings("TF_GLM_DFLASH_Q4_DOWN: 0 or 1", problem);
+    const h: [32]u8 = @splat(0);
+    const all = [_]Fingerprint{
+        Fingerprint.of(2, 0, on, 8192, true, h, h, h),
+        Fingerprint.of(2, 1, .{}, 8192, true, h, h, h),
+    };
+    try std.testing.expectEqual(Mismatch{ .field = .mtp, .rank = 1 }, mismatch(&all).?);
+}
+
 test "startup switches: external drafter precision and checkpoint digest agree across ranks" {
     const h: [32]u8 = @splat(0);
     const d0 = ranks.hashBytes("drafter-a");
@@ -139,6 +169,7 @@ test "startup switches: rank-local P2 validation failures notify waiting peers t
         fn report(_: Args, _: startup.Report) void {}
     };
     const cases = [_]struct { set: Settings, args: Args, err: anyerror, name: []const u8 }{
+        .{ .set = .{ .dflash_q4_down = true }, .args = .{ .bits = 0 }, .err = error.BadSetting, .name = "BadSetting" },
         .{ .set = .{ .dflash_only = true }, .args = .{ .external = false }, .err = error.BadSetting, .name = "BadSetting" },
     };
     for (cases) |c| {

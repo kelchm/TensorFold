@@ -17,7 +17,11 @@ pub fn requestStartsAlone(learn_conversations: bool) !void {
 
 /// Rank-local P2 option checks, run inside startup.open's tp_watch boundary so peers hear refusals immediately.
 pub fn validateRankOptions(set: @import("cuda_ranks.zig").Settings, shared: usize, drafts: bool, external: bool, drafter_bits: u8) !void {
-    _ = .{ shared, drafter_bits };
+    _ = shared;
+    if (set.dflash_q4_down and (!external or !drafts or drafter_bits != 4)) {
+        if (!@import("builtin").is_test) std.log.err("TF_GLM_DFLASH_Q4_DOWN=1 requires enabled DFlash2 and --drafter-bits 4", .{});
+        return error.BadSetting;
+    }
     if (set.dflash_only and (!external or !drafts)) {
         if (!@import("builtin").is_test) std.log.err("TF_GLM_DFLASH_ONLY=1 requires --drafter and enabled drafts", .{});
         return error.BadSetting;

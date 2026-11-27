@@ -4,8 +4,9 @@ const std = @import("std");
 const cuda = @import("cuda");
 const cuda_pdl = @import("cuda_pdl.zig");
 
-/// qmm_group.cu's tile-2 instantiation (LaneTile<64, 16, 64, 1, 4, 8>, bf16 out), as zig/kernels/cuda exports it.
+/// qmm_group.cu's tile-2 instantiations (LaneTile<64, 16, 64, 1, 4, 8>, bf16 and fp32 out).
 const group_symbol = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
+const group_f32_symbol = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb1ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
 const group_smem: u32 = 35328; // LaneTile<64, 16, 64, 1, 4, 8>::SMEM
 
 /// qmm_group.cu's Part and Parts, passed by value: four projections at most, one used here.
@@ -20,6 +21,7 @@ comptime {
 pub const Q4 = struct { w: u64, s: u64, b: u64, n: usize, k: usize, npad: usize };
 
 pub const Kernels = struct {
+    group_f32: ?cuda.Function = null,
     group: cuda.Function,
     pack_dense: cuda.Function,
     transpose: cuda.Function,
@@ -35,6 +37,17 @@ pub const Kernels = struct {
         };
         try k.group.allowDynamicShared(group_smem);
         return k;
+    }
+
+    /// Resolve the FP32-output tile-2 kernel only when TF_GLM_DFLASH_Q4_DOWN=1 requests Q4 down projections.
+    pub fn prepareWide(k: *Kernels, group: cuda.Module) !void {
+        if (k.group_f32 != null) return;
+        const f = try group.optionalFunction(group_f32_symbol) orelse {
+            if (!@import("builtin").is_test) std.log.err("TF_GLM_DFLASH_Q4_DOWN=1 requires qmm_group FP32-output kernel ({s}); rebuild fatbins or unset TF_GLM_DFLASH_Q4_DOWN", .{group_f32_symbol});
+            return error.MissingWideQ4Kernel;
+        };
+        try f.allowDynamicShared(group_smem);
+        k.group_f32 = f;
     }
 };
 
@@ -79,6 +92,11 @@ pub fn pack(ks: *const Kernels, stream: cuda.Stream, words: u64, scales: u64, bi
 
 /// qmm.matmul of a Q4 (tile 2, up to 16 rows): x bf16 (`ldx` apart), group sums xs fp32 [rows][k/64] -> out bf16.
 pub fn matmul(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize) !void {
+    return matmulOutput(ks, stream, x, ldx, xs, q, out, rows, false);
+}
+
+/// A row-parallel projection retains its unrounded accumulator until after tensor-parallel summation.
+pub fn matmulOutput(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize, wide: bool) !void {
     if (rows == 0 or rows > 16) return error.WindowTooWide;
     const sk = splitK(q.n, q.k);
     const tiles = (q.n + 63) / 64;
@@ -99,11 +117,71 @@ pub fn matmul(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u
         .cluster = if (sk > 1) .{ .x = @intCast(sk) } else null,
         .pdl = ks.gb10 and cuda_pdl.on(),
     };
-    try cuda.launch.launch(ks.group, cfg, stream, &a);
+    const f = if (wide) (ks.group_f32 orelse return error.MissingWideQ4Kernel) else ks.group;
+    try cuda.launch.launch(f, cfg, stream, &a);
 }
 
 test "the draft head's shape takes one K slice; npad rounds to 128s" {
     try std.testing.expectEqual(@as(usize, 1), splitK(77440, 4096));
     try std.testing.expectEqual(@as(usize, 77440), npadOf(77440));
     try std.testing.expectEqual(@as(usize, 51712), npadOf(51627));
+}
+
+test "GLM Q4: load skips FP32 down symbol until prepareWide enables it" {
+    const Fake = struct {
+        var allow_f32 = false;
+        var lookups: usize = 0;
+        var smem_calls: usize = 0;
+        var last_launched: usize = 0;
+        fn getFn(out: *cuda.abi.Function, _: cuda.abi.Module, name: [*:0]const u8) callconv(.c) cuda.abi.Result {
+            const s = std.mem.span(name);
+            lookups += 1;
+            if (std.mem.eql(u8, s, group_f32_symbol)) {
+                if (!allow_f32) return cuda.abi.error_not_found;
+                out.* = @ptrFromInt(42);
+                return 0;
+            }
+            out.* = @ptrFromInt(11);
+            return 0;
+        }
+        fn setAttr(_: cuda.abi.Function, _: cuda.abi.FunctionAttribute, v: c_int) callconv(.c) cuda.abi.Result {
+            if (v == @as(c_int, @intCast(group_smem))) smem_calls += 1;
+            return 0;
+        }
+        fn errStr(_: cuda.abi.Result, out: *?[*:0]const u8) callconv(.c) cuda.abi.Result {
+            out.* = null;
+            return 1;
+        }
+        fn devAttr(out: *c_int, a: cuda.abi.DeviceAttribute, _: cuda.abi.Device) callconv(.c) cuda.abi.Result {
+            out.* = if (a == .compute_capability_major) 12 else 1;
+            return 0;
+        }
+        fn launch(f: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+            last_launched = @intFromPtr(f);
+            return 0;
+        }
+    };
+    var d: cuda.Driver = undefined;
+    d.api.cuModuleGetFunction = Fake.getFn;
+    d.api.cuFuncSetAttribute = Fake.setAttr;
+    d.api.cuGetErrorName = Fake.errStr;
+    d.api.cuGetErrorString = Fake.errStr;
+    d.api.cuDeviceGetAttribute = Fake.devAttr;
+    d.api.cuLaunchKernel = Fake.launch;
+    d.api.cuLaunchKernelEx = cuda_pdl.forwardEx(Fake.launch);
+    const ctx: cuda.Context = .{ .d = &d, .device = 0, .handle = null };
+    const mod: cuda.Module = .{ .d = &d, .handle = null };
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    const q: Q4 = .{ .w = 0, .s = 0, .b = 0, .n = 4096, .k = 4096, .npad = 4096 };
+    var ks = try Kernels.load(mod, mod, &ctx);
+    try std.testing.expect(ks.group_f32 == null);
+    try std.testing.expectEqual(@as(usize, 1), Fake.smem_calls);
+    try std.testing.expectError(error.MissingWideQ4Kernel, matmulOutput(&ks, stream, 0, 4096, 0, q, 0, 8, true));
+    try std.testing.expectError(error.MissingWideQ4Kernel, ks.prepareWide(mod));
+    try std.testing.expect(ks.group_f32 == null);
+    Fake.allow_f32 = true;
+    try ks.prepareWide(mod);
+    try std.testing.expectEqual(@as(usize, 2), Fake.smem_calls);
+    try matmulOutput(&ks, stream, 0, 4096, 0, q, 0, 8, true);
+    try std.testing.expectEqual(@as(usize, 42), Fake.last_launched);
 }

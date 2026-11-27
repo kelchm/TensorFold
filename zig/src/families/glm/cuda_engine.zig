@@ -190,6 +190,7 @@ pub const Engine = struct {
         e.m.mm.prompt_fixed_k = o.settings.prompt_fixed_k;
         e.m.tiled = o.settings.tiled;
         if (o.settings.tiled) e.m.packs = &e.packs;
+        if (o.settings.dflash_q4_down) try e.m.q4.prepareWide(e.m.mods[5]);
         if (held.count == 1 and o.settings.l2pf.want(try ctx.capability(), world)) e.l2pf = try l2pf_mod.L2pf.init(gpa, d, &e.w, o.settings.l2pf);
         errdefer if (e.l2pf) |*p| p.deinit();
         if (e.settings.pages and pages_mod.pageBytes(e) == 0) e.settings.pages = false;

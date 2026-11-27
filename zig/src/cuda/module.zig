@@ -36,6 +36,15 @@ pub const Module = struct {
         self.* = undefined;
     }
 
+    /// A kernel by its exact (mangled or extern "C") symbol; null when absent from the module.
+    pub fn optionalFunction(self: Module, name: [:0]const u8) Error!?Function {
+        var f: abi.Function = null;
+        const res = self.d.api.cuModuleGetFunction(&f, self.handle, name.ptr);
+        if (res == abi.error_not_found) return null;
+        try self.d.check(res, "cuModuleGetFunction");
+        return .{ .d = self.d, .handle = f };
+    }
+
     /// A kernel by its exact (mangled or extern "C") symbol; the function lives as long as the module.
     pub fn function(self: Module, name: [:0]const u8) Error!Function {
         var f: abi.Function = null;

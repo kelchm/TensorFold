@@ -59,6 +59,11 @@ const Loader = struct {
         return p;
     }
 
+    fn down(l: *Loader, name: []const u8, part: ?[4]usize, quantized: bool) !df.Lin {
+        if (quantized) return l.linear(&.{name}, &.{D}, FF, part);
+        return .{ .bf16 = try l.linearB(&.{name}, &.{D}, FF, part) };
+    }
+
     /// `names` stacked as linear(), at the drafter's bits: quantize4 then q4's tiling, or glm_mm's.
     fn linear(l: *Loader, names: []const []const u8, rows: []const usize, kk: usize, part: ?[4]usize) !df.Lin {
         if (l.bits == 0) return .{ .bf16 = try l.linearB(names, rows, kk, part) };
@@ -152,7 +157,9 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
     const small: u64 = 6 * 4096 * 2 + 2 * 128 * 2 + 2 * 2 * 2 * D * 2 + 16 * 256;
     const per: u64 = if (bits == 4) 1 else 4; // quarter-bytes a weight: 4 bits (plus scales and biases below) or bf16
     const lin_elems: u64 = df.QKV * D + 2 * KVW * D + D * D + 2 * ff * D + 2 * KVW * D + 5 * D * D / df.LAYERS;
-    const total: u64 = df.LAYERS * (lin_elems * per / 2 + lin_elems / 16 + D * ff * 2 + small + 32 * 256) + df.RANK * D * 2 + 2 * D * 2 + 64 * 256;
+    const down_parts = q4.bytes(D, ff);
+    const down_bytes = if (e.settings.dflash_q4_down) down_parts[0] + down_parts[1] + down_parts[2] else D * ff * 2;
+    const total: u64 = df.LAYERS * (lin_elems * per / 2 + lin_elems / 16 + down_bytes + small + 32 * 256) + df.RANK * D * 2 + 2 * D * 2 + 64 * 256;
     var wbuf = try cuda.DeviceBuffer.alloc(d, total);
     errdefer wbuf.free();
     var tmp = try cuda.DeviceBuffer.alloc(d, 2 * FF * D * 2); // the largest linear as stored
@@ -189,10 +196,10 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
         const down = try layerName(&nb[3], i, "mlp.down_proj.weight");
         if (split) { // this rank's share of the MLP width: gate and up rows, down columns, at rank * ff
             lw.gu = try l.linear(&.{ gate, up }, &.{ FF, FF }, D, .{ rank * ff, ff, 0, D });
-            lw.down = try l.linearB(&.{down}, &.{D}, FF, .{ 0, 0, rank * ff, ff });
+            lw.down = try l.down(down, .{ 0, 0, rank * ff, ff }, e.settings.dflash_q4_down);
         } else {
             lw.gu = try l.linear(&.{ gate, up }, &.{ FF, FF }, D, null);
-            lw.down = try l.linearB(&.{down}, &.{D}, FF, null);
+            lw.down = try l.down(down, null, e.settings.dflash_q4_down);
         }
         lw.a_proj = try l.linear(&.{try layerName(&nb[1], i, "attention_conv.kernel_projection.weight")}, &.{KVW}, D, null);
         lw.m_proj = try l.linear(&.{try layerName(&nb[1], i, "mlp_conv.kernel_projection.weight")}, &.{KVW}, D, null);
@@ -236,10 +243,9 @@ fn carve(dr: *Drafter, d: *const cuda.Driver, head_n: usize) !void {
     const chunks: u64 = (head_n + 4095) / 4096;
     var part: u64 = 16;
     for (dr.layers) |l| {
-        for ([_]df.Lin{ l.qkv, l.kv, l.o, l.gu, l.a_proj, l.m_proj }) |w| if (w == .bf16) {
+        for ([_]df.Lin{ l.qkv, l.kv, l.o, l.gu, l.down, l.a_proj, l.m_proj }) |w| if (w == .bf16) {
             part = @max(part, mm.partBytes(64, w.bf16));
         };
-        part = @max(part, mm.partBytes(64, l.down));
     }
     if (dr.fc == .bf16) part = @max(part, mm.partBytes(64, dr.fc.bf16));
     part = @max(part, mm.partBytes(64, dr.hproj));

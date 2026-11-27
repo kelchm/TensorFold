@@ -77,8 +77,8 @@ test "glm dflash: the raw scratch holds every 4-bit linear's words, scales and b
     var short: usize = 0;
     for (1..17) |world| for ([_]bool{ false, true }) |wide| {
         const ff = df.mlpSplit(world, wide).ff;
-        // dflash_load's 4-bit linears, rows by columns: qkv, kv, o, gate and up, the kernel projections, fc
-        const linears = [_][2]usize{ .{ df.QKV, df.D }, .{ 2 * df.KVW, df.D }, .{ df.D, df.D }, .{ 2 * ff, df.D }, .{ df.KVW, df.D }, .{ df.D, 5 * df.D } };
+        // dflash_load's 4-bit linears, rows by columns: qkv, kv, o, gate and up, down, the kernel projections, fc
+        const linears = [_][2]usize{ .{ df.QKV, df.D }, .{ 2 * df.KVW, df.D }, .{ df.D, df.D }, .{ 2 * ff, df.D }, .{ df.D, ff }, .{ df.KVW, df.D }, .{ df.D, 5 * df.D } };
         for (linears) |shape| {
             const nk = shape[0] * shape[1];
             const need = std.mem.alignForward(usize, nk / 2, 256) + std.mem.alignForward(usize, nk / 32, 256) + nk / 32;
