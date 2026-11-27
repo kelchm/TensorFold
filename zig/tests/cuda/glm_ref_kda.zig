@@ -126,6 +126,15 @@ fn window(r: *Rig, ks: *const kda.Kernels, rows: usize) !void {
         try ref.sameRows(r, if (wide) "KDA three-kernel chain: the replay rebuilds its state" else "KDA fused chain: the replay rebuilds its state", o[1], replayed, sizes[1]);
     }
     var name: [96]u8 = undefined;
+    for ([_]u32{ 8, 4, 2 }) |wp| { // TF_GLM_KDA_STEP_WARPS: every step block width gives the auto choice's bytes
+        var fixed = ks.*;
+        fixed.step_warps = wp;
+        var o: [6]u64 = undefined;
+        for (&o, sizes) |*b, size| b.* = try r.zeros(size);
+        try kda.chain(&fixed, r.s, ch, rows, .{ .out = o[0], .state_out = o[1], .k = o[2], .v = o[3], .g = o[4], .b = o[5] }, .{ .q = try r.zeros(rows * n * 4), .y = try r.zeros(rows * n * 2) });
+        for (o[0..2], runs[1][0..2], sizes[0..2], what[0..2]) |got, want, size, label|
+            try ref.sameRows(r, try std.fmt.bufPrint(&name, "KDA {d} rows: {d}-warp steps' {s} equal the auto step's", .{ rows, wp, label }), want, got, size);
+    }
     for (runs[0], runs[1], sizes, what) |fused, three, size, label|
         try ref.sameRows(r, try std.fmt.bufPrint(&name, "KDA {d} rows: the three-kernel chain's {s} equal the fused chain's", .{ rows, label }), fused, three, size);
     const want = try reference(r, in, rows);
@@ -138,11 +147,11 @@ fn window(r: *Rig, ks: *const kda.Kernels, rows: usize) !void {
     try ref.closeCols(r, try std.fmt.bufPrint(&name, "KDA {d} rows x {d} heads, fused chain against float64 (column = head x 128 + t)", .{ rows, heads }), runs[0][0], false, want, tol, n);
 }
 
-/// `glm-ref`'s KDA: 70 rows (a prompt window) and 3 rows (a decode window) on 32 heads.
+/// `glm-ref`'s KDA: 70 rows (a prompt window), 3 and 1 rows (decode windows) on 32 heads.
 pub fn chains(r: *Rig) !void {
     var mod = try cuda.Module.load(r.gpu.d, cuda.kernels.glm_kda);
     defer mod.unload();
     const ks = try kda.Kernels.load(mod);
-    for ([_]usize{ 70, 3 }) |rows| try window(r, &ks, rows);
-    check.pass("KDA {d} heads: within float64 tolerance, fused and three-kernel chains equal at 70 and 3 rows, replays rebuild the state", .{heads});
+    for ([_]usize{ 70, 3, 1 }) |rows| try window(r, &ks, rows);
+    check.pass("KDA {d} heads: within float64 tolerance, fused and three-kernel chains (8, 4, 2-warp steps) equal at 70, 3 and 1 rows, replays rebuild", .{heads});
 }

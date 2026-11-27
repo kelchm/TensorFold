@@ -43,7 +43,7 @@ const reals = [_][:0]const u8{ "TF_GLM_DRAFT_CONFIDENCE", "TF_GLM_SHARED_DRAFT_C
 const ranks = [_][:0]const u8{ "TF_GLM_RANK", "TF_GLM_WORLD" };
 /// The window GLM may serve past config.json's: GLM's raisedCeiling reads it at the open, after these rows' check.
 const windows = [_][:0]const u8{"TF_GLM_CONTEXT_CEILING"};
-const words = [_][:0]const u8{"TF_GLM_EXPERT_FORM"};
+const words = [_][:0]const u8{ "TF_GLM_EXPERT_FORM", "TF_GLM_KDA_STEP_WARPS" };
 const added = [_][:0]const u8{ "TF_GLM_INDEX_CUDA", "TF_GLM_INDEX_SPLIT", "TF_GLM_KV_HOST_GIB" };
 
 /// The row by name without `rule`, so a missing row fails an assertion instead of panicking.
@@ -114,6 +114,22 @@ test "GLM strict env: the expert form takes classic or factored, leaves blank to
     try t.expectEqual(@as(?u64, 0), try e.value(?u64, words[0], "classic", null));
     try t.expectEqual(@as(?u64, 1), try e.value(?u64, words[0], "factored", null));
     for ([_][]const u8{ "Classic", "FACTORED", "0", "1", "race", "auto", " classic", "factored " }) |raw| try check(words[0], raw, false);
+}
+
+test "GLM strict env: KDA step warps accept auto, 8, 4 or 2 and refuse other words" {
+    const name = "TF_GLM_KDA_STEP_WARPS";
+    const kda = @import("cuda").kda;
+    try t.expectEqualSlices([]const u8, &.{ "auto", "8", "4", "2" }, (try row(name)).words);
+    for ([_]?[]const u8{ null, "", " ", " \t\r\n" }) |raw| {
+        try t.expectEqual(@as(usize, 0), try e.value(usize, name, raw, 0));
+        if (raw) |v| try check(name, v, true);
+    }
+    for ([_][2][]const u8{ .{ "auto", "0" }, .{ "8", "8" }, .{ " 4\t", "4" }, .{ "2", "2" } }) |c| {
+        const want = try std.fmt.parseInt(u32, c[1], 10);
+        try t.expectEqual(want, kda.stepWarpsSetting(try e.value(usize, name, c[0], 0)));
+        try check(name, c[0], true);
+    }
+    for ([_][]const u8{ "AUTO", "0", "1", "3", "16", "bad" }) |raw| try check(name, raw, false);
 }
 
 test "GLM strict env: switches keep unset, blank, 0 and 1, and refuse words and padded digits by name" {

@@ -23,16 +23,47 @@ pub const Kernels = struct {
     replay_layers: cuda.Function,
     prep: cuda.Function,
     step: cuda.Function,
+    step4: ?cuda.Function = null, // 4- and 2-warp step variants: same bits, more blocks for small windows
+    step2: ?cuda.Function = null,
     out: cuda.Function,
-    pdl: bool, // dependent launches (each entry opens with glm_pdl::enter()); the loader's caller opts in
+    pdl: bool = false, // dependent launches (each entry opens with glm_pdl::enter()); the loader's caller opts in
+    step_warps: u32 = 0, // TF_GLM_KDA_STEP_WARPS: 0 (auto) by rows (stepWarps); 8, 4 or 2 at every row count
 
     pub fn load(m: cuda.Module) !Kernels {
-        var k: Kernels = undefined;
+        var k: Kernels = .{
+            .chain = undefined,
+            .replay = undefined,
+            .replay_layers = undefined,
+            .prep = undefined,
+            .step = undefined,
+            .out = undefined,
+        };
         inline for (.{ "chain", "replay", "replay_layers", "prep", "step", "out" }) |name| @field(k, name) = try m.function("tf_glm_kda_" ++ name);
-        k.pdl = false;
+        k.step4 = try m.optionalFunction("tf_glm_kda_step4");
+        k.step2 = try m.optionalFunction("tf_glm_kda_step2");
         return k;
     }
 };
+
+/// Warps a step block takes by the window's rows: 2 for one row, 4 to 8 rows, 8 past that and for prompt chunks.
+pub fn stepWarps(rows: usize) u32 {
+    return if (rows == 1) 2 else if (rows <= 8) 4 else 8;
+}
+
+/// TF_GLM_KDA_STEP_WARPS' word (auto, 8, 4, 2) as warps; 0 is auto. No bit depends on it.
+pub fn stepWarpsSetting(word: usize) u32 {
+    return ([_]u32{ 0, 8, 4, 2 })[@min(word, 3)];
+}
+
+/// Selected step entry and warp count for `rows`, falling back to 8-warp `step` on older fatbins.
+pub fn stepChoice(ks: *const Kernels, rows: usize) struct { f: cuda.Function, warps: u32 } {
+    const wp: u32 = if (ks.step_warps != 0) ks.step_warps else stepWarps(rows);
+    return switch (wp) {
+        2 => if (ks.step2) |f| .{ .f = f, .warps = 2 } else .{ .f = ks.step, .warps = 8 },
+        4 => if (ks.step4) |f| .{ .f = f, .warps = 4 } else .{ .f = ks.step, .warps = 8 },
+        else => .{ .f = ks.step, .warps = 8 },
+    };
+}
 
 /// One layer's chain inputs, `heads` heads: p rows [q|k|v|f_a|g_a|...] (beta at `b_off`), decay and gate rows, states.
 pub const Chain = struct {
@@ -60,7 +91,7 @@ pub const Saves = struct { out: u64, state_out: u64, k: u64, v: u64, g: u64, b: 
 /// The three-kernel chain's scratch: q fp32 and the read-out bf16, [rows][heads][128] each.
 pub const Wide = struct { q: u64, y: u64 };
 
-/// kda.chain: `rows` rows through the fused kernel, or with `wide` through prep, step and out (WARPS 8, TR 16).
+/// kda.chain: `rows` rows through the fused kernel, or with `wide` through prep, step (by stepWarps, TR 16) and out.
 pub fn chain(ks: *const Kernels, stream: cuda.Stream, c: Chain, rows: usize, s: Saves, wide: ?Wide) !void {
     try validate(c, rows);
     const h: c_int = @intCast(c.heads);
@@ -84,7 +115,8 @@ pub fn chain(ks: *const Kernels, stream: cuda.Stream, c: Chain, rows: usize, s: 
         b.add(@as(c_int, @intCast(rows)));
         b.add(w.y);
         b.add(s.state_out);
-        try cuda.launch.launch(ks.step, .{ .grid = .{ .x = @intCast(c.heads), .y = dv / 4 / 8 }, .block = .{ .x = 8 * 32 }, .pdl = pdl }, stream, &b);
+        const st = stepChoice(ks, rows);
+        try cuda.launch.launch(st.f, .{ .grid = .{ .x = @intCast(c.heads), .y = dv / 4 / st.warps }, .block = .{ .x = st.warps * 32 }, .pdl = pdl }, stream, &b);
         var o: cuda.Args = .{};
         o.add(h);
         o.add(w.y);
@@ -159,6 +191,102 @@ pub fn replayLayers(ks: *const Kernels, stream: cuda.Stream, s: Replay, rows: us
     a.add(@as(c_int, @intCast(rows)));
     a.add(s.state_out);
     try cuda.launch.launch(ks.replay_layers, .{ .grid = .{ .x = @intCast(layers * heads) }, .block = .{ .x = 1024 }, .pdl = ks.pdl }, stream, &a);
+}
+
+test "shared KDA: step warps dispatch by rows, grids cover every value row, and fallback holds on older fatbins" {
+    try std.testing.expectEqual(@as(u32, 2), stepWarps(1));
+    for ([_]usize{ 2, 3, 4, 8 }) |r| try std.testing.expectEqual(@as(u32, 4), stepWarps(r));
+    for ([_]usize{ 9, 16, 32, 64, 2048 }) |r| try std.testing.expectEqual(@as(u32, 8), stepWarps(r));
+    for ([_]u32{ 2, 4, 8 }) |wp| try std.testing.expectEqual(@as(u32, dv), dv / 4 / wp * wp * 4);
+    try std.testing.expectEqual([4]u32{ 0, 8, 4, 2 }, .{ stepWarpsSetting(0), stepWarpsSetting(1), stepWarpsSetting(2), stepWarpsSetting(3) });
+    var ks: Kernels = .{
+        .chain = .{ .d = undefined, .handle = @ptrFromInt(1) },
+        .replay = .{ .d = undefined, .handle = @ptrFromInt(2) },
+        .replay_layers = .{ .d = undefined, .handle = @ptrFromInt(3) },
+        .prep = .{ .d = undefined, .handle = @ptrFromInt(4) },
+        .step = .{ .d = undefined, .handle = @ptrFromInt(5) },
+        .step4 = .{ .d = undefined, .handle = @ptrFromInt(7) },
+        .step2 = .{ .d = undefined, .handle = @ptrFromInt(8) },
+        .out = .{ .d = undefined, .handle = @ptrFromInt(6) },
+    };
+    try std.testing.expectEqual(@as(u32, 2), stepChoice(&ks, 1).warps);
+    try std.testing.expectEqual(@as(usize, 8), @intFromPtr(stepChoice(&ks, 1).f.handle));
+    try std.testing.expectEqual(@as(u32, 4), stepChoice(&ks, 4).warps);
+    try std.testing.expectEqual(@as(usize, 7), @intFromPtr(stepChoice(&ks, 4).f.handle));
+    try std.testing.expectEqual(@as(u32, 8), stepChoice(&ks, 9).warps);
+    try std.testing.expectEqual(@as(usize, 5), @intFromPtr(stepChoice(&ks, 9).f.handle));
+    ks.step_warps = 8;
+    try std.testing.expectEqual(@as(u32, 8), stepChoice(&ks, 1).warps);
+    ks.step_warps = 2;
+    try std.testing.expectEqual(@as(u32, 2), stepChoice(&ks, 64).warps);
+    ks.step2 = null;
+    try std.testing.expectEqual(@as(u32, 8), stepChoice(&ks, 1).warps);
+}
+
+test "shared KDA: wide chain launches step2, step4 and step with matching grids, blocks and PDL" {
+    const Rec = struct {
+        var step_id: usize = 0;
+        var grid_y: u32 = 0;
+        var block_x: u32 = 0;
+        var pdl_count: usize = 0;
+        var total: usize = 0;
+        fn plain(f: cuda.abi.Function, _: u32, gy: u32, _: u32, bx: u32, _: u32, _: u32, _: u32, _: cuda.abi.Stream, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+            if (total == 1) {
+                step_id = @intFromPtr(f);
+                grid_y = gy;
+                block_x = bx;
+            }
+            total += 1;
+            return 0;
+        }
+        fn ex(c: *const cuda.abi.LaunchConfig, f: cuda.abi.Function, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+            if (total == 1) {
+                step_id = @intFromPtr(f);
+                grid_y = c.grid_y;
+                block_x = c.block_x;
+            }
+            for (c.attrs.?[0..c.num_attrs]) |a| if (a.id == .programmatic_stream_serialization and a.value.int == 1) {
+                pdl_count += 1;
+            };
+            total += 1;
+            return 0;
+        }
+    };
+    var d: cuda.Driver = undefined;
+    d.api.cuLaunchKernel = Rec.plain;
+    d.api.cuLaunchKernelEx = Rec.ex;
+    const stream: cuda.Stream = .{ .d = &d, .handle = @ptrFromInt(1) };
+    const ks: Kernels = .{
+        .chain = .{ .d = &d, .handle = @ptrFromInt(1) },
+        .replay = .{ .d = &d, .handle = @ptrFromInt(2) },
+        .replay_layers = .{ .d = &d, .handle = @ptrFromInt(3) },
+        .prep = .{ .d = &d, .handle = @ptrFromInt(4) },
+        .step = .{ .d = &d, .handle = @ptrFromInt(5) },
+        .step4 = .{ .d = &d, .handle = @ptrFromInt(7) },
+        .step2 = .{ .d = &d, .handle = @ptrFromInt(8) },
+        .out = .{ .d = &d, .handle = @ptrFromInt(6) },
+        .pdl = true,
+    };
+    const heads: usize = 32;
+    const n = heads * dk;
+    const ch: Chain = .{ .heads = heads, .p = 0x1000, .p_stride = 3 * n + heads, .b_off = 3 * n, .a = 0x2000, .a_stride = n, .g = 0x3000, .g_stride = n, .conv_state = 0x4000, .conv_w = 0x5000, .state_in = 0x6000, .a_log = 0x7000, .dt_bias = 0x8000, .norm_w = 0x9000, .eps = 1e-6, .lower = -5 };
+    const sv: Saves = .{ .out = 0xa000, .state_out = 0xb000, .k = 0xc000, .v = 0xd000, .g = 0xe000, .b = 0xf000 };
+    const w: Wide = .{ .q = 0x10000, .y = 0x11000 };
+    for ([_]struct { usize, usize, u32, u32, usize }{
+        .{ 1, 8, 16, 64, 3 },
+        .{ 4, 7, 8, 128, 3 },
+        .{ 16, 5, 4, 256, 3 },
+        .{ 64, 5, 4, 256, 0 },
+    }) |case| {
+        Rec.total = 0;
+        Rec.pdl_count = 0;
+        try chain(&ks, stream, ch, case[0], sv, w);
+        try std.testing.expectEqual(@as(usize, 3), Rec.total);
+        try std.testing.expectEqual(case[1], Rec.step_id);
+        try std.testing.expectEqual(case[2], Rec.grid_y);
+        try std.testing.expectEqual(case[3], Rec.block_x);
+        try std.testing.expectEqual(case[4], Rec.pdl_count);
+    }
 }
 
 test {
