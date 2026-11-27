@@ -547,9 +547,9 @@ pub const State = struct {
     }
 
     pub fn setPos(st: *State, stream: cuda.Stream, pos: usize) !void {
-        st.pos = pos;
         const v: i32 = @intCast(pos);
         try st.arena.buf.d.check(st.arena.buf.d.api.cuMemsetD32Async(st.pos_dev, @bitCast(v), 1, stream.handle), "cuMemsetD32Async");
+        st.pos = pos;
     }
 
     /// Before a pass of `rows` rows at pos: within capacity, and the index rings holding them (rebased if not).

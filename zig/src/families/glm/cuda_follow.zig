@@ -318,7 +318,10 @@ pub const Leader = struct {
     pub fn keep(x: Leader, n: usize) !void {
         try x.flush();
         try x.send(.{ .kind = @backingInt(Kind.keep), .a = n }, &.{});
-        try x.e.keep(n);
+        x.e.keep(n) catch |err| {
+            cuda.tp_watch.fatal(@errorName(err));
+            return err;
+        };
     }
 
     /// Structured output's first token: every rank gathers the prompt's last row again, rank 0 draws it among `bits`.
@@ -337,12 +340,20 @@ pub const Leader = struct {
 
     /// DFlash2's round on every rank (Engine.draftBlock): each stream's slot, kept rows and anchor.
     pub fn block(x: Leader, reqs: []dflash.Req) !void {
-        if (reqs.len == 0 or reqs.len > dflash.MAX_S) return error.TooManyStreams;
-        try x.flush();
+        return x.blockKeeping(reqs, 0);
+    }
+
+    /// DFlash2's round on every rank, committing each stream flagged in `commit_mask` before `draftBlock`.
+    pub fn blockKeeping(x: Leader, reqs: []dflash.Req, commit_mask: u16) !void {
+        const proposals = @import("dflash_proposals.zig");
         var buf: [3 * dflash.MAX_S]u32 = undefined;
-        for (reqs, 0..) |q, i| buf[3 * i ..][0..3].* = .{ q.slot, @intCast(q.n), q.anchor };
-        try x.send(.{ .kind = @backingInt(Kind.block), .depth = @intCast(reqs.len), .flags = @import("dflash_proposals.zig").mask(reqs) }, buf[0 .. 3 * reqs.len]);
-        try x.e.draftBlock(reqs);
+        const flags = try proposals.prepareBlock(x.e, reqs, commit_mask, &buf);
+        try x.flush();
+        try x.send(.{ .kind = @backingInt(Kind.block), .depth = @intCast(reqs.len), .flags = flags }, buf[0 .. 3 * reqs.len]);
+        proposals.keepAndBlock(x.e, reqs, commit_mask) catch |err| {
+            cuda.tp_watch.fatal(@errorName(err));
+            return err;
+        };
     }
 
     /// Every rank's expert forms, bit r - 1 for a window of r rows (the same bits; load timing picks them by width).
@@ -457,13 +468,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 defer e.gpa.free(ids);
                 try e.draft(h.flags & 1 != 0, ids, h.depth, &drafts, if (h.flags & 2 != 0) &chances else null);
             },
-            .block => {
-                const k = h.depth;
-                if (k == 0 or k > dflash.MAX_S or step.ids.len != 3 * k) return error.BadStep;
-                var reqs: [dflash.MAX_S]dflash.Req = undefined;
-                for (reqs[0..k], 0..) |*q, i| q.* = .{ .slot = step.ids[3 * i], .pos = 0, .n = step.ids[3 * i + 1], .anchor = step.ids[3 * i + 2], .propose = @import("dflash_proposals.zig").enabled(h.flags, i) };
-                try e.draftBlock(reqs[0..k]);
-            },
+            .block => try @import("dflash_proposals.zig").applyBlock(e, h.depth, h.flags, step.ids),
             .image => {
                 const v = e.images orelse return error.NoVision; // the ranks agreed on --vision (cuda_ranks)
                 try v.take(h.slot, step.ids);

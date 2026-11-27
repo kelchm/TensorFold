@@ -572,28 +572,21 @@ pub const Forward = struct {
         for (f.ranks) |r| {
             const st = r.st;
             if (keep == 0 or keep > st.pending or (st.prompt and keep != st.pending)) return error.BadCommit;
-            if (!st.prompt and st.kda_layers > 0) {
+            const flip = !st.prompt and st.kda_layers > 0;
+            if (flip) {
                 const cur = st.cur[0];
                 for (st.cur) |x| if (x != cur) return error.KdaLayersOutOfStep;
                 if (keep < st.pending) {
                     const h = st.heads;
-                    try kda.replayLayers(&f.m.kda, f.stream, .{
-                        .state_in = st.recAt(cur, 0),
-                        .state_stride = st.rec_layer / 4,
-                        .k = st.save_k,
-                        .v = st.save_v,
-                        .g = st.save_g,
-                        .b = st.save_b,
-                        .kv_stride = window_rows * h * kda.dk,
-                        .b_stride = window_rows * h,
-                        .state_out = st.recAt(1 - cur, 0),
-                    }, keep, h, st.kda_layers);
+                    try kda.replayLayers(&f.m.kda, f.stream, .{ .state_in = st.recAt(cur, 0), .state_stride = st.rec_layer / 4, .k = st.save_k, .v = st.save_v, .g = st.save_g, .b = st.save_b, .kv_stride = window_rows * h * kda.dk, .b_stride = window_rows * h, .state_out = st.recAt(1 - cur, 0) }, keep, h, st.kda_layers);
                 }
+                try glue.convShift(f.set(), f.stream, st.conv, st.proj, keep, st.proj_layer, st.proj_row, st.kda_layers, st.conv_c);
+            }
+            try st.setPos(f.stream, st.pos + keep);
+            if (flip) {
                 for (st.cur) |*x| x.* = 1 - x.*;
-                if (st.kda_layers > 0) try glue.convShift(f.set(), f.stream, st.conv, st.proj, keep, st.proj_layer, st.proj_row, st.kda_layers, st.conv_c);
             }
             st.pending = 0;
-            try st.setPos(f.stream, st.pos + keep);
         }
     }
 };

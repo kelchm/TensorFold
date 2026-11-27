@@ -18,7 +18,7 @@ const shared_head_drafts = 3; // an MTP chain's most drafts in a shared round, w
 const copy_policy = @import("cuda_copy_policy.zig");
 const lane_costs = @import("cuda_lane_costs.zig");
 /// A stream's place in the backend: its sequence's slot, the rows its last verify left uncommitted, its held drafts.
-const Lane = struct {
+pub const Lane = struct {
     slot: u32,
     pending_rows: ?usize = null,
     held: [@max(max_held, engine.max_drafts)]u32 = undefined,
@@ -150,7 +150,7 @@ pub const Lanes = struct {
         self.next += 1;
         return h;
     }
-    fn value(self: *const Lanes, feed: be.Feed) u32 {
+    pub fn value(self: *const Lanes, feed: be.Feed) u32 {
         return switch (feed) {
             .handle => |h| self.drawn[h % ring],
             .value => |v| v,
@@ -181,7 +181,7 @@ pub const Lanes = struct {
     }
 
     /// The stream's sequence bound, its last verify committed (`kept` rows, else all of them).
-    fn bind(self: *Lanes, s: *const lanes.Stream, kept: ?usize) !*Lane {
+    pub fn bind(self: *Lanes, s: *const lanes.Stream, kept: ?usize) !*Lane {
         const l = self.lanes.getPtr(s) orelse return error.UnknownStream;
         try self.x.bind(l.slot);
         if (l.pending_rows) |rows| try self.x.keep(kept orelse rows);
@@ -544,26 +544,9 @@ pub const Lanes = struct {
         }
     }
 
-    /// DFlash2: every request's kept rows committed, then one block round for them all (cuda_follow's block step).
+    /// DFlash2: validate requests, fold per-stream keeps into one Kind.block step, and calibrate chances.
     fn draftBlock(self: *Lanes, requests: []const be.DraftRequest) !void {
-        if (requests.len > dflash.MAX_S) return error.TooManyStreams;
-        var reqs: [dflash.MAX_S]dflash.Req = undefined;
-        var held: [dflash.MAX_S]*Lane = undefined;
-        for (requests, 0..) |r, i| {
-            const l = try self.bind(r.stream, if (r.rows) |rows| rows.len else null);
-            if (r.position != self.x.e.pos() + 1) return error.PositionMismatch;
-            if (r.lanes != null) return error.TreesNotBuilt;
-            var n: usize = 0;
-            const anchor = if (r.rows) |rows| a: {
-                for (rows, 0..) |row, j| if (row != j) return error.TreesNotBuilt;
-                n = rows.len;
-                break :a r.follow[rows.len - 1];
-            } else self.value(r.first orelse return error.NoFirstToken);
-            reqs[i] = .{ .slot = l.slot, .pos = 0, .n = n, .anchor = anchor, .propose = r.depth > 0, .out = &l.held, .probs = &l.chances };
-            held[i] = l;
-        }
-        try self.x.block(reqs[0..requests.len]);
-        try copy_policy.blockChances(requests, held[0..requests.len], self.x.e.m.priced_windows);
+        return copy_policy.draftBlock(self, requests);
     }
 
     /// Each held draft's chance, DFlash2's or the MTP head's under --mtp-confidence (else the per-depth rates stand).

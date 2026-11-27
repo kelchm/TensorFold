@@ -76,3 +76,58 @@ pub fn blockChances(requests: anytype, records: anytype, priced: bool) !void {
         }
     }
 }
+
+/// DFlash2: validate requests before wire traffic, fold normal keeps into Kind.block, then calibrate chances.
+pub fn draftBlock(self: *@import("cuda_lanes.zig").Lanes, requests: []const lanes.backend.DraftRequest) !void {
+    const std = @import("std");
+    const dflash = @import("dflash.zig");
+    const proposals = @import("dflash_proposals.zig");
+    const Lane = @import("cuda_lanes.zig").Lane;
+    if (requests.len == 0 or requests.len > dflash.MAX_S) return error.TooManyStreams;
+    if (self.x.e.drafter == null) return error.NoDrafter;
+    var reqs: [dflash.MAX_S]dflash.Req = undefined;
+    var records: [dflash.MAX_S]*Lane = undefined;
+    var commit_mask: u16 = 0;
+    // Pass 1: pure validation with zero mutations or wire traffic.
+    for (requests, 0..) |r, i| {
+        const l = self.lanes.getPtr(r.stream) orelse return error.UnknownStream;
+        if (r.lanes != null) return error.TreesNotBuilt;
+        if (l.slot >= self.x.e.seqs.items.len) return error.UnknownSlot;
+        const seq = self.x.e.seqs.items[l.slot] orelse return error.UnknownSlot;
+        for (records[0..i]) |prev| if (prev.slot == l.slot) return error.SlotTwice;
+        var n: usize = 0;
+        const anchor = if (r.rows) |rows| a: {
+            if (rows.len == 0 or rows.len > r.follow.len) return error.BadCommit;
+            for (rows, 0..) |row, j| if (row != j) return error.TreesNotBuilt;
+            n = rows.len;
+            break :a r.follow[rows.len - 1];
+        } else self.value(r.first orelse return error.NoFirstToken);
+        if (std.math.cast(u32, n) == null) return error.BadStep;
+        if (r.depth > 0 and anchor >= self.x.e.c.vocab) return error.BadTokenId;
+        const keep_n: usize = if (l.pending_rows) |pending| (if (r.rows != null) n else pending) else 0;
+        if (l.pending_rows != null) {
+            try proposals.checkCommit(self.x.e, l.slot, keep_n);
+            if (r.rows != null) commit_mask |= @as(u16, 1) << @intCast(i);
+        }
+        if (r.position != seq.st.pos + keep_n + 1) return error.PositionMismatch;
+        reqs[i] = .{ .slot = l.slot, .pos = 0, .n = n, .anchor = anchor, .propose = r.depth > 0, .out = &l.held, .probs = &l.chances };
+        records[i] = l;
+    }
+    // Pass 2: rare rowless keeps (r.rows == null, pending_rows != null) flush upfront via bind.
+    for (requests, records[0..requests.len]) |r, l| if (r.rows == null and l.pending_rows != null) {
+        _ = try self.bind(r.stream, null);
+    };
+    // Pass 3: single Kind.block step carrying all folded keeps; keep pending_rows synced on partial errors.
+    errdefer for (records[0..requests.len], 0..) |l, i| {
+        if ((commit_mask & (@as(u16, 1) << @intCast(i))) != 0) {
+            if (self.x.e.seqs.items[l.slot]) |seq| if (seq.st.pending == 0) {
+                l.pending_rows = null;
+            };
+        }
+    };
+    try self.x.blockKeeping(reqs[0..requests.len], commit_mask);
+    for (records[0..requests.len], 0..) |l, i| {
+        if ((commit_mask & (@as(u16, 1) << @intCast(i))) != 0) l.pending_rows = null;
+    }
+    try blockChances(requests, records[0..requests.len], self.x.e.m.priced_windows);
+}
