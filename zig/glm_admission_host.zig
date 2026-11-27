@@ -14,11 +14,13 @@ const Fake = struct {
     choices: std.ArrayList(Choice) = .empty,
     ready: std.atomic.Value(bool) = .init(false),
     go: std.atomic.Value(bool) = .init(false),
+    multi_prefill: bool = false,
     batches: usize = 0,
 
     fn backend(f: *Fake) Backend {
         var real: glm.lanes.Lanes = undefined;
         real.whole = false;
+        real.multi_prefill = f.multi_prefill;
         const caps = real.backend().vtable;
         f.table = f.target.backend().vtable.*;
         f.table.prefill = whole;
@@ -146,7 +148,58 @@ test "GLM CUDA admission: a live decoder runs between three eligible fresh promp
 test "GLM CUDA admission: whole-prompt mode retains its batch callback" {
     var real: glm.lanes.Lanes = undefined;
     real.whole = true;
+    real.multi_prefill = false;
     const caps = real.backend().vtable;
     try std.testing.expect(caps.prefill_many != null);
     try std.testing.expect(caps.prefill_step == null);
+    try std.testing.expectEqual(@as(u32, 0), caps.many_rows);
+}
+
+test "GLM CUDA admission: TF_GLM_MULTI_PREFILL opt-in exposes 512-row prefill_many beside stepped fills" {
+    var real: glm.lanes.Lanes = undefined;
+    real.whole = false;
+    real.multi_prefill = false;
+    const off = real.backend().vtable;
+    try std.testing.expect(off.prefill_step != null);
+    try std.testing.expect(off.prefill_many == null);
+    try std.testing.expectEqual(@as(u32, 0), off.many_rows);
+    real.multi_prefill = true;
+    const on = real.backend().vtable;
+    try std.testing.expect(on.prefill_step != null);
+    try std.testing.expect(on.prefill_many != null);
+    try std.testing.expectEqual(@as(u32, 512), on.many_rows);
+}
+
+test "GLM CUDA admission: multi_prefill batches queued short prompts while keeping long prompts stepped" {
+    var f: Fake = .{ .multi_prefill = true };
+    defer f.deinit();
+    var cfg = try lanes.Config.init(a, .{ .exact_width = 1 }, 8, 7);
+    defer cfg.deinit(a);
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(a, &cfg, f.backend(), clock.clock());
+    defer core.deinit();
+    var host = api.LaneHost.init(a, std.testing.io, &core, .{ .lanes = 4 });
+    var box: Box = .{};
+    const engine = host.engine();
+    const first: api.Request = .{ .prompt = &.{ 3, 1, 4, 1 }, .max_tokens = 16, .drafts = false };
+    try engine.submit(1, &first, .{ .ctx = &box, .event = Box.event });
+    try host.start();
+    var stopped = false;
+    defer {
+        f.go.store(true, .release);
+        if (!stopped) host.stop();
+    }
+    try wait(&f.ready, true);
+    var short_prompts: [3][128]u32 = undefined;
+    for (&short_prompts, 0..) |*prompt, i| {
+        @memset(prompt, @intCast(i + 1));
+        const request: api.Request = .{ .prompt = prompt, .max_tokens = 4, .drafts = false };
+        try engine.submit(@intCast(i + 2), &request, .{ .ctx = &box, .event = Box.event });
+    }
+    f.go.store(true, .release);
+    try wait(&box.done, @as(u32, 4));
+    host.stop();
+    stopped = true;
+    try std.testing.expect(!box.bad);
+    try std.testing.expectEqual(@as(usize, 1), f.batches);
 }

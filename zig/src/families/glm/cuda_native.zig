@@ -351,11 +351,12 @@ fn finishRank(a: OpenArgs) !Loaded {
     }
     // Rank 0 alone reads these: TF_GLM_PROMPT_STEPS=0 passes prompts whole, TF_GLM_SHARED=0 runs windows alone.
     const steps = try @import("sys").environment.value(bool, "TF_GLM_PROMPT_STEPS", ranks.environment("TF_GLM_PROMPT_STEPS"), true);
+    const multi_prefill = try @import("sys").environment.value(bool, "TF_GLM_MULTI_PREFILL", ranks.environment("TF_GLM_MULTI_PREFILL"), false);
     const shared = try @import("sys").environment.value(bool, "TF_GLM_SHARED", ranks.environment("TF_GLM_SHARED"), true);
     const long_copy_match = try @import("sys").environment.value(bool, "TF_GLM_COPY_8_16", ranks.environment("TF_GLM_COPY_8_16"), false);
     own.link.lead(cuda.tp_watch.open(), p.world); // the other ranks begin asleep (follow): the first step wakes them
     if (own.e.local.len > 0 and o.mtp_confidence != null) return error.SharesOneRankEach; // chances need every share's
-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = !steps, .alone = !shared or own.e.local.len > 0, .long_copy_match = long_copy_match, .mtp_confidence = o.mtp_confidence };
+    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = !steps, .multi_prefill = multi_prefill and own.e.local.len == 0, .alone = !shared or own.e.local.len > 0, .long_copy_match = long_copy_match, .mtp_confidence = o.mtp_confidence };
     if (long_copy_match and own.copies and own.e.drafter != null) std.log.info("verified copies: prompt match 8, reply match 16, up to 15 drafts", .{});
     const extra: u64 = (if (o.drafter != null) dflash.ring_bytes else 0) + if (own.e.images) |v| v.streamBytes() else @as(usize, 0);
     own.layout = if (set.pages) try pages_mod.layout(gpa, own.e, extra) else null;

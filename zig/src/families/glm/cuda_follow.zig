@@ -107,12 +107,9 @@ pub const Link = struct {
             return;
         }
         try l.buf.uploadAsync(0, std.mem.asBytes(&hh), l.stream.handle);
-        if (ids.len > 0 and ids.len <= inline_ids) try l.buf.uploadAsync(64, std.mem.sliceAsBytes(ids), l.stream.handle);
+        if (ids.len > 0) try l.buf.uploadAsync(64, std.mem.sliceAsBytes(ids), l.stream.handle);
         try l.bcast(first_bytes);
-        if (ids.len > inline_ids) {
-            try l.buf.uploadAsync(64, std.mem.sliceAsBytes(ids), l.stream.handle);
-            try l.bcast(64 + ids.len * 4);
-        }
+        if (ids.len > inline_ids) try l.bcast(64 + ids.len * 4);
     }
 
     /// `bytes` at `ptr` from rank 0 into every rank's `ptr` (image rows: the follower's buffer is the same size).
@@ -206,7 +203,7 @@ pub const Leader = struct {
 
     /// `begin` on a paged sequence: its page ids (rank 0's lease, the cache's `kept` first) go to every rank's table.
     pub fn beginOn(x: Leader, s: ?sampler.Sampling, pages: []const u32, kept: usize) !void {
-        try x.flush();
+        if (pages.len > x.link.ids.len) return error.TooManyIds;
         const c = sampler.check(s);
         var h: Header = .{ .kind = @backingInt(Kind.begin), .a = kept };
         if (c) |v| {
@@ -217,8 +214,9 @@ pub const Leader = struct {
             h.min_p = v.min_p;
             h.top_k = v.top_k;
         }
-        try x.send(h, pages);
         try x.e.begin(c);
+        try x.flush();
+        try x.send(h, pages);
     }
 
     /// Every rank's prompt cache at rank 0's budget (snapshots.agree), its states past the pool's pages as rank 0's.

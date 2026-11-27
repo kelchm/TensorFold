@@ -1,7 +1,10 @@
 //! The lane backend's slots: chosen before a stream's map entry exists, and none left behind by a failed insertion.
 const std = @import("std");
+const cuda = @import("cuda");
 const lanes = @import("lanes");
 const engine = @import("cuda_engine.zig");
+const follow = @import("cuda_follow.zig");
+const dflash = @import("dflash.zig");
 const Lanes = @import("cuda_lanes.zig").Lanes;
 const fw = @import("cuda_forward.zig");
 const solo = @import("cuda_prompt_solo.zig");
@@ -105,4 +108,132 @@ test "glm request starts: a kept state off the new request's cold cuts, or over 
         try std.testing.expectEqual(@as(usize, if (c.why == null) c.at else 0), if (from) |r| r.at else 0);
         try std.testing.expectEqual(if (c.why == null) c.at else 0, s.cached); // refused: the pass starts at 0
     }
+}
+
+test "multi_prefill and opening roll back announced slots across ranks when begin or cuts fails" {
+    const a = std.testing.allocator;
+    const Wire = struct {
+        var sent: [8]follow.Header = undefined;
+        var steps: usize = 0;
+        fn reset() void {
+            steps = 0;
+        }
+        fn put(_: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, params: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+            const w: *align(1) const follow.Words = @ptrCast(params.?[2].?);
+            if (steps < sent.len) @memcpy(std.mem.asBytes(&sent[steps]), std.mem.sliceAsBytes(w.w[0..16]));
+            steps += 1;
+            return 0;
+        }
+        fn memset8(_: u64, _: u8, _: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            return 0;
+        }
+        fn memset32(_: u64, _: c_uint, _: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            return 0;
+        }
+        fn htod(_: u64, _: ?*const anyopaque, _: usize) callconv(.c) cuda.abi.Result {
+            return 0;
+        }
+        fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            return 0;
+        }
+        fn broadcast(_: cuda.abi.DevicePtr, _: cuda.abi.DevicePtr, _: usize, _: cuda.nccl.DataType, _: c_int, _: cuda.nccl.Comm, _: cuda.abi.Stream) callconv(.c) cuda.nccl.Result {
+            return 0;
+        }
+    };
+    Wire.reset();
+    var d: cuda.Driver = undefined;
+    d.api.cuLaunchKernel = Wire.put;
+    d.api.cuLaunchKernelEx = @import("cuda_pdl.zig").forwardEx(Wire.put);
+    d.api.cuMemsetD8Async = Wire.memset8;
+    d.api.cuMemsetD32Async = Wire.memset32;
+    d.api.cuMemcpyHtoD_v2 = Wire.htod;
+    d.api.cuStreamSynchronize = Wire.sync;
+    var lib: cuda.nccl.Library = .{ .lib = undefined, .api = undefined };
+    lib.api.ncclBroadcast = Wire.broadcast;
+    var cur_bits = [_]u1{0};
+    var rings_buf = [_]u64{ 0, 0 };
+    const Seq = @import("cuda_engine_types.zig").Seq;
+    var seqs = [2]Seq{ .{ .st = undefined }, .{ .st = undefined } };
+    for (&seqs) |*q| {
+        q.st.arena.buf = .{ .d = &d, .ptr = 0, .len = 0, .borrowed = true };
+        q.st.conv = 0;
+        q.st.rec = 0;
+        q.st.kda_layers = 0;
+        q.st.conv_c = 0;
+        q.st.rec_layer = 0;
+        q.st.cur = &cur_bits;
+        q.st.caches = &.{};
+        q.st.rings = &rings_buf;
+        q.st.ring_row = 256;
+        q.st.head = false;
+        q.st.pos_dev = 0;
+        q.st.mtp_pos_dev = 0;
+        q.st.capacity = 4096;
+        q.cuts = .empty;
+    }
+    defer for (&seqs) |*q| q.cuts.deinit(a);
+    var e: engine.Engine = undefined;
+    e.gpa = a;
+    e.d = &d;
+    e.stream = .{ .d = &d, .handle = null };
+    e.m.glue.put_words = .{ .d = &d, .handle = null };
+    e.m.tiled = true;
+    e.capacity = 4096;
+    e.pages = null;
+    e.images = null;
+    e.local = &.{};
+    e.keep_seqs = true;
+    e.dropped = .empty;
+    e.seqs = .empty;
+    defer e.seqs.deinit(a);
+    try e.seqs.appendSlice(a, &.{ &seqs[0], &seqs[1] });
+    e.cur = &seqs[0];
+    e.slot = 0;
+    var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+    var dr: dflash.Drafter = undefined;
+    dr.d = &d;
+    dr.gpa = fail.allocator();
+    dr.slots = .empty;
+    defer dr.slots.deinit(dr.gpa);
+    try dr.slots.ensureTotalCapacityPrecise(dr.gpa, 1);
+    dr.slots.appendAssumeCapacity(.{ .ring = .{ .d = &d, .ptr = 0x2000, .len = 16, .borrowed = true } });
+    e.drafter = &dr;
+    var buf: [64 + 64 * 4]u8 align(8) = undefined;
+    var ids: [64]u32 = undefined;
+    var link: follow.Link = .{ .d = &d, .lib = &lib, .comm = null, .stream = e.stream, .buf = .{ .d = &d, .ptr = @intFromPtr(&buf), .len = buf.len, .borrowed = true }, .ids = &ids, .gpa = a, .wait = false };
+    var self: Lanes = .{ .x = .{ .e = &e, .link = &link }, .whole = false, .multi_prefill = true };
+    defer self.deinit();
+    const prompt = [_]u32{ 10, 20, 30, 40 };
+    var s0 = try lanes.Stream.init(a, .{ .id = "s0", .prompt = &prompt, .max_new = 4, .drafts = false });
+    defer s0.deinit(a);
+    var s1 = try lanes.Stream.init(a, .{ .id = "s1", .prompt = &prompt, .max_new = 4, .drafts = false });
+    defer s1.deinit(a);
+    // Slot 1 fails locally in e.begin (DFlash slot grow OOM) before send: slot 1 stays off the wire, slot 0 releases.
+    const be = self.backend();
+    try std.testing.expectError(error.OutOfMemory, be.vtable.prefill_many.?(be.ptr, &.{ &s0, &s1 }));
+    try std.testing.expectEqual(@as(usize, 0), self.lanes.count());
+    try std.testing.expectEqual(@as(usize, 2), Wire.steps);
+    try std.testing.expectEqual(@backingInt(follow.Kind.begin), Wire.sent[0].kind);
+    try std.testing.expectEqual(@as(u32, 0), Wire.sent[0].slot);
+    try std.testing.expectEqual(@backingInt(follow.Kind.release), Wire.sent[1].kind);
+    try std.testing.expectEqual(@as(u32, 0), Wire.sent[1].slot);
+    // 2) In opening, if cuts() fails after beginOn succeeded, followers still receive release on that slot.
+    Wire.reset();
+    e.drafter = null;
+    var bad_cuts = try lanes.Stream.init(a, .{ .id = "bad-cuts", .prompt = &prompt, .max_new = 4, .drafts = false, .chunks = &.{0} });
+    defer bad_cuts.deinit(a);
+    try std.testing.expectError(error.BadCuts, self.prefillStep(&bad_cuts, 0));
+    try std.testing.expectEqual(@as(usize, 0), self.lanes.count());
+    try std.testing.expectEqual(@as(usize, 2), Wire.steps);
+    try std.testing.expectEqual(@backingInt(follow.Kind.begin), Wire.sent[0].kind);
+    try std.testing.expectEqual(@as(u32, 0), Wire.sent[0].slot);
+    try std.testing.expectEqual(@backingInt(follow.Kind.release), Wire.sent[1].kind);
+    try std.testing.expectEqual(@as(u32, 0), Wire.sent[1].slot);
+    // Subsequent slot 0 reuse after rollback announces cleanly.
+    Wire.reset();
+    try self.x.bind(0);
+    try self.x.beginOn(null, &.{}, 0);
+    try std.testing.expectEqual(@as(usize, 1), Wire.steps);
+    try std.testing.expectEqual(@backingInt(follow.Kind.begin), Wire.sent[0].kind);
+    try std.testing.expectEqual(@as(u32, 0), Wire.sent[0].slot);
 }

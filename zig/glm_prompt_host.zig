@@ -220,6 +220,31 @@ test "GLM prompt workflow: DFlash context equals ordinary ingest at own offsets 
         try t.expectEqualSlices(u8, std.mem.asBytes(&ordinary), std.mem.asBytes(&actual));
     }
 }
+test "GLM prompt workflow: dflash_only batched pass skips MTP absorb while ingesting all four streams' DFlash2 context" {
+    var b: Box = .{};
+    var e = b.make();
+    e.mtp = false;
+    fw.observed_propose = null;
+    var tap_rows: [16 * glm.dflash.TAP_ROW]u8 align(8) = @splat(0);
+    var contexts: [32][16]u32 = @splat(@splat(0));
+    var dr: engine.Drafter = .{ .taps_prefill = @intFromPtr(&tap_rows) };
+    for (&dr.states, 0..) |*v, i| v.ring = .{ .ptr = @intFromPtr(&contexts[i]) };
+    e.drafter = &dr;
+    const p0 = [_]u32{ 10, 11, 12 };
+    const p1 = [_]u32{ 20, 21 };
+    const p2 = [_]u32{ 30, 31, 32, 33 };
+    const p3 = [_]u32{ 40, 41, 42 };
+    try pass(&e, &.{ .{ .slot = 0, .ids = &p0 }, .{ .slot = 1, .ids = &p1 }, .{ .slot = 2, .ids = &p2 }, .{ .slot = 3, .ids = &p3 } });
+    try t.expectEqual(@as(?bool, null), fw.observed_propose);
+    for ([_][]const u32{ &p0, &p1, &p2, &p3 }, 0..) |ids, slot| {
+        try t.expectEqual(ids.len, e.seqs[slot].st.pos);
+        try t.expectEqual(@as(usize, 0), e.seqs[slot].st.mtp_len);
+        try t.expectEqual(@as(u16, @intCast(ids[ids.len - 1])), held(&e, slot));
+        try t.expectEqual(@as(usize, 0), dr.states[slot].prompt_history.lo);
+        try t.expectEqual(ids.len, dr.states[slot].prompt_history.end);
+        for (ids, 0..) |id, i| try t.expectEqual(id, contexts[slot][i]);
+    }
+}
 test "GLM prompt workflow: context window cut preserves sequence positions independently of tap offsets" {
     const dr = glm.dflash;
     const C = dr.MAX_CTX;

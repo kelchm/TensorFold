@@ -31,6 +31,7 @@ const Lane = struct {
 pub const Lanes = struct {
     x: follow.Leader,
     whole: bool = false, // prompt passes run whole (TF_GLM_PROMPT_STEPS=0): no other stream's round between chunks
+    multi_prefill: bool = false, // TF_GLM_MULTI_PREFILL=1: batch short fresh text prompts beside stepped fills
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
     long_copy_match: bool = false, // TF_GLM_COPY_8_16: 8 prompt / 16 reply match, up to 15 copy drafts
     mtp_confidence: ?f64 = null, // --mtp-confidence: the MTP head's chains stop where their chance falls under it
@@ -65,7 +66,7 @@ pub const Lanes = struct {
     }
 
     pub fn backend(self: *Lanes) be.Backend {
-        return .{ .ptr = self, .vtable = if (self.whole) &whole_vt else &steps_vt };
+        return .{ .ptr = self, .vtable = if (self.whole) &whole_vt else if (self.multi_prefill) &steps_many_vt else &steps_vt };
     }
 
     const whole_vt: be.Backend.VTable = .{
@@ -84,10 +85,15 @@ pub const Lanes = struct {
         .held = heldFn,
         .prompt_rows = true,
     };
-    const steps_vt: be.Backend.VTable = vt: {
+    const steps_many_vt: be.Backend.VTable = vt: {
         var v = whole_vt;
         v.prefill_step = prefillStepFn;
         v.cancel_prefill = cancelPrefillFn;
+        v.many_rows = 512;
+        break :vt v;
+    };
+    const steps_vt: be.Backend.VTable = vt: {
+        var v = steps_many_vt;
         v.prefill_many = null;
         v.many_rows = 0;
         break :vt v;
@@ -132,21 +138,18 @@ pub const Lanes = struct {
     fn of(ptr: *anyopaque) *Lanes {
         return @ptrCast(@alignCast(ptr));
     }
-
     fn take(self: *Lanes, token: u32) u64 {
         const h = self.next;
         self.drawn[h % ring] = token;
         self.next += 1;
         return h;
     }
-
     fn value(self: *const Lanes, feed: be.Feed) u32 {
         return switch (feed) {
             .handle => |h| self.drawn[h % ring],
             .value => |v| v,
         };
     }
-
     /// The lowest slot no stream holds.
     fn freeSlot(self: *const Lanes) u32 {
         var slot: u32 = 0;
@@ -201,8 +204,9 @@ pub const Lanes = struct {
 
     fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
         const self = of(ptr);
-        if (!self.x.e.m.tiled or ss.len > engine.max_together or share_mod.of(self.x.e) != null) return false; // the store keeps a pass alone
-        for (ss) |s| if (!canBatch(s)) return false;
+        const max_len: usize = if (self.whole) engine.prompt_rows else steps_many_vt.many_rows;
+        if (!self.x.e.m.tiled or self.x.e.local.len > 0 or ss.len > engine.max_together or share_mod.of(self.x.e) != null) return false;
+        for (ss) |s| if (!canBatch(s) or s.prompt_len > max_len) return false;
         var opened: usize = 0;
         errdefer for (ss[0..opened]) |s| releaseFn(ptr, s);
         var parts: [engine.max_together]engine.Prompt = undefined;
@@ -295,12 +299,15 @@ pub const Lanes = struct {
         var held = true;
         errdefer if (held) gpa.free(marks);
         const pages = try self.seat(s, ids.len, s.max_new, adopt.items);
+        var announced = false;
         errdefer {
-            self.x.e.release(self.lanes.get(s).?.slot);
+            const slot = self.lanes.get(s).?.slot;
+            if (announced) self.x.release(slot) catch self.x.e.release(slot) else self.x.e.release(slot);
             _ = self.lanes.remove(s);
         }
         if (self.x.e.images) |v| v.clear(); // no earlier request's rows splice into this one
         try self.x.beginOn(s.sampling, pages, adopt.items.len);
+        announced = true;
         if (s.chunks.len > 0) try self.x.cuts(s.chunks); // TF_GLM_REQUEST_STARTS: every rank cuts the pass there too
         s.cached = 0;
         s.prompt_rows.clearRetainingCapacity();
@@ -427,14 +434,9 @@ pub const Lanes = struct {
         @memcpy(out, l.held[0..out.len]);
     }
 
-    fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
-        _ = ptr;
-        _ = s;
-        _ = feed;
-        _ = position;
+    fn queueFn(_: *anyopaque, _: *lanes.Stream, _: be.Feed, _: u64) anyerror!u64 {
         return error.NotPipelined;
     }
-
     fn readFn(ptr: *anyopaque, handle: u64) anyerror!u32 {
         const self = of(ptr);
         if (handle >= self.next or self.next - handle > ring) return error.NoSuchToken;
