@@ -70,6 +70,7 @@ test {
     _ = @import("cuda_keep_seqs_test.zig");
     _ = @import("cuda_snapshot_layout_test.zig");
     _ = @import("cuda_ranks_test.zig");
+    _ = @import("cuda_ranks_p2_test.zig");
     _ = @import("cuda_ranks_roce_test.zig");
     _ = @import("cuda_env.zig");
     _ = @import("cuda_taps_tp_test.zig");
@@ -120,6 +121,7 @@ test {
     _ = @import("cuda_zero_budget_test.zig");
     _ = native;
     _ = native_dsa;
+    _ = kv_host;
     _ = @import("cuda_engine_shares.zig");
     _ = @import("cuda_qpack.zig");
     _ = share;
@@ -129,6 +131,7 @@ test {
 }
 
 pub const dflash = @import("dflash.zig");
+pub const dflash_select = @import("dflash_select.zig");
 pub const dflash_candidates = @import("dflash_candidates.zig");
 pub const dflash_load_owner = @import("dflash_load_owner.zig");
 pub const dflash_load = @import("dflash_load.zig");

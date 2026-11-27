@@ -160,7 +160,7 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
     }
     // every row through the drafts' head (4-bit or TFQ3, this rank's vocab), its 16 best gathered; rank 0 projects
     try glue.rmsnorm(set(e), e.stream, dr.x, D, dr.norm, dr.hn, D, dr.xs, df.EPS, M, D);
-    const head = e.w.mtp.?.draft;
+    const head = e.w.draftHead() orelse return error.DrafterNeedsDraftHead;
     const head_n = head.outputs();
     try head.project(&e.m.q4, if (e.m.tfq3) |*x| x else null, e.stream, dr.hn, dr.xs, dr.logits, M);
     const chunks = (head_n + 4095) / 4096;

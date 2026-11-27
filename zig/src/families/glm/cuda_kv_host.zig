@@ -21,6 +21,7 @@ fn enabled(comptime id: @import("profile").Switch) bool {
 
 /// Host pages of `page` bytes for a `capacity`-row window: `gib` GiB of them, else one full window and 16.
 fn pagesOf(gib: ?f64, page: u64, capacity: usize) usize {
+    if (page == 0) return 0;
     const g = gib orelse return cdiv(capacity, page_rows) + 16;
     return @intFromFloat(g * (1 << 30) / @as(f64, @floatFromInt(page)));
 }
@@ -39,7 +40,7 @@ pub fn pagesFor(page: u64, capacity: usize, pages: usize) usize {
 
 /// Before the ranks measure their room: the gather's device buffers, so the budget counts them.
 pub fn prepare(d: *const cuda.Driver, page: u64, capacity: usize, row_bytes: usize) !void {
-    if (!onHost() or active != null) return;
+    if (!onHost() or active != null or page == 0) return;
     active = try Gather.init(d, hostPages(page, capacity) * page / row_bytes, capacity, row_bytes);
 }
 
@@ -274,6 +275,8 @@ test "kv host pages: one full window and 16 by default, TF_GLM_KV_HOST_GIB's wor
     try std.testing.expectEqual(@as(usize, 1 + 16), pagesOf(null, page, 300));
     try std.testing.expectEqual(@as(usize, 2088), pagesOf(13, page, 1 << 20));
     try std.testing.expectEqual(@as(usize, 0), pagesOf(0, page, 1 << 20));
+    try std.testing.expectEqual(@as(usize, 0), pagesOf(null, 0, 1 << 20));
+    try std.testing.expectEqual(@as(usize, 0), pagesOf(13, 0, 1 << 20));
 }
 
 test "kv host slots: mark's flag is seen once, then cleared for the next call" {

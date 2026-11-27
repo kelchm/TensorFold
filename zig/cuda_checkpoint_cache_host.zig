@@ -85,8 +85,8 @@ test "CUDA load cache: MiniMax backbone, DSpark and vision" {
     try scope(mm ++ "cuda_vision.zig", "load", "ck");
 }
 test "CUDA load cache: GLM final head and MTP reads after layer releases" {
-    try scope(glm ++ "cuda_weights.zig", "load", "ck");
-    try scope(glm ++ "cuda_weights.zig", "load", "head_ck");
+    try scope(glm ++ "cuda_weights.zig", "loadFor", "ck"); // load wraps loadFor
+    try scope(glm ++ "cuda_weights.zig", "loadFor", "head_ck");
     try scope(glm ++ "cuda_vision.zig", "load", "ck");
 }
 test "CUDA load cache: Dory" {

@@ -21,7 +21,8 @@ pub fn select(dr: *const df.Drafter, i: usize, M: usize, q: df.Req) void {
         for (0..dr.world) |rk| {
             const blk = dr.cand[rk * M * CW + r * CW ..][0..CW];
             for (0..TOPK) |j| {
-                if (blk[j] < 0) continue;
+                // No-winner id 0x7fffffff (NaN or -inf logits) must never index the codebooks.
+                if (blk[j] < 0 or blk[j] >= df.VOCAB) continue;
                 const cand: Cand = .{ .v = @bitCast(blk[TOPK + j]), .id = @intCast(blk[j]) };
                 if (n < TOPK) {
                     c[n] = cand;
@@ -42,6 +43,7 @@ pub fn select(dr: *const df.Drafter, i: usize, M: usize, q: df.Req) void {
             }
             return;
         }
+        if (prev >= df.VOCAB) prev = 0; // a corrupt anchor must not index past the codebook
         const g = dr.gh[r * RANK ..][0..RANK];
         const P = dr.pred[prev * RANK ..][0..RANK];
         var pg: [RANK]f32 = undefined;

@@ -395,6 +395,10 @@ fn loadMtpExperts(w: *weights.Weights, d: *const cuda.Driver, stream: cuda.Strea
 
 /// Full GLM-5.3-Flash TFQ3 checkpoint load on CUDA (TP=1): backbone + MTP layer + TFQ3 draft head (for MTP & DFlash2).
 pub fn loadWeights(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: cuda.Stream, tools: weights.Tools, dir: []const u8, c: cfg.Config, share: shard.Share, layer_ids: []const u32, with_mtp: bool) !weights.Weights {
+    return loadWeightsFor(gpa, io, d, stream, tools, dir, c, share, layer_ids, if (with_mtp) .mtp else .none);
+}
+
+pub fn loadWeightsFor(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: cuda.Stream, tools: weights.Tools, dir: []const u8, c: cfg.Config, share: shard.Share, layer_ids: []const u32, mode: weights.DraftWeights) !weights.Weights {
     if (share.world != 1) {
         std.log.err("glm tfq3: CUDA TFQ3 runs on --tp 1 (got world={d})", .{share.world});
         return error.UnsupportedQuant;
@@ -446,7 +450,8 @@ pub fn loadWeights(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, st
     w.norm = try uploadNorm(&w, d, &ck, prefix ++ "norm.weight", c.hidden);
     const lm_head = try st.nonmoe.findChecked("lm_head", c.vocab, c.hidden);
     w.head = .{ .tfq3 = lm_head };
-    if (with_mtp and c.mtp > 0) {
+    if (mode == .external) w.external_head = .{ .tfq3 = lm_head };
+    if (mode == .mtp and c.mtp > 0) {
         const mi = c.layers;
         const m_in = try uploadNorm(&w, d, &ck, try std.fmt.bufPrint(&b[0], prefix ++ "layers.{d}.input_layernorm.weight", .{mi}), c.hidden);
         const m_post = try uploadNorm(&w, d, &ck, try std.fmt.bufPrint(&b[0], prefix ++ "layers.{d}.post_attention_layernorm.weight", .{mi}), c.hidden);

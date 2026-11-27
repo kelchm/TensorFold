@@ -575,3 +575,21 @@ test "a request needing more pages than the whole pool is admitted at once and r
     p.close(1);
     try expect(p.fits(600, 100));
 }
+
+test "TF_KV_PAGES: thin headless models return NoPagedCaches and headless host-KV uses pageBytes" {
+    var f: Fake = undefined;
+    try f.init(std.testing.allocator);
+    defer f.deinit(null);
+    f.e.mtp = false;
+    const state = @import("cuda_state.zig");
+    const kv_host = @import("cuda_kv_host.zig");
+    const env = @import("sys").env;
+    _ = env.setenv("TF_GLM_KV_HOST_GIB", "1", 1);
+    defer _ = env.unsetenv("TF_GLM_KV_HOST_GIB");
+    try expect(pages_mod.pageBytes(&f.e) < state.pageBytes(&f.e.w));
+    try expect(kv_host.hostPages(pages_mod.pageBytes(&f.e), f.e.capacity) > kv_host.hostPages(state.pageBytes(&f.e.w), f.e.capacity));
+    for (&f.layers) |*l| l.mixer = .{ .kda = undefined };
+    try expectEqual(@as(u64, 0), pages_mod.pageBytes(&f.e));
+    try std.testing.expectError(error.NoPagedCaches, pages_mod.layout(std.testing.allocator, &f.e, 0));
+    try std.testing.expectError(error.NoPagedCaches, pages_mod.ownSequence(&f.e));
+}

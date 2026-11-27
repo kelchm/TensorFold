@@ -4,6 +4,64 @@ const glm = @import("glm");
 const registry = @import("core").contract.registry;
 const t = std.testing;
 
+test "glm dflash: external-only keeps the draft projection and scheduling when the MTP layer is absent" {
+    var e: glm.engine.Engine = undefined;
+    var dr: glm.dflash.Drafter = undefined;
+    e.drafter = &dr;
+    e.mtp = false;
+    e.w.mtp = null;
+    e.w.external_head = null;
+    try t.expect(e.w.draftHead() == null);
+    const head: glm.tfq3.DraftHead = .{ .q4 = .{ .w = 11, .s = 12, .b = 13, .n = 64, .k = 128, .npad = 64 } };
+    e.w.external_head = head;
+    try t.expectEqualDeep(head, e.w.draftHead().?);
+    var adapter: glm.lanes.Lanes = .{ .x = .{ .e = &e, .link = undefined } };
+    const standalone = adapter.factsWithCopies(true);
+    try t.expect(standalone.speculate and standalone.draft_streams and standalone.hidden_rows);
+    e.mtp = true;
+    const both = adapter.factsWithCopies(true);
+    try t.expectEqualDeep(standalone, both);
+
+    const h: [32]u8 = @splat(0);
+    const ranks = glm.ranks;
+    const fp0 = ranks.Fingerprint.of(2, 0, .{}, 8192, true, h, h, h);
+    const fp1 = ranks.Fingerprint.of(2, 1, .{ .dflash_only = true }, 8192, true, h, h, h);
+    try t.expectEqual(ranks.Fingerprint.Field.mtp, ranks.mismatch(&.{ fp0, fp1 }).?.field);
+}
+
+test "glm dflash: selector skips out-of-vocabulary candidate ids and clamps a corrupt anchor" {
+    const df = glm.dflash;
+    var dr: df.Drafter = undefined;
+    dr.world = 1;
+    dr.temp = 1.0;
+    const pred = try t.allocator.alloc(u16, df.VOCAB * df.RANK);
+    defer t.allocator.free(pred);
+    @memset(pred, 0);
+    const succ = try t.allocator.alloc(u16, df.VOCAB * df.RANK);
+    defer t.allocator.free(succ);
+    @memset(succ, 0);
+    var gh: [df.BLOCK * df.RANK]f32 = @splat(0);
+    var cand: [df.BLOCK * df.CW]i32 = @splat(-1);
+    // Row 1 has no-winner 0x7fffffff alongside one valid token id (42).
+    cand[1 * df.CW + 0] = 0x7fff_ffff;
+    cand[1 * df.CW + df.TOPK + 0] = @bitCast(@as(f32, 99.0));
+    cand[1 * df.CW + 1] = 42;
+    cand[1 * df.CW + df.TOPK + 1] = @bitCast(@as(f32, 1.5));
+    // Row 2 has only out-of-vocab ids, so selection stops cleanly without indexing past the codebook.
+    cand[2 * df.CW + 0] = @intCast(df.VOCAB);
+    cand[2 * df.CW + df.TOPK + 0] = @bitCast(@as(f32, 5.0));
+    dr.pred = pred;
+    dr.succ = succ;
+    dr.gh = &gh;
+    dr.cand = &cand;
+    var out: [df.BLOCK - 1]u32 = @splat(0);
+    var probs: [df.BLOCK - 1]f64 = @splat(1.0);
+    glm.dflash_select.select(&dr, 0, df.BLOCK, .{ .slot = 0, .pos = 0, .n = 0, .anchor = df.VOCAB + 7, .propose = true, .out = &out, .probs = &probs });
+    try t.expectEqual(@as(u32, 42), out[0]);
+    try t.expectEqual(@as(u32, 42), out[1]);
+    try t.expectEqual(@as(f64, 0.0), probs[1]);
+}
+
 test "glm dflash: gather and read fit for every supported rank count" {
     for (1..17) |world| for ([_]usize{ 1, 8, glm.dflash.MAX_M }) |rows| {
         const n = glm.dflash_candidates.Layout.init(world, rows, glm.dflash.CW);

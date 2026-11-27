@@ -74,9 +74,11 @@ pub fn shapeOf(w: *const weights.Weights) Shape {
 }
 
 pub fn pkPageBytes(w: *const weights.Weights) u64 {
-    return shapeOf(w).pkPageBytes();
+    return pkPageBytesOf(w, true);
 }
-
+pub fn pkPageBytesOf(w: *const weights.Weights, head: bool) u64 {
+    return Shape.ofFormat(&w.config, mlaLayers(w), false, head).pkPageBytes();
+}
 /// A page's bytes: every DSA layer's part, then the MTP layer's.
 pub fn pageBytes(w: *const weights.Weights) u64 {
     return pageBytesOf(w, false, true);
@@ -442,7 +444,10 @@ pub const State = struct {
         return initFormat(gpa, d, w, capacity, false);
     }
     pub fn initFormat(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, kv8: bool) !State {
-        return make(gpa, d, w, capacity, kv8, null, true);
+        return initWindowFormat(gpa, d, w, capacity, kv8, true);
+    }
+    pub fn initWindowFormat(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, kv8: bool, head: bool) !State {
+        return make(gpa, d, w, capacity, kv8, null, head);
     }
     /// A sequence whose latent rows and pooled keys are pages of `p`; it holds no rows until a stream maps some.
     pub fn initPaged(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, p: Paged) !State {

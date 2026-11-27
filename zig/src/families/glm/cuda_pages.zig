@@ -18,7 +18,8 @@ pub fn tableLen(capacity: usize) usize {
 pub fn layout(gpa: std.mem.Allocator, e: *const Engine, extra: u64) !kv.Layout {
     const fixed = try state.State.pagedBytesOf(gpa, &e.w, e.capacity, tableLen(e.capacity), e.mtp);
     // TF_GLM_KV_HOST: a page costs the device only its pooled keys (the pages themselves are in host memory)
-    const page = if (kv_host.onHost()) state.pkPageBytes(&e.w) else pageBytes(e);
+    const page = if (kv_host.onHost()) state.pkPageBytesOf(&e.w, e.mtp) else pageBytes(e);
+    if (page == 0) return error.NoPagedCaches;
     return .{ .fixed_bytes = fixed + extra, .token_bytes = page / state.page_rows, .page_tokens = state.page_rows, .snap_bytes = 0 };
 }
 
@@ -44,6 +45,7 @@ pub fn need(l: kv.Layout, prompt: usize, max_tokens: usize) usize {
 
 /// The engine's own sequence (slot 0) when it pages, bound: its fixed part and table, no rows until its pool places it.
 pub fn ownSequence(e: *Engine) !void {
+    if (pageBytes(e) == 0) return error.NoPagedCaches;
     if (e.seqs.items.len == 0) try e.seqs.append(e.gpa, null);
     if (e.seqs.items[0] != null) return error.SlotTaken;
     const q = try e.gpa.create(types.Seq);
@@ -83,7 +85,7 @@ pub const Pages = struct {
         if (own == null or own.?.st.table == 0) return error.OwnNotPaged; // slot 0 holds a window, or none was made
         const p = try gpa.create(Pages);
         errdefer gpa.destroy(p);
-        const page = if (kv_host.onHost()) state.pageBytes(&e.w) else l.pageBytes();
+        const page = if (kv_host.onHost()) pageBytes(e) else l.pageBytes();
         p.* = .{ .gpa = gpa, .e = e, .layout = l, .page = page, .pool = try kv.Pool.init(gpa, pages, page), .arena = null, .leases = &.{}, .used = &.{}, .leader = leader, .poison = poisoned() };
         errdefer p.pool.deinit();
         const host = kv_host.onHost() and pages > 0;
@@ -97,9 +99,10 @@ pub const Pages = struct {
                 p.host = try cuda.HostBuffer.allocMapped(e.d, pages * page);
                 p.host_ptr = try p.host.?.device();
             }
-            p.pk_arena = try cuda.DeviceBuffer.alloc(e.d, pages * state.pkPageBytes(&e.w));
+            const pk_page = state.pkPageBytesOf(&e.w, e.mtp);
+            p.pk_arena = try cuda.DeviceBuffer.alloc(e.d, pages * pk_page);
             try kv_host.prepare(e.d, page, e.capacity, e.w.config.latentRow() * 2); // made before the room was read
-            std.log.info("kv host: {d} pages ({d} MiB) in pinned host memory, pooled keys {d} MiB on the device", .{ pages, pages * page >> 20, pages * state.pkPageBytes(&e.w) >> 20 });
+            std.log.info("kv host: {d} pages ({d} MiB) in pinned host memory, pooled keys {d} MiB on the device", .{ pages, pages * page >> 20, pages * pk_page >> 20 });
         }
         errdefer if (p.host) |*h| h.free();
         errdefer if (p.shared) |*h| h.close();
@@ -122,7 +125,7 @@ pub const Pages = struct {
         var at = on(e, p.base(), page);
         if (p.pk_arena) |a| {
             at.pk = a.ptr;
-            at.pk_page = state.pkPageBytes(&e.w);
+            at.pk_page = state.pkPageBytesOf(&e.w, e.mtp);
         }
         for (seqs) |*q| {
             if (q.* != null) return error.SlotTaken; // attach comes before any stream

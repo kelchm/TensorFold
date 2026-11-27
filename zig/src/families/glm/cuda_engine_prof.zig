@@ -1,6 +1,29 @@
 //! GLM profiler lifetime operation used by unwind and close.
 const std = @import("std");
+const prof_mod = @import("cuda_prof.zig");
 const Engine = @import("cuda_engine.zig").Engine;
+
+pub fn initProfs(e: *Engine, layers: usize) !void {
+    const profiled = try prof_mod.Prof.wanted();
+    if (!profiled) return;
+    for (&e.profs) |*p| p.* = try prof_mod.Prof.init(e.d, e.io);
+    for (&e.prompt_profs, 0..) |*p, bucket| {
+        p.* = try prof_mod.Prof.init(e.d, e.io);
+        p.*.?.every = 4;
+        const started = std.Io.Clock.awake.now(e.io).toNanoseconds();
+        try p.*.?.initPrompt(layers, e.pieces.count);
+        const create_ms = prof_mod.Prof.elapsedMs(e.io, started);
+        const pairs = prof_mod.Prof.promptCapacity(layers, e.pieces.count);
+        const bucket_rows = ([_]usize{ 64, 256, 1024, 2048 })[bucket];
+        std.log.info("glm prof startup rank={d} bucket_rows={d} layers={d} pieces={d} pairs={d} events={d} create_ms={d:.4}", .{ e.share.rank, bucket_rows, layers, e.pieces.count, pairs, 2 * pairs, create_ms });
+    }
+    if (e.heat_gate.bands) |bands| {
+        std.log.info("glm prof startup rank={d} heat=on high_c={d:.1} low_c={d:.1} root={s}", .{ e.share.rank, bands.high_c, bands.low_c, e.heat_gate.root });
+    } else {
+        std.log.info("glm prof startup rank={d} heat=off", .{e.share.rank});
+    }
+}
+
 pub fn freeProfs(e: *Engine) void {
     for (&e.profs) |*p| {
         if (p.*) |v| v.deinit();

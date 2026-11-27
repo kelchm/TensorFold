@@ -31,6 +31,7 @@ pub const Settings = struct {
     kv_host: u8 = 0, // TF_GLM_KV_HOST=1: KV pages in host memory (1); with TF_GLM_KV_HOST_SHARED=1, one copy a host (2)
     kv_host_gib: f64 = 0, // TF_GLM_KV_HOST_GIB: the host pages' GiB (0: one full window)
     l2pf: l2pf.Options = .{}, // TF_GLM_L2PF and its knobs: a decode window's next weights read into L2 beside it
+    dflash_only: bool = false, // TF_GLM_DFLASH_ONLY=1: omit checkpoint MTP layer and its KV pages beside DFlash2
     kv_live_half: bool = false, // TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone (cuda_snapshot_layout.zig)
     draft_split: bool = false, // TF_GLM_DRAFT_SPLIT=1: three ranks or more split the drafter MLP without TF_ROCE=1
 
@@ -52,6 +53,10 @@ pub const Settings = struct {
     /// `read` from a lookup with no blank text, so every name below and in l2pf's reader is unset when blank.
     fn readSet(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
         var s: Settings = .{};
+        s.dflash_only = @import("sys").environment.value(bool, "TF_GLM_DFLASH_ONLY", get("TF_GLM_DFLASH_ONLY"), false) catch {
+            problem.* = "TF_GLM_DFLASH_ONLY: 0 or 1";
+            return error.BadSetting;
+        };
         if (get("TF_GLM_PROMPT_K")) |v| {
             if (std.mem.eql(u8, v, "shape")) s.prompt_fixed_k = true else if (!std.mem.eql(u8, v, "one")) {
                 problem.* = "TF_GLM_PROMPT_K: one or shape";
@@ -237,7 +242,7 @@ pub fn toolPieces(s: *Settings, comptime get: *const fn ([:0]const u8) ?[]const 
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 24, // this struct's version (23, plus keep_seqs)
+    layout: u32 = 25, // 24, plus dflash_only bit in mtp
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -267,12 +272,14 @@ pub const Fingerprint = extern struct {
     l2pf: [4]u32 = @splat(0), // TF_GLM_L2PF's words: every rank prefetches alike, so none waits on a slower one's windows
     bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
     capacity: u64, // tokens a sequence holds
+    drafter_bits: u64 = 0, // --drafter-bits (0: no drafter, 16: bf16, 4: q4)
     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
     heat_low: f64,
     kv_host_gib: f64 = 0, // TF_GLM_KV_HOST_GIB: each rank's row marks span the host pages rank 0 counts
     config: [32]u8, // sha256 of config.json
     program: [32]u8, // sha256 of this executable
     checkpoint: [64]u8, // hex digest of the checkpoint's metadata and every shard byte, through the digest cache
+    drafter_checkpoint: [64]u8 = @splat(0), // hex digest of --drafter's metadata and shard bytes (0s: none)
 
     pub const Field = enum {
         layout,
@@ -305,12 +312,14 @@ pub const Fingerprint = extern struct {
         l2pf,
         bits,
         capacity,
+        drafter_bits,
         heat_high,
         heat_low,
         kv_host_gib,
         config,
         program,
         checkpoint,
+        drafter_checkpoint,
     };
 
     pub fn of(
@@ -338,7 +347,7 @@ pub const Fingerprint = extern struct {
             .pair = @intFromBool(s.pair),
             .pair_experts = @intFromBool(s.pair_experts),
             .layers = s.layers,
-            .mtp = @intFromBool(mtp),
+            .mtp = @as(u32, @intFromBool(mtp)) | (@as(u32, @intFromBool(s.dflash_only)) << 2),
             .roce_multi = @intFromBool(s.roce_multi),
             .roce_wide = @intFromBool(s.roce_wide and world >= 3), // two ranks ask by default, so a lone TF_ROCE=1 there is no difference
             .draft_split = @intFromBool(s.draft_split and world >= 3), // two ranks split whatever it says
@@ -395,12 +404,14 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "l2pf",
             "bits",
             "capacity",
+            "drafter_bits",
             "heat_high",
             "heat_low",
             "kv_host_gib",
             "config",
             "program",
             "checkpoint",
+            "drafter_checkpoint",
         };
         inline for (fields) |name| {
             if (!std.mem.eql(u8, std.mem.asBytes(&@field(f, name)), std.mem.asBytes(&@field(all[0], name))))
@@ -508,7 +519,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .pair => "TF_GLM_PROMPT_PAIR",
         .pair_experts => "TF_GLM_PAIR_EXPERTS",
         .layers => "TF_GLM_LAYERS",
-        .mtp => "--no-drafts given to some ranks and not others",
+        .mtp => "--no-drafts, --drafter or TF_GLM_DFLASH_ONLY differs across ranks",
         .vision => "--vision (or its image tokens) given to some ranks and not others",
         .video_tokens => "--vision-video-tokens",
         .max_images => "the image count limit",
@@ -523,11 +534,13 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .l2pf => "TF_GLM_L2PF, _MB, _CTAS or _PACE_GBPS",
         .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
         .capacity => "the sequence capacity (the context)",
+        .drafter_bits => "--drafter-bits",
         .heat_high => "TF_HEAT_HIGH",
         .heat_low => "TF_HEAT_LOW",
         .config => "config.json",
         .program => "the executable",
         .checkpoint => "checkpoint metadata or shard bytes",
+        .drafter_checkpoint => "--drafter checkpoint metadata or shard bytes",
     };
 }
 
@@ -539,62 +552,12 @@ pub fn mediaFingerprint(f: *Fingerprint, limits: @import("cuda_images.zig").Limi
     f.max_frames = limits.max_frames;
 }
 
+pub fn drafterFingerprint(f: *Fingerprint, bits: u8, digest: [32]u8) void {
+    f.drafter_bits = if (bits == 0) 16 else bits;
+    f.drafter_checkpoint = std.fmt.bytesToHex(digest, .lower);
+}
+
 /// The checkpoint digest a rank sends: its metadata and every shard byte, read again only for a file that changed.
 pub fn artifact(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![32]u8 {
     return @import("core").checkpoint_identity.fullIdentity(gpa, io, dir);
-}
-test "TF_GLM_PAIR_EXPERTS: off by default, 0 or 1, and every rank must agree" {
-    const Reader = struct {
-        fn absent(_: [:0]const u8) ?[]const u8 {
-            return null;
-        }
-        fn on(key: [:0]const u8) ?[]const u8 {
-            return if (std.mem.eql(u8, key, "TF_GLM_PAIR_EXPERTS")) "1" else null;
-        }
-        fn off(key: [:0]const u8) ?[]const u8 {
-            return if (std.mem.eql(u8, key, "TF_GLM_PAIR_EXPERTS")) "0" else null;
-        }
-        fn bad(key: [:0]const u8) ?[]const u8 {
-            return if (std.mem.eql(u8, key, "TF_GLM_PAIR_EXPERTS")) "2" else null;
-        }
-    };
-    var problem: []const u8 = "";
-    try std.testing.expect(!(try Settings.read(Reader.absent, &problem)).pair_experts);
-    const on = try Settings.read(Reader.on, &problem);
-    try std.testing.expect(on.pair_experts);
-    try std.testing.expect(!(try Settings.read(Reader.off, &problem)).pair_experts);
-    try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
-    try std.testing.expectEqualStrings("TF_GLM_PAIR_EXPERTS: 0 or 1", problem);
-    const all = [_]Fingerprint{ Fingerprint.of(2, 0, on, 8192, true, @splat(0), @splat(0), @splat(0)), Fingerprint.of(2, 1, .{}, 8192, true, @splat(0), @splat(0), @splat(0)) };
-    try std.testing.expectEqual(Mismatch{ .field = .pair_experts, .rank = 1 }, mismatch(&all).?);
-}
-
-test "wire pieces: a blank override is unset; the tools' form takes its world from TF_GLM_WORLD" {
-    const Reader = struct {
-        fn at(key: [:0]const u8, world: ?[]const u8, pieces: ?[]const u8) ?[]const u8 {
-            if (std.mem.eql(u8, key, "TF_GLM_CHUNK_SOLO")) return "4096";
-            if (std.mem.eql(u8, key, "TF_GLM_ROCE_MULTI")) return "1";
-            if (std.mem.eql(u8, key, "TF_GLM_WORLD")) return world;
-            if (std.mem.eql(u8, key, "TF_GLM_OVERLAP_PIECES")) return pieces;
-            return null;
-        }
-        fn blank(key: [:0]const u8) ?[]const u8 {
-            return at(key, null, " ");
-        }
-        fn three(key: [:0]const u8) ?[]const u8 {
-            return at(key, "3", null);
-        }
-        fn none(key: [:0]const u8) ?[]const u8 {
-            return at(key, null, null);
-        }
-    };
-    var s: Settings = .{ .solo = true, .roce_multi = true, .pieces = 3 };
-    wirePieces(&s, 3, Reader.blank);
-    try std.testing.expectEqual(@as(u32, 8), s.pieces);
-    s.pieces = 3;
-    toolPieces(&s, Reader.three);
-    try std.testing.expectEqual(@as(u32, 8), s.pieces);
-    s.pieces = 3;
-    toolPieces(&s, Reader.none);
-    try std.testing.expectEqual(@as(u32, 3), s.pieces);
 }

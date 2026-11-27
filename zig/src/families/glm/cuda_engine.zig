@@ -148,6 +148,7 @@ pub const Engine = struct {
         );
         if (o.vision) |lim| ranks.mediaFingerprint(&fp, lim);
         fp.mtp += @intFromBool(o.drafter);
+        if (o.drafter) ranks.drafterFingerprint(&fp, o.drafter_bits, if (o.drafter_dir) |dd| try ranks.artifact(a, io, dd) else @splat(0));
         try ranks.agree(d, lib, comm, stream, fp, try a.alloc(ranks.Fingerprint, world));
         try ranks.probeStart(d, lib, comm, stream, o.settings, rank, world);
         const place = mesh_mod.Mesh.init(.{ .tensor = std.math.cast(u32, world) orelse 0 }, std.math.cast(u32, rank) orelse std.math.maxInt(u32)) catch return error.BadRank;
@@ -173,13 +174,14 @@ pub const Engine = struct {
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .mesh = place, .backend = backend, .collective = backend.collective(), .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .mtp = o.mtp };
+        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .mesh = place, .backend = backend, .collective = backend.collective(), .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .mtp = o.mtp and !o.settings.dflash_only };
         e.keep_seqs = o.settings.keep_seqs; // release keeps a slot's sequence with TF_GLM_KEEP_SEQS=1
         const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
         if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
         if (held.count > 1) try held_shares.refused(&o, o.drafter, o.vision != null or has_packs);
         const tiler: tile.Tiler = .{ .gpa = gpa, .mk = &e.m.mm, .s = stream, .d = d, .enabled = o.settings.tiled, .dense = o.settings.dense_bits, .head = o.settings.head_bits, .packs = &e.packs };
-        e.w = try @import("cuda_load_owner.zig").finish(try weights.load(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, o.mtp), tiler, tile.Tiler.apply);
+        const draft_weights: weights.DraftWeights = if (o.settings.dflash_only) .external else if (o.mtp) .mtp else .none;
+        e.w = try @import("cuda_load_owner.zig").finish(try weights.loadFor(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, draft_weights), tiler, tile.Tiler.apply);
         errdefer e.w.deinit();
         errdefer {
             gpa.free(e.packs.ptrs);
@@ -190,7 +192,8 @@ pub const Engine = struct {
         if (o.settings.tiled) e.m.packs = &e.packs;
         if (held.count == 1 and o.settings.l2pf.want(try ctx.capability(), world)) e.l2pf = try l2pf_mod.L2pf.init(gpa, d, &e.w, o.settings.l2pf);
         errdefer if (e.l2pf) |*p| p.deinit();
-        if (o.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
+        if (e.settings.pages and pages_mod.pageBytes(e) == 0) e.settings.pages = false;
+        if (e.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
         errdefer {
             e.free(0);
             e.seqs.deinit(gpa);
@@ -203,38 +206,21 @@ pub const Engine = struct {
         errdefer if (e.pair) |*p| p.deinit();
         e.bd = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
         errdefer e.bd.deinit();
-        e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
-        errdefer e.bm.deinit();
+        if (!o.settings.dflash_only) e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
+        errdefer if (!o.settings.dflash_only) e.bm.deinit();
+        if (o.settings.dflash_only and rank == 0) std.log.info("glm: DFlash2 uses its draft head without loading the checkpoint MTP layer or its KV pages", .{});
         if (o.mtp) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
         e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * held.total * pick_rows);
         errdefer e.pairs.free();
         try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, pair_bytes * held.total * pick_rows), "cuMemsetD8"); // each pair's padding stays zero
-        try held_shares.load(e, held, .{ .tiler = tiler, .checkpoint = checkpoint, .layers = layers, .mtp = o.mtp });
+        try held_shares.load(e, held, .{ .tiler = tiler, .checkpoint = checkpoint, .layers = layers, .mtp = e.mtp });
         errdefer held_shares.deinit(e);
         try held_shares.fill(e);
         e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
         errdefer e.smp.deinit();
         errdefer e.freeProfs();
-        const profiled = try prof_mod.Prof.wanted();
-        if (profiled) for (&e.profs) |*p| {
-            p.* = try prof_mod.Prof.init(d, io);
-        };
-        if (profiled) for (&e.prompt_profs, 0..) |*p, bucket| {
-            p.* = try prof_mod.Prof.init(d, io);
-            p.*.?.every = 4;
-            const started = std.Io.Clock.awake.now(io).toNanoseconds();
-            try p.*.?.initPrompt(layers.len, e.pieces.count);
-            const create_ms = prof_mod.Prof.elapsedMs(io, started);
-            const pairs = prof_mod.Prof.promptCapacity(layers.len, e.pieces.count);
-            const bucket_rows = ([_]usize{ 64, 256, 1024, 2048 })[bucket];
-            std.log.info("glm prof startup rank={d} bucket_rows={d} layers={d} pieces={d} pairs={d} events={d} create_ms={d:.4}", .{ e.share.rank, bucket_rows, layers.len, e.pieces.count, pairs, 2 * pairs, create_ms });
-        };
-        if (profiled) if (e.heat_gate.bands) |bands| {
-            std.log.info("glm prof startup rank={d} heat=on high_c={d:.1} low_c={d:.1} root={s}", .{ e.share.rank, bands.high_c, bands.low_c, e.heat_gate.root });
-        } else {
-            std.log.info("glm prof startup rank={d} heat=off", .{e.share.rank});
-        };
+        try @import("cuda_engine_prof.zig").initProfs(e, layers.len);
         e.prompt_out = try prompt_lp.Output.init(d);
         errdefer e.prompt_out.free();
         e.shared_buf = try cuda.DeviceBuffer.alloc(d, 8);
@@ -262,7 +248,7 @@ pub const Engine = struct {
         e.smp.deinit();
         e.pairs.free();
         if (e.bs) |*b| b.deinit();
-        e.bm.deinit();
+        if (!e.settings.dflash_only) e.bm.deinit();
         e.bd.deinit();
         if (e.pair) |*p| p.deinit();
         e.bp.deinit();

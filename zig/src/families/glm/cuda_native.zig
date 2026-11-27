@@ -94,7 +94,7 @@ pub fn benchmark(p: *anyopaque) struct { ranks: ?u32, group: ?[]const u8 } {
 pub fn attach(p: *anyopaque, streams: u32, pages: usize) !void {
     const own: *Owned = @ptrCast(@alignCast(p));
     const l = own.layout orelse return error.NoPages;
-    const kept = @import("cuda_kv_host.zig").pagesFor(@import("cuda_state.zig").pageBytes(&own.e.w), own.e.capacity, pages);
+    const kept = @import("cuda_kv_host.zig").pagesFor(pages_mod.pageBytes(own.e), own.e.capacity, pages);
     try own.lanes.x.pool(streams + 1, kept, l.pageBytes());
     own.e.pages = try pages_mod.Pages.init(own.gpa, own.e, l, streams + 1, kept, true);
 }
@@ -220,6 +220,7 @@ fn openRank(a: StartArgs, set: ranks.Settings) !Loaded {
     const o = a.o;
     const p = a.p;
     const roce_bytes = a.roce_bytes;
+    try @import("cuda_env.zig").validateRankOptions(set, a.share, o.drafts, o.drafter != null, o.drafter_bits);
     const copies = try cuda.priority_copies.read("TF_GLM_COPIES", o.drafts);
     var load_cache = @import("core").checkpoint.cache.Load.begin(io, p.world > 1);
     defer load_cache.deinit();
@@ -262,7 +263,7 @@ fn openRank(a: StartArgs, set: ranks.Settings) !Loaded {
     cuda.p2p_report.afterInit(&diag, .{ .lib = &own.group.lib, .comm = comm, .d = ctx.d, .later = true });
     const cap = capacity(o.context);
     own.progress.enter(.weights);
-    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.group.lib, own.group.comm, p.rank, p.world, .{ .capacity = cap, .mtp = o.drafts, .settings = set, .vision = o.vision, .drafter = o.drafter != null, .owner = &own.group });
+    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.group.lib, own.group.comm, p.rank, p.world, .{ .capacity = cap, .mtp = o.drafts, .settings = set, .vision = o.vision, .drafter = o.drafter != null, .drafter_dir = o.drafter, .drafter_bits = if (o.drafter != null) o.drafter_bits else 0, .owner = &own.group });
     errdefer own.e.deinit();
     if (o.vision) |lim| { // before the rooms: the tower's bytes count against rank 0's
         var problem: []const u8 = "";
@@ -319,7 +320,7 @@ fn finishRank(a: OpenArgs) !Loaded {
     errdefer own.link.deinit();
     try @import("cuda_prompt_logprobs.zig").prepare(own.e);
     own.e.snap_setup = .{ .ptr = own, .run = readySnapshots };
-    try @import("cuda_kv_host.zig").prepare(ctx.d, @import("cuda_state.zig").pageBytes(&own.e.w), own.e.capacity, own.e.w.config.latentRow() * 2);
+    if (set.pages) try @import("cuda_kv_host.zig").prepare(ctx.d, pages_mod.pageBytes(own.e), own.e.capacity, own.e.w.config.latentRow() * 2);
     if (p.world > 1) try a.load_cache.finishAfter(.{ io, own.e.checkpoint_digest }, cuda.tp_watch.ready) else a.load_cache.finish();
     // Rank 0 admits by the smallest room of the ranks; its sizes are the largest (the first ranks take the remainder).
     const rooms = try gpa.alloc(u64, p.world);
