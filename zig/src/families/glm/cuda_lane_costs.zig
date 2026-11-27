@@ -171,7 +171,14 @@ fn keyShape(e: *const engine.Engine, sm: usize, driver: c_int, shape: []u8, pin:
     const draft_hex = std.fmt.bytesToHex(if (e.drafter) |dr| dr.checkpoint_digest else @as([32]u8, @splat(0)), .lower);
     const tail: []const u8 = if (pin) |f| (if (f) " form factored" else " form classic") else "";
     var p2_buf: [64]u8 = undefined;
-    const p2 = try std.fmt.bufPrint(&p2_buf, " ext{d}/{d}{s}", .{ @intFromBool(set.dflash_only), @intFromBool(set.dflash_q4_down), tail });
+    const p2 = try std.fmt.bufPrint(&p2_buf, " ext{d}/{d} tiles{d}/{d} first{d}{s}", .{
+        @intFromBool(set.dflash_only),
+        @intFromBool(set.dflash_q4_down),
+        @intFromBool(set.verify_tiles.mla),
+        @intFromBool(set.verify_tiles.ranges),
+        @intFromBool(set.l2pf.shared_first),
+        tail,
+    });
     return std.fmt.bufPrint(shape, "sm{d} cuda{d} ranks{d} {s} drafter{d}/{d}/{s} layers{d} l2{d}/{d}/{d}/{d}/{d} warps{d} kda{d} mm{d} bits{d}/{d} kv8{d} pages{d} host{d} roce{d} p2p{s}/{s}/{s} pad{d} pdl{d} dsel{d} wide{d}{s}{s}", .{
         sm,                                          driver,                       e.share.world,                          hex[0..],                                   @intFromBool(e.drafter != null),
         if (e.drafter) |dr| dr.bits else @as(u8, 0), draft_hex[0..],               set.layers,                             @intFromBool(set.l2pf.on),                  @intFromBool(set.l2pf.named),
@@ -275,7 +282,7 @@ test "GLM cost identity: the consumed key includes drafter precision and all tim
     e.drafter = &dr;
     var base: [512]u8 = undefined;
     const before = try keyShape(&e, 121, 13000, &base, null);
-    for (0..18) |which| {
+    for (0..21) |which| {
         const original = e.settings;
         switch (which) {
             0 => dr.bits = 0,
@@ -296,6 +303,9 @@ test "GLM cost identity: the consumed key includes drafter precision and all tim
             15 => e.m.experts.wide_tile = true,
             16 => e.settings.dflash_only = true,
             17 => e.settings.dflash_q4_down = true,
+            18 => e.settings.verify_tiles.mla = true,
+            19 => e.settings.verify_tiles.ranges = true,
+            20 => e.settings.l2pf.shared_first = true,
             else => unreachable,
         }
         var changed: [512]u8 = undefined;

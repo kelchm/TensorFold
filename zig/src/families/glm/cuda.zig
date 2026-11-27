@@ -85,6 +85,7 @@ test {
     _ = @import("dflash.zig");
     _ = prompt_solo;
     _ = @import("cuda_l2pf.zig");
+    _ = @import("cuda_verify_tiles.zig");
     _ = prompt_pair;
     _ = @import("cuda_disk_image.zig");
     _ = @import("cuda_disk_ranks_test.zig");

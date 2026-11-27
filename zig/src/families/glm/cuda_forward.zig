@@ -177,6 +177,8 @@ pub fn checkTokenIds(ids: []const i32, vocab: u32) error{BadTokenId}!void {
 }
 
 pub const Forward = struct {
+    scheduled_l2: bool = false,
+    verify_tiles: @import("cuda_verify_tiles.zig").Window = .{},
     d: *const cuda.Driver,
     m: *const Modules,
     stream: cuda.Stream,
@@ -199,7 +201,7 @@ pub const Forward = struct {
     }
 
     pub fn set(f: *const Forward) glue.Set {
-        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .dsel = f.m.dsel, .dscore = if (f.m.dscore) |*x| x else null, .mla = if (f.m.mla) |*x| x else null, .tfq3 = if (f.m.tfq3) |*x| x else null };
+        return .{ .verify_tiles = f.verify_tiles, .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .dsel = f.m.dsel, .dscore = if (f.m.dscore) |*x| x else null, .mla = if (f.m.mla) |*x| x else null, .tfq3 = if (f.m.tfq3) |*x| x else null };
     }
 
     /// The layer sums' boundary (cuda_boundary.zig): every rank's fp32 partial into every gathered buffer.
@@ -280,8 +282,11 @@ pub const Forward = struct {
                 if (out) |o| try mlp.fill(f.mlpKernels(), f.stream, m, b.dense, 0, rows, b.prefill, o);
             },
             .moe => |m| {
-                try moe.body(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, rows, b.prefill);
-                if (out) |o| try moe.fill(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, 0, rows, b.prefill, o);
+                const pf = f.prefetch();
+                var kernels = f.moeKernels();
+                kernels.early_shared = f.scheduled_l2 and pf != null and pf.?.o.front(rows) and out != null and m.exl3 != null;
+                try moe.body(kernels, f.stream, m, b.moe, b.normed, c.hidden, rows, b.prefill);
+                if (out) |o| try moe.fill(kernels, f.stream, m, b.moe, b.normed, c.hidden, 0, rows, b.prefill, o);
             },
         }
     }
@@ -448,7 +453,7 @@ pub const Forward = struct {
                 if (r.segs.len > 0) try shared.mixer(f, r, l, li, di, R, slot(r, R)) else try f.mixer(r, l, li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), slot(r, R));
             }
             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].mixer == .kda) .kda else .mla);
-            if (pf) |p| try p.fork(f.stream, j, .f);
+            if (pf) |p| try p.fork(f.stream, j, if (f.scheduled_l2 and p.o.front(R)) .f_first else .f);
             try f.resolve(R);
             if (f.prof) |p| p.mark(f.stream, .gather_a);
             prof_mod.context(f.prof, j, null, .ffn);

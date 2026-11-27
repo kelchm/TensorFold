@@ -8,6 +8,7 @@ const index_mod = @import("cuda_index.zig");
 
 /// What the forward's kernels launch from: our glue's, glm_mm's when tiled, qlinear's lane for FP8 kinds, copy_rows.
 pub const Set = struct {
+    verify_tiles: @import("cuda_verify_tiles.zig").Window = .{},
     glue: *const Kernels,
     index: ?*const index_mod.Kernels = null,
     mm: ?*const mm_mod.Kernels = null,

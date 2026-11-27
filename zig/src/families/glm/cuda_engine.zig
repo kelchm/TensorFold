@@ -63,6 +63,8 @@ pub const Engine = struct {
     lib: *const cuda.nccl.Library,
     comm: cuda.nccl.Comm,
     group: ?*const cuda.tp_group.Group = null, // the main stream's all-gathers (RoCE on two ranks); null: lib and comm
+    verify_tiles: @import("cuda_verify_tiles.zig").Options = .{},
+    scheduled_l2: bool = false,
     mesh: mesh_mod.Mesh, // this rank's place: one tensor group of `world` ranks
     backend: *tp.group.Backend, // the boundary's communicator over lib and comm, then the group once it is up
     collective: tp.Collective, // backend's, made once so a const engine hands it out
@@ -190,9 +192,12 @@ pub const Engine = struct {
         e.m.mm.prompt_fixed_k = o.settings.prompt_fixed_k;
         e.m.tiled = o.settings.tiled;
         if (o.settings.tiled) e.m.packs = &e.packs;
+        const cap = try ctx.capability();
         if (o.settings.dflash_q4_down) try e.m.q4.prepareWide(e.m.mods[5]);
-        if (held.count == 1 and o.settings.l2pf.want(try ctx.capability(), world)) e.l2pf = try l2pf_mod.L2pf.init(gpa, d, &e.w, o.settings.l2pf);
+        if (o.settings.verify_tiles.enabled()) e.verify_tiles = o.settings.verify_tiles.gate(cap, world, o.settings.pages, o.settings.kv_host);
+        if (held.count == 1 and o.settings.l2pf.want(cap, world)) e.l2pf = try l2pf_mod.L2pf.init(gpa, d, &e.w, o.settings.l2pf);
         errdefer if (e.l2pf) |*p| p.deinit();
+        e.scheduled_l2 = e.l2pf != null and world == 2 and cap == 121;
         if (e.settings.pages and pages_mod.pageBytes(e) == 0) e.settings.pages = false;
         if (e.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
         errdefer {
@@ -468,6 +473,8 @@ pub const Engine = struct {
         var one: [1]fw.Rank = undefined;
         var f = e.view(&e.bd, &one);
         const at = e.cur.st.pos;
+        f.scheduled_l2 = e.scheduled_l2;
+        f.verify_tiles = e.verify_tiles.window(at, ids.len);
         f.prof = e.profs[ids.len - 1];
         if (f.prof) |p| try p.begin(e.stream, verifyLabel(ids.len));
         try f.run(@ptrCast(ids));

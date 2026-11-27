@@ -125,6 +125,43 @@ test "TF_GLM_DFLASH_Q4_DOWN: off by default, 0 or 1, and every rank must agree" 
     try std.testing.expectEqual(Mismatch{ .field = .mtp, .rank = 1 }, mismatch(&all).?);
 }
 
+test "startup switches: verify_tiles and TF_GLM_L2PF_SHARED_FIRST agree across ranks" {
+    const Reader = struct {
+        fn on(key: [:0]const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "TF_GLM_DECODE_MLA_WIDE")) return "1";
+            if (std.mem.eql(u8, key, "TF_GLM_DECODE_TILE_RANGES")) return "1";
+            if (std.mem.eql(u8, key, "TF_GLM_L2PF_SHARED_FIRST")) return "1";
+            return null;
+        }
+        fn badMla(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_DECODE_MLA_WIDE")) "2" else null;
+        }
+        fn badRanges(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_DECODE_TILE_RANGES")) "yes" else null;
+        }
+    };
+    var problem: []const u8 = "";
+    const s = try Settings.read(Reader.on, &problem);
+    try std.testing.expect(s.verify_tiles.mla and s.verify_tiles.ranges and s.l2pf.shared_first);
+    try std.testing.expectError(error.BadSetting, Settings.read(Reader.badMla, &problem));
+    try std.testing.expectEqualStrings("TF_GLM_DECODE_MLA_WIDE: 0 or 1", problem);
+    try std.testing.expectError(error.BadSetting, Settings.read(Reader.badRanges, &problem));
+    try std.testing.expectEqualStrings("TF_GLM_DECODE_TILE_RANGES: 0 or 1", problem);
+    const h: [32]u8 = @splat(0);
+    try std.testing.expectEqual(Mismatch{ .field = .tiled, .rank = 1 }, mismatch(&.{
+        Fingerprint.of(2, 0, .{ .verify_tiles = .{ .mla = true } }, 8192, true, h, h, h),
+        Fingerprint.of(2, 1, .{}, 8192, true, h, h, h),
+    }).?);
+    try std.testing.expectEqual(Mismatch{ .field = .tiled, .rank = 1 }, mismatch(&.{
+        Fingerprint.of(2, 0, .{ .verify_tiles = .{ .ranges = true } }, 8192, true, h, h, h),
+        Fingerprint.of(2, 1, .{}, 8192, true, h, h, h),
+    }).?);
+    try std.testing.expectEqual(Mismatch{ .field = .l2pf, .rank = 1 }, mismatch(&.{
+        Fingerprint.of(2, 0, .{ .l2pf = .{ .shared_first = true } }, 8192, true, h, h, h),
+        Fingerprint.of(2, 1, .{}, 8192, true, h, h, h),
+    }).?);
+}
+
 test "startup switches: external drafter precision and checkpoint digest agree across ranks" {
     const h: [32]u8 = @splat(0);
     const d0 = ranks.hashBytes("drafter-a");

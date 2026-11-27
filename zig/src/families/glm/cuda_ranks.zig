@@ -33,6 +33,7 @@ pub const Settings = struct {
     l2pf: l2pf.Options = .{}, // TF_GLM_L2PF and its knobs: a decode window's next weights read into L2 beside it
     dflash_only: bool = false, // TF_GLM_DFLASH_ONLY=1: omit checkpoint MTP layer and its KV pages beside DFlash2
     dflash_q4_down: bool = false, // TF_GLM_DFLASH_Q4_DOWN=1: quantize DFlash2 MLP down projections to Q4 (fp32 partials)
+    verify_tiles: @import("cuda_verify_tiles.zig").Options = .{},
     kv_live_half: bool = false, // TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone (cuda_snapshot_layout.zig)
     draft_split: bool = false, // TF_GLM_DRAFT_SPLIT=1: three ranks or more split the drafter MLP without TF_ROCE=1
 
@@ -195,6 +196,12 @@ pub const Settings = struct {
                 return error.BadSetting;
             }
         }
+        inline for (.{ .{ "TF_GLM_DECODE_MLA_WIDE", "mla" }, .{ "TF_GLM_DECODE_TILE_RANGES", "ranges" } }) |flag| {
+            @field(s.verify_tiles, flag[1]) = @import("sys").environment.value(bool, flag[0], get(flag[0]), false) catch {
+                problem.* = flag[0] ++ ": 0 or 1";
+                return error.BadSetting;
+            };
+        }
         if (get("TF_GLM_DRAFT_SPLIT")) |v| {
             if (std.mem.eql(u8, v, "1")) s.draft_split = true else if (!std.mem.eql(u8, v, "0")) {
                 problem.* = "TF_GLM_DRAFT_SPLIT: 0 or 1";
@@ -247,7 +254,7 @@ pub fn toolPieces(s: *Settings, comptime get: *const fn ([:0]const u8) ?[]const 
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 26, // 25, plus dflash_q4_down bit in mtp
+    layout: u32 = 27, // 26, plus verify_tiles bits in tiled and shared_first in l2pf
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -343,7 +350,7 @@ pub const Fingerprint = extern struct {
             .world = @intCast(world),
             .rank = @intCast(rank),
             .prompt_fixed_k = @intFromBool(s.prompt_fixed_k),
-            .tiled = @intFromBool(s.tiled),
+            .tiled = @as(u32, @intFromBool(s.tiled)) | (@as(u32, @intFromBool(s.verify_tiles.mla)) << 1) | (@as(u32, @intFromBool(s.verify_tiles.ranges)) << 2),
             .split = if (!s.split) 0 else if (s.ring) 2 else 1,
             .kda_wide = @intFromBool(s.kda_wide),
             .kda_pad = @intFromBool(s.kda_pad),
@@ -515,7 +522,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .kv8 => "--kv-cache fp8",
         .pages => "TF_KV_PAGES (unset or auto pages from two ranks)",
         .prompt_fixed_k => "TF_GLM_PROMPT_K",
-        .tiled => "TF_GLM_MM",
+        .tiled => "TF_GLM_MM, TF_GLM_DECODE_MLA_WIDE or TF_GLM_DECODE_TILE_RANGES",
         .split => "TF_GLM_PREFILL_REDUCE",
         .kda_wide => "TF_GLM_KDA_DECODE_WIDE",
         .kda_pad => "TF_GLM_KDA_PAD",
@@ -536,7 +543,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .kv_host => "TF_GLM_KV_HOST or TF_GLM_KV_HOST_SHARED",
         .kv_host_gib => "TF_GLM_KV_HOST_GIB",
         .solo => "TF_GLM_CHUNK_SOLO",
-        .l2pf => "TF_GLM_L2PF, _MB, _CTAS or _PACE_GBPS",
+        .l2pf => "TF_GLM_L2PF, _SHARED_FIRST, _MB, _CTAS or _PACE_GBPS",
         .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
         .capacity => "the sequence capacity (the context)",
         .drafter_bits => "--drafter-bits",
