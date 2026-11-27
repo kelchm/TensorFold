@@ -38,7 +38,7 @@ pub const max_together = @import("cuda_state.zig").prompt_heads;
 pub const Prompt = struct { slot: u32, ids: []const u32 };
 
 /// A shared verify's max rows and streams: under hc_pre's 64-row block change; 16 streams take 2 rows each.
-pub const shared_rows = 32;
+pub const shared_rows = types.shared_rows;
 pub const max_shared = 16;
 
 const types = @import("cuda_engine_types.zig");
@@ -162,7 +162,7 @@ pub const Engine = struct {
         const block32 = if (is_tfq3 or exl3.isExl3(gpa, text)) null else try @import("cuda_experts.zig").wantsBlock32(gpa, text);
         var m = try fw.Modules.load(d, ctx, block32, c.rope != 0, is_tfq3);
         errdefer m.deinit();
-        const pair = prompt_pair.wanted(o.settings.pair, o.settings.solo, world);
+        const pair = prompt_pair.wanted(o.settings.pair, o.settings.solo > fw.prefill_rows, o.settings.pair_solo, world);
         const joint_experts = pair and o.settings.pair_experts;
         var pieces = try fw.Pieces.init(d, o.settings.pieces, pair);
         errdefer pieces.deinit();
@@ -194,17 +194,19 @@ pub const Engine = struct {
         errdefer if (e.l2pf) |*p| p.deinit();
         e.scheduled_l2 = e.l2pf != null and world == 2 and cap == 121;
         if (e.settings.pages and pages_mod.pageBytes(e) == 0) e.settings.pages = false;
+        try @import("cuda_solo_memory.zig").check(e, ctx, o);
         if (e.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
         errdefer {
             e.free(0);
             e.seqs.deinit(gpa);
         }
-        e.bp = if (joint_experts) try fw.Buffers.initPairExperts(d, &e.w, prompt_solo.bufferRows(o.settings.solo), o.capacity) else try fw.Buffers.init(d, &e.w, prompt_solo.bufferRows(o.settings.solo), true, o.capacity);
+        e.bp = if (joint_experts) try fw.Buffers.initPairExperts(d, &e.w, o.settings.solo, o.capacity) else try fw.Buffers.init(d, &e.w, o.settings.solo, true, o.capacity);
         errdefer e.bp.deinit();
-        if (o.settings.solo and rank == 0) std.log.info("glm: prompt passes of {d} rows, {d} while another stream decodes", .{ fw.solo_rows, fw.prefill_rows });
+        if (o.settings.solo > fw.prefill_rows and rank == 0) std.log.info("glm: prompt passes of {d} rows, {d} while another stream decodes", .{ o.settings.solo, fw.prefill_rows });
         if (world > 1 and rank == 0) std.log.info("glm: a prompt chunk's exchanges in {d} row pieces", .{o.settings.pieces});
         if (pair) e.pair = try prompt_pair.Pair.init(d, &e.w, &e.bp, &e.pieces, o.capacity, joint_experts);
         errdefer if (e.pair) |*p| p.deinit();
+        if (pair and o.settings.pair_solo and rank == 0) std.log.info("glm: paired prompt steps of two {d}-row chunks: {d:.2} GiB for the second's buffers, index rings of {d} rows", .{ e.bp.rows, @as(f64, @floatFromInt(e.pair.?.bp.arena.buf.len)) / (1 << 30), e.cur.st.ring_rows });
         e.bd = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
         errdefer e.bd.deinit();
         if (!o.settings.dflash_only) e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
@@ -390,8 +392,9 @@ pub const Engine = struct {
         const capped = e.cap_rows;
         e.cap_rows = 0;
         if ((from != null or start == 0) and try e.prefillStart(len, from) != start) return error.BadChunk;
-        const rows = if (capped == 0) try prompt_cuts.stepRows(len, e.cur.cuts.items, start, part.len) else if (e.c.dsa) try prompt_cuts.cappedRows(len, e.cur.cuts.items, start, capped) else return error.BadChunk;
-        if (rows > fw.prefill_rows and e.pair != null) return prompt_pair.prefill(e, part, start, len, cancel, marks, split);
+        const paired = capped == 0 and if (e.pair) |p| part.len > p.rows + 1 else false; // a pair holds > p.rows + next id
+        const rows = if (capped == 0) try prompt_cuts.stepRows(len, e.cur.cuts.items, start, part.len, if (paired) 2 * e.pair.?.rows else e.bp.rows) else if (e.c.dsa) try prompt_cuts.cappedRows(len, e.cur.cuts.items, start, capped) else return error.BadChunk;
+        if (paired) return prompt_pair.prefill(e, part, start, len, cancel, marks, split);
         if (part.len != @min(len - start, rows + 1)) return error.BadChunk;
         if (rows > fw.prefill_rows and !prompt_solo.allowed(e, start, rows)) return error.BadChunk;
         var one: [1]fw.Rank = undefined;

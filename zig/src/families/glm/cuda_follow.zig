@@ -271,7 +271,8 @@ pub const Leader = struct {
         try x.flush();
         const starts = x.e.cur.cuts.items;
         const capped = x.e.c.dsa and (max_rows != 0 or !prompt_cuts.coldCut(ids.len, starts, start)); // or a capped pass's rest
-        const wide = !capped and alone and (prompt_solo.at(x.e, start, ids.len, from, marks) or prompt_pair.pairedAt(x.e, start, ids.len, from, marks));
+        // a pair first: with TF_GLM_PROMPT_PAIR=solo it takes two solo chunks, else a solo chunk, else to the next cut
+        const wide: usize = if (capped or !alone) 0 else if (prompt_pair.pairedAt(x.e, start, ids.len, from, marks)) 2 * x.e.pair.?.rows else if (prompt_solo.at(x.e, start, ids.len, from, marks)) x.e.bp.rows else 0;
         const n = if (capped) prompt_cuts.cappedEnd(ids.len, starts, start, max_rows) - start else prompt_cuts.leaderRows(ids.len, starts, start, wide);
         const cap: u32 = if (capped) @intCast(n) else 0;
         const part = ids[start..@min(ids.len, start + n + 1)];

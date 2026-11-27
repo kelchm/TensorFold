@@ -40,6 +40,11 @@ pub const Marks = struct {
 const ranks = @import("cuda_ranks.zig");
 const images_mod = @import("cuda_images.zig");
 
+/// Shared decode verify window capacity (rows across concurrent streams).
+pub const shared_rows = 32;
+
+pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
+
 pub const Options = struct {
     capacity: usize, // tokens a sequence holds
     mtp: bool, // load the MTP head (drafts)
@@ -49,4 +54,5 @@ pub const Options = struct {
     drafter_dir: ?[]const u8 = null, // --drafter's folder: its digest enters rank agreement before weights load
     drafter_bits: u8 = 0, // --drafter-bits (4 or 0 when drafter is enabled): ranks agree on draft precision
     owner: ?*cuda.tp_group.Group = null, // the communicator's owner, which the backend aborts (null: the caller's own)
+    room: ?Room = null, // remaining allocation budget, including the OS reserve and process limit
 };

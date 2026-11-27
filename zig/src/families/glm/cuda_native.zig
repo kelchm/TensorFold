@@ -39,7 +39,7 @@ pub const snap_tail = "TF_GLM_PROMPT_TAIL";
 pub const explains_open = true;
 
 /// The server's reading of this rank's room after its load (the budget streams are admitted by); null if unreadable.
-pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
+pub const Room = @import("cuda_engine_types.zig").Room;
 /// `slide` stays false: the server refuses --slide for a family without a learner (no `slide` here).
 pub const Options = struct {
     context: usize,
@@ -263,7 +263,7 @@ fn openRank(a: StartArgs, set: ranks.Settings) !Loaded {
     cuda.p2p_report.afterInit(&diag, .{ .lib = &own.group.lib, .comm = comm, .d = ctx.d, .later = true });
     const cap = capacity(o.context);
     own.progress.enter(.weights);
-    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.group.lib, own.group.comm, p.rank, p.world, .{ .capacity = cap, .mtp = o.drafts, .settings = set, .vision = o.vision, .drafter = o.drafter != null, .drafter_dir = o.drafter, .drafter_bits = if (o.drafter != null) o.drafter_bits else 0, .owner = &own.group });
+    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.group.lib, own.group.comm, p.rank, p.world, .{ .capacity = cap, .mtp = o.drafts, .settings = set, .vision = o.vision, .drafter = o.drafter != null, .drafter_dir = o.drafter, .drafter_bits = if (o.drafter != null) o.drafter_bits else 0, .owner = &own.group, .room = o.room });
     errdefer own.e.deinit();
     if (o.vision) |lim| { // before the rooms: the tower's bytes count against rank 0's
         var problem: []const u8 = "";
@@ -497,6 +497,7 @@ fn release(own: *Owned) void {
 /// The server's words for this family's refusals.
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
+        error.GlmSoloMemory => "TF_GLM_CHUNK_SOLO=8192, or 4096 with TF_GLM_PROMPT_PAIR=solo, does not fit the startup memory budget; use 4096 unpaired or 2048, or reduce --context / --parallel",
         error.BadRoceCap => "TF_ROCE_MAX_KB: give an integer from 1 through 4194303 KiB, or unset it for 4096 KiB",
         error.NoRank => "GLM-5.3-Flash runs at TP over hosts: launch every host with --tp and a --rank below it (--tp 1: one GPU, with TF_GLM_LAYERS for a thin model)",
         error.NoCommId => "GLM-5.3-Flash's ranks meet over NCCL: above one rank, give --master (rank 0's address) or set NCCL_COMM_ID to rank 0's address:port on every host",

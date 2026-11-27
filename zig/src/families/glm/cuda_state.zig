@@ -26,8 +26,12 @@ pub const prompt_heads = 16;
 pub const dense_reach = 2560;
 /// Index-key and gate rows a DSA cache holds (a ring): pool_keys reads only from the current pool's first row on.
 pub const index_ring = 2 * prefill_rows;
-/// A solo prompt pass's rows (TF_GLM_CHUNK_SOLO): a whole ring, which a rebase at a grid point leaves it.
-pub const solo_rows = index_ring;
+/// The widest solo prompt pass (TF_GLM_CHUNK_SOLO); buffers and rings grow only when selected.
+pub const solo_rows = 4 * prefill_rows;
+
+pub fn ringRows(capacity: usize, solo: usize) usize {
+    return @min(capacity, @max(index_ring, solo));
+}
 
 /// Sub-allocations of one device allocation, 256-byte aligned like the driver's own.
 const Arena = struct {
@@ -98,7 +102,7 @@ fn onPages(x: *dsa_block.Caches, s: Shape, p: Paged, table: u64, j: usize) void 
 }
 
 /// A State's fields in order; on pages (a table of `table` entries) no latent or pooled rows, and the table last.
-fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, kv8: bool, table: ?usize, head: bool) ![]usize {
+fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, kv8: bool, table: ?usize, head: bool, solo: usize) ![]usize {
     const c = &w.config;
     const s = &w.share;
     const nd = mlaLayers(w);
@@ -106,14 +110,14 @@ fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize
     const n = s.kda.len() * c.kda_dim;
     const kw = @import("cuda_kda_block.zig").rowWidth(s.kda.len()); // TF_GLM_KDA_PAD
     const pk_rows = capacity / c.kpool + 2;
-    const ring_rows = @min(capacity, shapeOf(w).keys);
+    const shape = shapeOf(w);
+    const ring_rows = @min(capacity, @max(shape.keys, solo));
     const rows: usize = @intFromBool(table == null); // on pages a cache's rows are the pool's
     var sizes: std.ArrayList(usize) = .empty;
     errdefer sizes.deinit(gpa);
     try sizes.appendSlice(gpa, &.{ 4, nk * 3 * 3 * n * 2, 2 * nk * s.kda.len() * kda.dk * kda.dv * 4, nk * window_rows * kw * 2 });
     try sizes.appendSlice(gpa, &.{ nk * window_rows * n * 4, nk * window_rows * n * 2, nk * window_rows * n * 4, nk * window_rows * s.kda.len() * 4 });
     const lc_bytes = try latent.cacheBytes(capacity, c.latentRow(), kv8);
-    const shape = shapeOf(w);
     for (0..nd + 1) |j| { // a shared layer's cache: its latent rows alone
         const keep: usize = @intFromBool(j < nd or head);
         const k: usize = keep * @intFromBool(shape.pooled(j));
@@ -125,7 +129,7 @@ fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize
 }
 
 /// A rank's B16 matmul shapes ([n, k]) whose split-K partials the buffers hold.
-fn b16Shapes(w: *const weights.Weights) [12][2]usize {
+pub fn b16Shapes(w: *const weights.Weights) [12][2]usize {
     const c = &w.config;
     const s = &w.share;
     const n = s.kda.len() * c.kda_dim;
@@ -142,44 +146,10 @@ fn b16Shapes(w: *const weights.Weights) [12][2]usize {
     };
 }
 
-test "GLM TP3: existing scratch covers raw projections through the 127-row split-K boundary" {
-    const c = @import("config.zig").Config{};
-    const Share = @import("cuda_shard.zig").Share;
-    for (0..3) |rank| {
-        const w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = try Share.of(&c, rank, 3) };
-        const shapes = b16Shapes(&w);
-        for ([_]usize{ 1, 17, 64, 65, 127, 128, 2066 }) |rows| {
-            var planned: usize = 4;
-            for (shapes) |shape| planned = @max(planned, b16.partBytes(@min(rows, b16.rows_from - 1), shape[0], shape[1]));
-            for (shapes[0..2]) |shape| try std.testing.expect(b16.partBytes(rows, shape[0], shape[1]) <= planned);
-        }
-    }
-}
-
 /// selectTokens' `ls` bytes in a Buffers and its decode select's rows of bit words (0 on a prompt's buffers).
-fn selectLs(rows: usize, prefill: bool, seg: usize, np_max: usize) struct { bytes: usize, bits_rows: usize } {
+pub fn selectLs(rows: usize, prefill: bool, seg: usize, np_max: usize) struct { bytes: usize, bits_rows: usize } {
     const bits_rows: usize = if (prefill) 0 else @min(seg, sparse.wide_rows);
     return .{ .bytes = @max(rows * sparse.select_list * 4, sparse.bitsBytes(bits_rows, np_max)), .bits_rows = bits_rows };
-}
-
-test "GLM buffers: a decode's ls holds its select's bit words for bits_rows rows, and a prompt's holds none" {
-    for ([_]usize{ 4096, 1048576 }) |capacity| {
-        const np_max = capacity / sparse.pool;
-        for ([_]usize{ 1, 8, 16, 48, 49, 64 }) |seg| {
-            for ([_]usize{ seg, prefill_rows }) |rows| {
-                const d = selectLs(rows, false, seg, np_max);
-                try std.testing.expectEqual(@as(usize, @min(seg, sparse.wide_rows)), d.bits_rows);
-                try std.testing.expect(d.bytes >= sparse.bitsBytes(d.bits_rows, np_max));
-                try std.testing.expect(d.bytes >= rows * sparse.select_list * 4);
-                try std.testing.expectEqual(@as(usize, 0), selectLs(rows, true, seg, np_max).bits_rows);
-            }
-        }
-    }
-}
-
-test "GLM buffers: a paired chunk keeps its own token lists, which its shared indexer layers read sites later" {
-    for (Buffers.twin_lists) |i| try std.testing.expect(Buffers.twinHolds(i, false, true) and !Buffers.twinHolds(i, false, false));
-    try std.testing.expect(!Buffers.twinHolds(39, false, true)); // the select's position: used within the indexed layer's own site
 }
 
 /// Scratch for windows of up to `rows` rows (the Python family's Buffers): a prompt buffer (`prefill`) or a decode's.
@@ -235,13 +205,32 @@ pub const Buffers = struct {
     /// The fields a twin holds apart, by their index in make's sizes (make reads the fields from these indexes too).
     const twin_at = .{ .ids = 0, .x = 1, .normed = 2, .xs = 3, .post = 4, .comb = 5, .hcpart = 6, .gathered = 7, .hidden = 62, .fnormed = 63, .fxs = 64, .logits = 65, .part = 70 };
     /// The DSA token lists and counts (dsa.tokens, dsa.counts): a shared indexer layer reads its chunk's sites later.
-    const twin_lists = [_]usize{ 40, 41 };
+    pub const twin_lists = [_]usize{ 40, 41 };
     /// make's size count when twin_at's indexes were last checked: adding or removing a size fails the build.
     const twin_checked = 77;
 
     /// Whether a twin holds size `i` apart: the regular and joint ones; with `lists` (full GLM-5.3) the token lists.
-    fn twinHolds(i: usize, joint: bool, lists: bool) bool {
+    pub fn twinHolds(i: usize, joint: bool, lists: bool) bool {
         return pair_layout.twinHolds(twin_at, i, joint) or lists and std.mem.indexOfScalar(usize, &twin_lists, i) != null;
+    }
+
+    /// Exact arena bytes before allocation, with the same rounding as `arena`.
+    pub fn bytes(w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize) usize {
+        return bytesOf(w, rows, prefill, capacity, seg, prefill, false);
+    }
+
+    /// Exact arena bytes for any `own_proj` and `joint` expert layout (`initShared`, `initPairExperts`).
+    pub fn bytesOf(w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize, own_proj: bool, joint: bool) usize {
+        var total: usize = 0;
+        for (sizesFor(w, rows, prefill, capacity, seg, own_proj, joint)) |n| total += std.mem.alignForward(usize, n, 256);
+        return @max(total, 256);
+    }
+
+    /// A twin's allocation (initTwin of `rows`-row prompt buffers): only the fields it holds apart.
+    pub fn twinBytes(w: *const weights.Weights, rows: usize, capacity: usize, joint: bool) usize {
+        var total: usize = 0;
+        for (sizesFor(w, rows, true, capacity, rows, true, joint), 0..) |n, i| total += if (twinHolds(i, joint, w.config.dsa)) std.mem.alignForward(usize, n, 256) else 0;
+        return @max(total, 256);
     }
 
     /// Chunk partials nch x rows: dense calls only on unroped prompts (sparse merges in-kernel), both on decode/roped.
@@ -254,82 +243,14 @@ pub const Buffers = struct {
     /// `seg`: a stream's most attention rows; `own_proj`: its KDA projection rows are here, not in the state.
     fn make(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize, own_proj: bool, twin: ?*const Buffers, joint: bool) !Buffers {
         const c = &w.config;
-        const s = &w.share;
-        const D: usize = c.hidden;
-        const S: usize = c.hc;
-        const LL = s.kda.len();
-        const HL = s.mla.len();
-        const n = LL * c.kda_dim;
-        const kw = @import("cuda_kda_block.zig").rowWidth(LL); // TF_GLM_KDA_PAD
-        const mw = s.dense.len();
-        const ew = s.moeMost(c);
-        const sh = s.shared.len();
-        const slots: usize = c.topk + 1;
-        const pairs = rows * slots;
-        const plan_pairs = if (joint) 2 * pairs else pairs;
-        const count: usize = c.experts;
-        const lw: usize = c.kv_lora;
-        const row: usize = c.latentRow(); // the latent, then its roped key columns
-        const qh: usize = c.nope + c.rope; // a q head
+        const sizes = sizesFor(w, rows, prefill, capacity, seg, own_proj, joint);
         const part_rows = if (prefill) @min(rows, dsa_block.prompt_att_rows) else seg;
         const nch = latent.chunksFor(@min(capacity, dense_reach) + seg);
-        const width: usize = c.keyWidth(); // a token list (sparse.Geometry.width)
-        const partial_rows = partialRows(rows, prefill, capacity, seg, width, c.rope != 0);
-        const np_max = capacity / c.kpool;
-        const sel = selectLs(rows, prefill, seg, np_max);
-        var mm: usize = 4;
-        // windows under rows_from rows keep their K slices apart (a prompt's tail chunk on the prefill buffers too)
-        for (b16Shapes(w)) |sh_| mm = @max(mm, b16.partBytes(@min(rows, b16.rows_from - 1), sh_[0], sh_[1]));
-        // EXL3 experts: each layer's path (the prompt kernels', or the grouped one) sizes it
-        var x3: [4]usize = @splat(4);
-        for (w.layers) |l| if (l.ffn == .moe) if (l.ffn.moe.exl3) |x| exl3.mostScratch(&x3, rows, D, ew, prefill, x);
-        if (w.mtp) |m| if (m.layer.ffn == .moe) if (m.layer.ffn.moe.exl3) |x| exl3.mostScratch(&x3, rows, D, ew, prefill, x);
-        var split = false; // a KDA stack in two parts moves each part's rows through one more buffer
-        for (w.layers) |l| split = split or (l.mixer == .kda and (l.mixer.kda.proj == .split or l.mixer.kda.proj == .tfq3_split));
-        const hist_len = if (plan_pairs > cuda.grouped.small) (plan_pairs + cuda.grouped.small - 1) / cuda.grouped.small * (count + 1) else 1;
-        const sizes: [twin_checked]usize = .{
-            rows * 4,     rows * S * D * 2, rows * D * 2,           rows * (D / 64) * 4,
-            rows * S * 4, rows * S * S * 4, glue.hcPartBytes(rows), s.world * rows * D * 4,
-            if (own_proj) rows * kw * 2 else 4, rows * n * 2, rows * n * 2, // kproj, ka, kg
-            rows * n * 2, rows * n * 4, rows * n * 2, rows * n * 4, // saves out, k, v, g
-            rows * LL * 4,                    rows * n * 4,               rows * n * 2, // saves b, wide q, y
-            rows * (c.q_lora + row) * 2,      rows * c.q_lora * 2,        rows * (c.q_lora / 64) * 4,
-            rows * row * 2,                   rows * (lw / 64) * 4,       rows * HL * qh * 2,
-            rows * (c.i_dim + c.i_heads) * 2, rows * c.i_dim * 4,         glue.router_ks * rows * @max(count, c.i_dim) * 4,
-            rows * HL * row * 2,              rows * HL * lw * 2,         rows * HL * c.v_dim * 2,
-            rows * c.i_heads * c.i_dim * 2,   partial_rows * HL * lw * 4, partial_rows * HL * 4,
-            partial_rows * HL * 4,
-            4, // dummy
-            @min(seg, sparse.select_rows) * np_max * 4,
-            sel.bytes, // ls: the list rows, and on a decode's buffers its select's bit words
-            rows * sparse.select_list * 4,
-            (if (prefill) rows + s.world else rows) * (c.i_topk / c.kpool) * 8, // pools; a split's equal blocks end at most world - 1 rows past them
-            4,
-            rows * width * 4,
-            rows * 4,
-            mm,
-            4, // a prompt block's position
-            rows * mw * 2,
-            rows * 2 * mw * 2,
-            rows * mw * 2,
-            rows * (mw / 64) * 4,
-            rows * count * 4, plan_pairs * 4, pairs * 4, plan_pairs * 4, // mlog, pick, wts, members
-            experts.maxItems(pairs, count + 1, experts.tile) * 3 * 4, // items (one chunk's decode bound covers the joint 128-pair plan)
-            8,              @max(1, plan_pairs) * 4, hist_len * 4, // counts, rank, hist
-            pairs * ew * 2, pairs * D * 4,           rows * 2 * sh * 2,
-            rows * sh * 2,
-            rows * (sh / 64) * 4, rows * D * 4, // sxs, sy
-            rows * D * 2,         rows * D * 2,
-            rows * (D / 64) * 4,  (if (prefill) prompt_heads else rows) * s.vocab.len() * 2,
-            rows * D * 2, rows * D * 2, rows * 2 * D * 2, rows * D * 2, // hin, me, mcat, mx
-            rows * D * 4, // part: this rank's fp32 partial rows a split exchange sends from
-            x3[0], x3[1], x3[2], x3[3], // EXL3 experts: prompt rotations and activations, or compact decode picks and partials
-            if (split) rows * @max(3 * n, kw - 3 * n) * 2 else 4, // a split KDA stack's part rows
-            if (prefill) 4 else @max(4, moe.sidePart(@min(rows, b16.rows_from - 1), sh, D)), // the side shared expert's slices
-        };
+        const partial_rows = partialRows(rows, prefill, capacity, seg, c.keyWidth(), c.rope != 0);
+        const sel = selectLs(rows, prefill, seg, capacity / c.kpool);
         var held = sizes;
-        if (twin != null) for (&held, 0..) |*bytes, i| { // a twin allocates its own rows only
-            if (!twinHolds(i, joint, c.dsa)) bytes.* = 0;
+        if (twin != null) for (&held, 0..) |*n, i| { // a twin allocates its own rows only
+            if (!twinHolds(i, joint, c.dsa)) n.* = 0;
         };
         var p: [sizes.len]u64 = undefined;
         const a = try arena(d, &held, &p);
@@ -381,6 +302,81 @@ pub const Buffers = struct {
             return t;
         }
         return out;
+    }
+
+    fn sizesFor(w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize, own_proj: bool, joint: bool) [twin_checked]usize {
+        const c = &w.config;
+        const s = &w.share;
+        const D: usize = c.hidden;
+        const S: usize = c.hc;
+        const LL = s.kda.len();
+        const HL = s.mla.len();
+        const n = LL * c.kda_dim;
+        const kw = @import("cuda_kda_block.zig").rowWidth(LL); // TF_GLM_KDA_PAD
+        const mw = s.dense.len();
+        const ew = s.moeMost(c);
+        const sh = s.shared.len();
+        const slots: usize = c.topk + 1;
+        const pairs = rows * slots;
+        const plan_pairs = if (joint) 2 * pairs else pairs;
+        const count: usize = c.experts;
+        const lw: usize = c.kv_lora;
+        const row: usize = c.latentRow(); // the latent, then its roped key columns
+        const qh: usize = c.nope + c.rope; // a q head
+        const width: usize = c.keyWidth(); // a token list (sparse.Geometry.width)
+        const partial_rows = partialRows(rows, prefill, capacity, seg, width, c.rope != 0);
+        const np_max = capacity / c.kpool;
+        const sel = selectLs(rows, prefill, seg, np_max);
+        var mm: usize = 4;
+        // windows under rows_from rows keep their K slices apart (a prompt's tail chunk on the prefill buffers too)
+        for (b16Shapes(w)) |sh_| mm = @max(mm, b16.partBytes(@min(rows, b16.rows_from - 1), sh_[0], sh_[1]));
+        // EXL3 experts: each layer's path (the prompt kernels', or the grouped one) sizes it
+        var x3: [4]usize = @splat(4);
+        for (w.layers) |l| if (l.ffn == .moe) if (l.ffn.moe.exl3) |x| exl3.mostScratch(&x3, rows, D, ew, prefill, x);
+        if (w.mtp) |m| if (m.layer.ffn == .moe) if (m.layer.ffn.moe.exl3) |x| exl3.mostScratch(&x3, rows, D, ew, prefill, x);
+        var split = false; // a KDA stack in two parts moves each part's rows through one more buffer
+        for (w.layers) |l| split = split or (l.mixer == .kda and (l.mixer.kda.proj == .split or l.mixer.kda.proj == .tfq3_split));
+        const hist_len = if (plan_pairs > cuda.grouped.small) (plan_pairs + cuda.grouped.small - 1) / cuda.grouped.small * (count + 1) else 1;
+        return .{
+            rows * 4,     rows * S * D * 2, rows * D * 2,           rows * (D / 64) * 4,
+            rows * S * 4, rows * S * S * 4, glue.hcPartBytes(rows), s.world * rows * D * 4,
+            if (own_proj) rows * kw * 2 else 4, rows * n * 2, rows * n * 2, // kproj, ka, kg
+            rows * n * 2, rows * n * 4, rows * n * 2, rows * n * 4, // saves out, k, v, g
+            rows * LL * 4,                    rows * n * 4,               rows * n * 2, // saves b, wide q, y
+            rows * (c.q_lora + row) * 2,      rows * c.q_lora * 2,        rows * (c.q_lora / 64) * 4,
+            rows * row * 2,                   rows * (lw / 64) * 4,       rows * HL * qh * 2,
+            rows * (c.i_dim + c.i_heads) * 2, rows * c.i_dim * 4,         glue.router_ks * rows * @max(count, c.i_dim) * 4,
+            rows * HL * row * 2,              rows * HL * lw * 2,         rows * HL * c.v_dim * 2,
+            rows * c.i_heads * c.i_dim * 2,   partial_rows * HL * lw * 4, partial_rows * HL * 4,
+            partial_rows * HL * 4,
+            4, // dummy
+            @min(seg, sparse.select_rows) * np_max * 4,
+            sel.bytes, // ls: the list rows, and on a decode's buffers its select's bit words
+            rows * sparse.select_list * 4,
+            (if (prefill) rows + s.world else rows) * (c.i_topk / c.kpool) * 8, // pools; a split's equal blocks end at most world - 1 rows past them
+            4,
+            rows * width * 4,
+            rows * 4,
+            mm,
+            4, // a prompt block's position
+            rows * mw * 2,
+            rows * 2 * mw * 2,
+            rows * mw * 2,
+            rows * (mw / 64) * 4,
+            rows * count * 4, plan_pairs * 4, pairs * 4, plan_pairs * 4, // mlog, pick, wts, members
+            experts.maxItems(pairs, count + 1, experts.tile) * 3 * 4, // items (one chunk's decode bound covers the joint 128-pair plan)
+            8,              @max(1, plan_pairs) * 4, hist_len * 4, // counts, rank, hist
+            pairs * ew * 2, pairs * D * 4,           rows * 2 * sh * 2,
+            rows * sh * 2,
+            rows * (sh / 64) * 4, rows * D * 4, // sxs, sy
+            rows * D * 2,         rows * D * 2,
+            rows * (D / 64) * 4,  (if (prefill) prompt_heads else rows) * s.vocab.len() * 2,
+            rows * D * 2, rows * D * 2, rows * 2 * D * 2, rows * D * 2, // hin, me, mcat, mx
+            rows * D * 4, // part: this rank's fp32 partial rows a split exchange sends from
+            x3[0], x3[1], x3[2], x3[3], // EXL3 experts: prompt rotations and activations, or compact decode picks and partials
+            if (split) rows * @max(3 * n, kw - 3 * n) * 2 else 4, // a split KDA stack's part rows
+            if (prefill) 4 else @max(4, moe.sidePart(@min(rows, b16.rows_from - 1), sh, D)), // the side shared expert's slices
+        };
     }
 
     pub fn deinit(b: *Buffers) void {
@@ -435,29 +431,36 @@ pub const State = struct {
         return initWindowFormat(gpa, d, w, capacity, kv8, true);
     }
     pub fn initWindowFormat(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, kv8: bool, head: bool) !State {
-        return make(gpa, d, w, capacity, kv8, null, head);
+        return initSized(gpa, d, w, capacity, kv8, null, head, prefill_rows);
     }
     /// A sequence whose latent rows and pooled keys are pages of `p`; it holds no rows until a stream maps some.
     pub fn initPaged(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, p: Paged) !State {
-        return make(gpa, d, w, capacity, false, p, true);
+        return initSized(gpa, d, w, capacity, false, p, true, prefill_rows);
     }
     /// `initPaged` for a cache format (`kv8`) and optional target MTP head part (`head`).
     pub fn initPagedFormat(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, p: Paged, kv8: bool, head: bool) !State {
-        return make(gpa, d, w, capacity, kv8, p, head);
+        return initSized(gpa, d, w, capacity, kv8, p, head, prefill_rows);
     }
     /// Bytes a sequence on pages allocates at any length (its fixed part, as `arena` rounds it), a table of `pages`.
     pub fn pagedBytes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, pages: usize) !usize {
         return pagedBytesOf(gpa, w, capacity, pages, true);
     }
     pub fn pagedBytesOf(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, pages: usize, head: bool) !usize {
-        const sizes = try stateSizes(gpa, w, capacity, false, pages, head);
+        return pagedBytesFor(gpa, w, capacity, pages, head, prefill_rows);
+    }
+    pub fn pagedBytesFor(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, pages: usize, head: bool, solo: usize) !usize {
+        return bytesFor(gpa, w, capacity, false, pages, head, solo);
+    }
+    /// Exact arena bytes before allocation, for a window or a paged sequence at the selected ring width.
+    pub fn bytesFor(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, kv8: bool, pages: ?usize, head: bool, solo: usize) !usize {
+        const sizes = try stateSizes(gpa, w, capacity, kv8, pages, head, solo);
         defer gpa.free(sizes);
         var total: usize = 0;
         for (sizes) |n| total += std.mem.alignForward(usize, n, 256);
         return total;
     }
 
-    fn make(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, kv8: bool, paged: ?Paged, head: bool) !State {
+    pub fn initSized(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, kv8: bool, paged: ?Paged, head: bool, solo: usize) !State {
         const c = &w.config;
         const s = &w.share;
         const nk = w.layers.len - mlaLayers(w);
@@ -465,7 +468,7 @@ pub const State = struct {
         const n = s.kda.len() * c.kda_dim;
         const kw = @import("cuda_kda_block.zig").rowWidth(s.kda.len()); // TF_GLM_KDA_PAD
         const pk_rows = capacity / c.kpool + 2;
-        const sizes = try stateSizes(gpa, w, capacity, kv8, if (paged) |q| q.pages else null, head);
+        const sizes = try stateSizes(gpa, w, capacity, kv8, if (paged) |q| q.pages else null, head, solo);
         defer gpa.free(sizes);
         const p = try gpa.alloc(u64, sizes.len);
         defer gpa.free(p);
@@ -480,7 +483,7 @@ pub const State = struct {
         for (caches, 0..) |*x, j| x.* = .{ .lc = p[8 + 4 * j], .ls = if (kv8) p[8 + 4 * j] + capacity * c.latentRow() else 0, .ik = p[9 + 4 * j], .ig = p[10 + 4 * j], .pk = p[11 + 4 * j], .pk_rows = if (shape.pooled(j)) pk_rows else 0 };
         const rings = try gpa.alloc(u64, 2 * (nd + 1));
         for (0..nd + 1) |j| rings[2 * j ..][0..2].* = .{ p[9 + 4 * j], p[10 + 4 * j] };
-        const ring_rows = @min(capacity, shapeOf(w).keys);
+        const ring_rows = @min(capacity, @max(shape.keys, solo));
         var st: State = .{ .pool = c.kpool, .ring_rows = ring_rows, .ring_row = c.i_dim * 2, .rings = rings, .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ls = if (kv8 and head) p[8 + 4 * nd] + capacity * c.latentRow() else 0, .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = if (head) pk_rows else 0 }, .mtp_pos_dev = p[12 + 4 * nd], .prompt_hidden = p[13 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw, .kv8 = kv8, .head = head };
         if (paged) |q| {
             st.table = p[14 + 4 * nd];
@@ -542,14 +545,18 @@ pub const State = struct {
 
     /// Before a pass of `rows` rows at pos: within capacity, and the index rings holding them (rebased if not).
     pub fn ready(st: *State, stream: cuda.Stream, rows: usize) !void {
+        if (rows > st.ring_rows) return error.IndexRingTooSmall;
         if (st.pos + rows > st.capacity) return error.PastCapacity;
         if (st.pos + rows > st.base + st.ring_rows) try st.rebase(stream, false);
+        if (st.pos + rows > st.base + st.ring_rows) return error.IndexRingTooSmall;
     }
 
     /// Before the MTP head's pass of `n` rows at mtp_len, likewise for its caches.
     pub fn readyMtp(st: *State, stream: cuda.Stream, n: usize) !void {
+        if (n > st.ring_rows) return error.IndexRingTooSmall;
         if (st.mtp_len + n > st.capacity) return error.PastCapacity;
         if (st.mtp_len + n > st.mtp_base + st.ring_rows) try st.rebase(stream, true);
+        if (st.mtp_len + n > st.mtp_base + st.ring_rows) return error.IndexRingTooSmall;
     }
 
     /// Rebase at the earliest pool a rollback may revisit; MTP retains a whole verify window before its cursor.

@@ -16,7 +16,7 @@ pub fn tableLen(capacity: usize) usize {
 
 /// What a stream of engine `e` holds: fixed part, table (`extra`) and token bytes on pages (bf16 or E4M3).
 pub fn layout(gpa: std.mem.Allocator, e: *const Engine, extra: u64) !kv.Layout {
-    const fixed = try state.State.pagedBytesOf(gpa, &e.w, e.capacity, tableLen(e.capacity), e.mtp);
+    const fixed = try state.State.pagedBytesFor(gpa, &e.w, e.capacity, tableLen(e.capacity), e.mtp, e.settings.ringWidth());
     // TF_GLM_KV_HOST: a page costs the device only its pooled keys (the pages themselves are in host memory)
     const page = if (kv_host.onHost()) state.pkPageBytesOf(&e.w, e.mtp) else pageBytes(e);
     if (page == 0) return error.NoPagedCaches;
@@ -30,7 +30,7 @@ pub fn pageBytes(e: *const Engine) u64 {
 
 /// A paged sequence of engine `e`'s format on the pages at `at`.
 fn pagedState(e: *const Engine, at: state.Paged) !fw.State {
-    return fw.State.initPagedFormat(e.gpa, e.d, &e.w, e.capacity, at, e.settings.kv8, e.mtp);
+    return fw.State.initSized(e.gpa, e.d, &e.w, e.capacity, e.settings.kv8, at, e.mtp, e.settings.ringWidth());
 }
 
 /// TF_KV_SHARE: a kept state's slot (`e.share_pages`: its prefix's pages left to the store), at the window's last mark.

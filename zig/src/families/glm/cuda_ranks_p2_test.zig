@@ -54,7 +54,7 @@ test "wire pieces: a blank override is unset; the tools' form takes its world fr
             return at(key, null, null);
         }
     };
-    var s: Settings = .{ .solo = true, .roce_multi = true, .pieces = 3 };
+    var s: Settings = .{ .solo = 4096, .roce_multi = true, .pieces = 3 };
     ranks.wirePieces(&s, 3, Reader.blank);
     try std.testing.expectEqual(@as(u32, 8), s.pieces);
     s.pieces = 3;
@@ -378,4 +378,38 @@ test "startup switches: TF_GLM_SHARED_KDA_WIDE inherits TF_GLM_KDA_DECODE_WIDE, 
         Fingerprint.of(2, 0, def, 8192, true, h, h, h),
         Fingerprint.of(2, 1, shared_off, 8192, true, h, h, h),
     }).?);
+}
+
+test "TF_GLM_PROMPT_PAIR=solo pairs TF_GLM_CHUNK_SOLO=4096 passes only, rings of both, and every rank must agree" {
+    const Reader = struct {
+        var solo: ?[]const u8 = null;
+        var pair: ?[]const u8 = "solo";
+        fn get(key: [:0]const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "TF_GLM_CHUNK_SOLO")) return solo;
+            return if (std.mem.eql(u8, key, "TF_GLM_PROMPT_PAIR")) pair else null;
+        }
+    };
+    var problem: []const u8 = "";
+    for ([_]?[]const u8{ null, "2048", "8192" }) |width| {
+        Reader.solo = width;
+        try std.testing.expectError(error.BadSetting, Settings.read(Reader.get, &problem));
+        try std.testing.expectEqualStrings("TF_GLM_PROMPT_PAIR=solo requires TF_GLM_CHUNK_SOLO=4096", problem);
+    }
+    Reader.solo = "4096";
+    const on = try Settings.read(Reader.get, &problem);
+    try std.testing.expect(on.pair and on.pair_solo);
+    try std.testing.expectEqual(@as(usize, 8192), on.ringWidth());
+    Reader.pair = "1";
+    const unpaired = try Settings.read(Reader.get, &problem);
+    try std.testing.expect(unpaired.pair and !unpaired.pair_solo);
+    try std.testing.expectEqual(@as(usize, 4096), unpaired.ringWidth());
+    try std.testing.expectEqual(@as(usize, 2048), (Settings{}).ringWidth());
+    var all = [_]Fingerprint{ Fingerprint.of(2, 0, on, 8192, true, @splat(0), @splat(0), @splat(0)), Fingerprint.of(2, 1, on, 8192, true, @splat(0), @splat(0), @splat(0)) };
+    try std.testing.expectEqual(@as(?Mismatch, null), mismatch(&all));
+    try std.testing.expectEqual(@as(u32, 5), all[0].pair); // bit 0 pair | bit 2 pair_solo (bit 1 reserved for pair_dflash)
+    var with_dflash = on;
+    with_dflash.pair_dflash = true;
+    try std.testing.expectEqual(@as(u32, 7), Fingerprint.of(2, 0, with_dflash, 8192, true, @splat(0), @splat(0), @splat(0)).pair);
+    all[1] = Fingerprint.of(2, 1, unpaired, 8192, true, @splat(0), @splat(0), @splat(0));
+    try std.testing.expectEqual(Mismatch{ .field = .pair, .rank = 1 }, mismatch(&all).?);
 }

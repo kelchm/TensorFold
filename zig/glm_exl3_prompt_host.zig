@@ -109,21 +109,22 @@ fn run(rows: usize, prompt: bool, shared: bool, count: usize) !void {
 }
 
 test "GLM EXL3 prompt: a whole pass makes one expert call and no 2D copies" {
-    for ([_]bool{ false, true }) |shared| for ([_]usize{ 2048, 1, 17, 1024, 4096, 4102 }) |rows| {
+    const cap = glm.exl3.prompt_rows;
+    for ([_]bool{ false, true }) |shared| for ([_]usize{ 2048, 1, 17, 1024, 4096, cap, cap + 6 }) |rows| {
         try run(rows, true, shared, 288);
         try t.expectEqual(@as(usize, 0), Record.copies);
-        const calls = (rows + 4095) / 4096;
+        const calls = (rows + cap - 1) / cap;
         try t.expectEqual(calls, Record.up);
         try t.expectEqual(calls, Record.down);
         try t.expectEqual(calls, Record.routes);
         try t.expectEqual(@as(usize, 0), Record.decode);
         for (0..calls) |j| {
-            const n: usize = @min(rows - j * 4096, 4096);
+            const n: usize = @min(rows - j * cap, cap);
             try t.expectEqual(@as(i32, @intCast(n * 9)), Record.pairs[j]);
             try t.expectEqual(@as(i32, 289), Record.experts[j]);
             try t.expectEqual(@as(i32, if (shared) 9 else 1), Record.divisor[j]);
             try t.expectEqual(@as(i32, 288), Record.skip[j]);
-            try t.expectEqual(@as(u64, 0x400000000 + j * 4096 * 9 * 512 * 4), Record.outputs[j]);
+            try t.expectEqual(@as(u64, 0x400000000 + j * cap * 9 * 512 * 4), Record.outputs[j]);
         }
     };
 }
@@ -160,13 +161,14 @@ test "GLM EXL3 prompt: scratch names the rank width and rotation layout" {
     const D = 4096;
     const W_tp2 = 1024;
     const W_tp1 = 2048;
-    for ([_]usize{ 2048, 4096 }, 1..) |rows, scale| {
+    for ([_]usize{ 2048, 4096, 8192 }, [_]usize{ 1, 2, 4 }) |rows, scale| {
         try t.expectEqual(@as(usize, 52 * MiB * scale), glm.exl3.scratchBytes(rows, D, W_tp2, true, true)[0]);
         try t.expectEqual(@as(usize, 88 * MiB * scale), glm.exl3.scratchBytes(rows, D, W_tp1, true, true)[0]);
         try t.expectEqual(@as(usize, 324 * MiB * scale), glm.exl3.scratchBytes(rows, D, W_tp2, true, false)[0]);
         try t.expectEqual(@as(usize, 360 * MiB * scale), glm.exl3.scratchBytes(rows, D, W_tp1, true, false)[0]);
     }
-    try t.expectEqual(glm.exl3.scratchBytes(4096, D, W_tp2, true, true), glm.exl3.scratchBytes(4102, D, W_tp2, true, true));
+    const cap = glm.exl3.prompt_rows;
+    try t.expectEqual(glm.exl3.scratchBytes(cap, D, W_tp2, true, true), glm.exl3.scratchBytes(cap + 6, D, W_tp2, true, true));
     const l: cuda.exl3_experts.Layer = .{ .gate = 0, .up = 0, .down = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .experts = cuda.grouped.max_experts, .dims = D, .width = W_tp2, .codebook = .mcg };
     for ([_]usize{ 1, 4, 64, 1024, 1030 }) |rows| {
         const n: usize = @min(rows, 1024);

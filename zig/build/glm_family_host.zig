@@ -4,6 +4,9 @@ const std = @import("std");
 pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mods: anytype, step: *std.Build.Step) void {
     // GLM CUDA's startup watcher (named phases, a warning while NCCL init or a load blocks), from cuda.zig's room
     b.step("test-startup-watch-host", "Blocked startup phase warnings without a driver or communicator").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{"startup watcher:"} })).step);
+    const solo_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{ "a solo pass", "TF_GLM_CHUNK_SOLO", "TF_GLM_PROMPT_PAIR", "a pair", "TF_GLM_PAIR_DFLASH", "TF_GLM_REQUEST_STARTS", "GLM buffers:" } }));
+    b.step("test-glm-solo-host", "Solo widths, marks, ring agreement and startup memory refusals without devices").dependOn(&solo_run.step);
+    step.dependOn(&solo_run.step);
     const host = b.graph.host;
     @import("glm_wide_expert_host.zig").steps(b, cuda, glm, mods.core, step);
     @import("glm_priced_windows_host.zig").steps(b, cuda, glm, mods.lanes, step);

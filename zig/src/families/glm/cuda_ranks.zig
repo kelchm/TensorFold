@@ -19,9 +19,10 @@ pub const Settings = struct {
     shared_kda_wide: bool = true, // TF_GLM_SHARED_KDA_WIDE: shared verify KDA chains (unset: inherits kda_wide)
     kda_pad: bool = false, // TF_GLM_KDA_PAD: 1 (an uneven fused KDA input, padded at load, tiled for glm_mm) or 0
     pieces: u32 = 3, // TF_GLM_OVERLAP_PIECES: a prompt chunk's exchanges in this many row pieces (1: whole); unset, 8 under solo on the wire.
-    solo: bool = false, // TF_GLM_CHUNK_SOLO: 4096 (prompt buffers for two chunks a pass, while no stream decodes) or 2048
+    solo: u32 = 2048, // TF_GLM_CHUNK_SOLO: 2048, 4096 or 8192 rows while no other stream decodes
     keep_seqs: bool = false, // TF_GLM_KEEP_SEQS: 1 (a released slot keeps its sequence for its next request)
     pair: bool = true, // TF_GLM_PROMPT_PAIR: 1 (while no stream decodes, a prompt step takes two chunks, each one's exchanges under the other's sites) or 0
+    pair_solo: bool = false, // TF_GLM_PROMPT_PAIR=solo (with TF_GLM_CHUNK_SOLO=4096): a paired step's chunks are solo passes, the index rings both's width
     pair_dflash: bool = false, // TF_GLM_PAIR_DFLASH=1: opt into paired prompt steps beside DFlash2
     exl3_decode: bool = false, // TF_GLM_EXL3_DECODE=1: specialized uniform 4-bit TP2 routed experts for short verify windows
     exl3_nmajor: bool = false, // TF_GLM_EXL3_N_MAJOR=1: output-major CTA traversal at rows 4 and 8..32
@@ -116,15 +117,19 @@ pub const Settings = struct {
         }
         if (get("TF_ROCE")) |v| s.roce_wide = std.mem.eql(u8, v, "1");
         if (get("TF_GLM_CHUNK_SOLO")) |v| {
-            if (std.mem.eql(u8, v, "4096")) s.solo = true else if (std.mem.eql(u8, v, "2048")) s.solo = false else {
-                problem.* = "TF_GLM_CHUNK_SOLO: 2048 or 4096";
+            if (std.mem.eql(u8, v, "8192")) s.solo = 8192 else if (std.mem.eql(u8, v, "4096")) s.solo = 4096 else if (std.mem.eql(u8, v, "2048")) s.solo = 2048 else {
+                problem.* = "TF_GLM_CHUNK_SOLO: 2048, 4096 or 8192";
                 return error.BadSetting;
             }
         }
         s.l2pf = try l2pf.Options.read(get, problem);
         if (get("TF_GLM_PROMPT_PAIR")) |v| {
-            if (std.mem.eql(u8, v, "1")) s.pair = true else if (std.mem.eql(u8, v, "0")) s.pair = false else {
-                problem.* = "TF_GLM_PROMPT_PAIR: 0 or 1";
+            if (std.mem.eql(u8, v, "1")) s.pair = true else if (std.mem.eql(u8, v, "0")) s.pair = false else if (std.mem.eql(u8, v, "solo")) s.pair_solo = true else {
+                problem.* = "TF_GLM_PROMPT_PAIR: 0, 1 or solo";
+                return error.BadSetting;
+            }
+            if (s.pair_solo and s.solo != 4096) {
+                problem.* = "TF_GLM_PROMPT_PAIR=solo requires TF_GLM_CHUNK_SOLO=4096";
                 return error.BadSetting;
             }
         }
@@ -240,6 +245,11 @@ pub const Settings = struct {
         }
         return s;
     }
+
+    /// The index rings' width each sequence holds: a solo pass's, or with TF_GLM_PROMPT_PAIR=solo a paired step's two.
+    pub fn ringWidth(s: Settings) usize {
+        return if (s.pair_solo) 2 * @as(usize, s.solo) else s.solo;
+    }
 };
 
 /// The most ranks a world holds: rank 0's greedy pick gathers every rank's top-1 into one host array of this size.
@@ -258,7 +268,7 @@ pub fn ownRoce(s: Settings, world: usize) bool {
 /// TF_GLM_CHUNK_SOLO with TF_GLM_ROCE_MULTI at three ranks or more (the wire opens; TP=2 stays on NCCL): 8 pieces.
 pub fn wirePieces(s: *Settings, world: usize, comptime get: *const fn ([:0]const u8) ?[]const u8) void {
     const set = if (get("TF_GLM_OVERLAP_PIECES")) |v| std.mem.trim(u8, v, " \t\r\n").len > 0 else false; // blank: unset, as `read`
-    if (!set and s.solo and s.roce_multi and world >= 3) s.pieces = 8;
+    if (!set and s.solo > 2048 and s.roce_multi and world >= 3) s.pieces = 8;
 }
 
 /// The tools' form (tf-cuda-test): the world from TF_GLM_WORLD, their input as it always was, not their own arguments.
@@ -269,7 +279,7 @@ pub fn toolPieces(s: *Settings, comptime get: *const fn ([:0]const u8) ?[]const 
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 33, // 32, plus shared_kda_wide bit in kda_wide
+    layout: u32 = 34, // 33, plus solo as row width and pair_solo bit in pair
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -281,7 +291,7 @@ pub const Fingerprint = extern struct {
     kda_pad: u32 = 0, // TF_GLM_KDA_PAD: every rank's KDA input rows carry one width
     kv_live_half: u32 = 0, // TF_GLM_KV_LIVE_HALF: every rank keeps the live KDA half alone (1) or the head whole (0)
     pieces: u32,
-    pair: u32, // TF_GLM_PROMPT_PAIR: rank 0's paired steps need the second chunk's buffers on every rank
+    pair: u32, // TF_GLM_PROMPT_PAIR (bit 0: pair, bit 1: pair_dflash, bit 2: pair_solo)
     pair_experts: u32 = 0, // TF_GLM_PAIR_EXPERTS: every rank sizes the joint plan and twin scratch alike
     layers: u32, // TF_GLM_LAYERS (0: all)
     mtp: u32, // 1: the MTP head loads and runs (drafts on); 2: and DFlash2 (--drafter), whose rounds gather
@@ -294,7 +304,7 @@ pub const Fingerprint = extern struct {
     roce_wide: u32 = 0, // TF_ROCE=1: three ranks or more split the drafter MLP and gather by RoCE, or none does
     draft_split: u32 = 0, // TF_GLM_DRAFT_SPLIT=1: three ranks or more split the drafter MLP, or none does
     kv_host: u32 = 0, // TF_GLM_KV_HOST(_SHARED): every rank sizes the pool alike and maps the shared file, or none does
-    solo: u32 = 0, // TF_GLM_CHUNK_SOLO: rank 0's solo passes need the wider prompt buffers on every rank
+    solo: u32 = 2048, // TF_GLM_CHUNK_SOLO: rank 0's pass and ring width, agreed before loading
     keep_seqs: u32 = 0, // TF_GLM_KEEP_SEQS: every rank keeps a released slot's sequence alike
     l2pf: [4]u32 = @splat(0), // TF_GLM_L2PF's words: every rank prefetches alike, so none waits on a slower one's windows
     bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
@@ -373,7 +383,7 @@ pub const Fingerprint = extern struct {
             .kda_pad = @intFromBool(s.kda_pad),
             .kv_live_half = @intFromBool(s.kv_live_half),
             .pieces = s.pieces,
-            .pair = @as(u32, @intFromBool(s.pair)) | (@as(u32, @intFromBool(s.pair_dflash)) << 1),
+            .pair = @as(u32, @intFromBool(s.pair)) | (@as(u32, @intFromBool(s.pair_dflash)) << 1) | (@as(u32, @intFromBool(s.pair_solo)) << 2),
             .pair_experts = @as(u32, @intFromBool(s.pair_experts)) | (@as(u32, @intFromBool(s.exl3_decode)) << 1) | (@as(u32, @intFromBool(s.exl3_nmajor)) << 2),
             .layers = s.layers,
             .mtp = @as(u32, @intFromBool(mtp)) | (@as(u32, @intFromBool(s.dflash_only)) << 2) | (@as(u32, @intFromBool(s.dflash_q4_down)) << 3) | (@as(u32, @intFromBool(s.dflash_snap_context)) << 4),
@@ -383,7 +393,7 @@ pub const Fingerprint = extern struct {
             .draft_split = @intFromBool(s.draft_split and world >= 3), // two ranks split whatever it says
             .kv_host = s.kv_host,
             .kv_host_gib = s.kv_host_gib,
-            .solo = @intFromBool(s.solo),
+            .solo = s.solo,
             .keep_seqs = @intFromBool(s.keep_seqs),
             .l2pf = s.l2pf.words(),
             .bits = (@as(u32, @intFromBool(s.prompt_s2)) << 16) | (@as(u32, s.dense_bits) << 8) | s.head_bits,
@@ -497,7 +507,7 @@ pub fn agree(
 ) !void {
     try gather(Fingerprint, d, lib, comm, stream, mine.rank, mine, out);
     if (mismatch(out)) |m| {
-        std.debug.print("REFUSE rank settings: rank {d}'s {s} differs from rank 0's ({s})\n", .{ m.rank, @tagName(m.field), explain(m.field) });
+        std.debug.print("REFUSE rank settings: rank {d}'s {s} differs from rank 0's ({s})\n", .{ m.rank, @tagName(m.field), @import("cuda_ranks_explain.zig").explain(m.field) });
         return error.RankMismatch;
     }
 }
@@ -530,50 +540,6 @@ fn unreachablePeer(rank: usize, peer: usize) error{SplitUnreachable} {
     }
     std.debug.print("REFUSE TF_GLM_PREFILL_REDUCE=split: rank {d} cannot exchange with rank {d}; split sends every rank's rows to every other, and a fabric where some ranks reach only their neighbours (a ring of four without a switch) needs TF_GLM_PREFILL_REDUCE=ring or gather\n", .{ rank, peer });
     return error.SplitUnreachable;
-}
-
-fn explain(f: Fingerprint.Field) []const u8 {
-    return switch (f) {
-        .layout => "a different build of this check",
-        .rank => "a rank number given twice or out of order",
-        .world => "the ranks were started with different world sizes",
-        .keep_seqs => "TF_GLM_KEEP_SEQS",
-        .kv8 => "--kv-cache fp8",
-        .pages => "TF_KV_PAGES (unset or auto pages from two ranks)",
-        .prompt_fixed_k => "TF_GLM_PROMPT_K",
-        .tiled => "TF_GLM_MM, TF_GLM_DECODE_MLA_WIDE or TF_GLM_DECODE_TILE_RANGES",
-        .split => "TF_GLM_PREFILL_REDUCE",
-        .kda_wide => "TF_GLM_KDA_DECODE_WIDE or TF_GLM_SHARED_KDA_WIDE",
-        .kda_pad => "TF_GLM_KDA_PAD",
-        .kv_live_half => "TF_GLM_KV_LIVE_HALF",
-        .pieces => "TF_GLM_OVERLAP_PIECES",
-        .pair => "TF_GLM_PROMPT_PAIR or TF_GLM_PAIR_DFLASH",
-        .pair_experts => "TF_GLM_PAIR_EXPERTS / TF_GLM_EXL3_DECODE / TF_GLM_EXL3_N_MAJOR",
-        .layers => "TF_GLM_LAYERS",
-        .mtp => "--no-drafts, --drafter, TF_GLM_DFLASH_ONLY, TF_GLM_DFLASH_Q4_DOWN or TF_GLM_DFLASH_SNAP_CONTEXT differs across ranks",
-        .vision => "--vision (or its image tokens) given to some ranks and not others",
-        .video_tokens => "--vision-video-tokens",
-        .max_images => "the image count limit",
-        .max_videos => "the video count limit",
-        .max_frames => "the frame limit",
-        .roce_multi => "TF_GLM_ROCE_MULTI",
-        .roce_fuse => "TF_GLM_ROCE_FUSE",
-        .roce_wide => "TF_ROCE=1 at three ranks or more (the RoCE gather and the drafter split)",
-        .draft_split => "TF_GLM_DRAFT_SPLIT=1 at three ranks or more (the drafter split)",
-        .kv_host => "TF_GLM_KV_HOST or TF_GLM_KV_HOST_SHARED",
-        .kv_host_gib => "TF_GLM_KV_HOST_GIB",
-        .solo => "TF_GLM_CHUNK_SOLO",
-        .l2pf => "TF_GLM_L2PF, _SHARED_FIRST, _MB, _CTAS or _PACE_GBPS",
-        .bits => "TF_GLM_DENSE_BITS, TF_GLM_HEAD_BITS or TF_GLM_PACKED_PROMPT_S2",
-        .capacity => "the sequence capacity (the context)",
-        .drafter_bits => "--drafter-bits",
-        .heat_high => "TF_HEAT_HIGH",
-        .heat_low => "TF_HEAT_LOW",
-        .config => "config.json",
-        .program => "the executable",
-        .checkpoint => "checkpoint metadata or shard bytes",
-        .drafter_checkpoint => "--drafter checkpoint metadata or shard bytes",
-    };
 }
 
 pub fn mediaFingerprint(f: *Fingerprint, limits: @import("cuda_images.zig").Limits) void {

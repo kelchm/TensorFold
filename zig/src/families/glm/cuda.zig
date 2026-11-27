@@ -92,6 +92,8 @@ test {
     _ = @import("dflash_load.zig");
     _ = @import("dflash.zig");
     _ = prompt_solo;
+    _ = @import("cuda_solo_test.zig");
+    _ = @import("cuda_solo_memory.zig");
     _ = @import("cuda_l2pf.zig");
     _ = @import("cuda_verify_tiles.zig");
     _ = prompt_pair;

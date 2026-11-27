@@ -48,10 +48,9 @@ pub fn clearOfCuts(cuts: []const u32, start: usize, rows: usize) bool {
     return true;
 }
 
-/// Rank 0's step rows from `start` (Leader.chunk): a solo or paired step's if `wide`, else to the next cut.
-pub fn leaderRows(len: usize, cuts: []const u32, start: usize, wide: bool) usize {
-    comptime std.debug.assert(state.solo_rows == 2 * prefill_rows);
-    return if (wide) state.solo_rows else nextCut(len, cuts, start) - start;
+/// Rank 0's step rows from `start` (Leader.chunk): `wide_rows` if above 0, else to the next cut.
+pub fn leaderRows(len: usize, cuts: []const u32, start: usize, wide_rows: usize) usize {
+    return if (wide_rows > 0) wide_rows else nextCut(len, cuts, start) - start;
 }
 
 /// A sequence's request chunk starts (TF_GLM_REQUEST_STARTS) into `list`: ascending and after 0, else error.BadCuts.
@@ -62,10 +61,10 @@ pub fn set(gpa: std.mem.Allocator, list: *std.ArrayList(u32), cuts: []const u32)
 }
 
 /// A prompt step's rows from `start` with `part_len` ids: to the next cut, or a wide step when `part_len` holds more.
-pub fn stepRows(len: usize, cuts: []const u32, start: usize, part_len: usize) !usize {
+pub fn stepRows(len: usize, cuts: []const u32, start: usize, part_len: usize, wide_rows: usize) !usize {
     if (start >= len or !coldCut(len, cuts, start)) return error.BadChunk;
     if (part_len <= prefill_rows + 1) return nextCut(len, cuts, start) - start;
-    const rows = @min(len - start, state.solo_rows);
+    const rows = @min(len - start, wide_rows);
     if (!clearOfCuts(cuts, start, rows)) return error.BadChunk;
     return rows;
 }
@@ -141,13 +140,13 @@ test "glm request starts: a short chunk ends at a start inside the first grid st
 
 test "glm request starts: a step runs to the next cut, a solo step only without cuts, and only from a cold cut" {
     const m = prefill_rows;
-    try std.testing.expectEqual(@as(usize, m), try stepRows(3 * m, &.{}, 0, m + 1));
-    try std.testing.expectEqual(@as(usize, state.solo_rows), try stepRows(3 * m, &.{}, 0, state.solo_rows + 1));
-    try std.testing.expectEqual(@as(usize, 500), try stepRows(3 * m, &.{500}, 0, 501));
-    try std.testing.expectEqual(@as(usize, m), try stepRows(3 * m, &.{500}, 500, m + 1));
-    try std.testing.expectError(error.BadChunk, stepRows(3 * m, &.{500}, 0, state.solo_rows + 1));
-    try std.testing.expectError(error.BadChunk, stepRows(3 * m, &.{500}, m, m + 1)); // the old grid point, not a cut here
-    try std.testing.expectError(error.BadChunk, stepRows(3 * m, &.{}, 3 * m, 1));
+    try std.testing.expectEqual(@as(usize, m), try stepRows(3 * m, &.{}, 0, m + 1, 2 * m));
+    try std.testing.expectEqual(@as(usize, 2 * m), try stepRows(3 * m, &.{}, 0, 2 * m + 1, 2 * m));
+    try std.testing.expectEqual(@as(usize, 500), try stepRows(3 * m, &.{500}, 0, 501, 2 * m));
+    try std.testing.expectEqual(@as(usize, m), try stepRows(3 * m, &.{500}, 500, m + 1, 2 * m));
+    try std.testing.expectError(error.BadChunk, stepRows(3 * m, &.{500}, 0, 2 * m + 1, 2 * m));
+    try std.testing.expectError(error.BadChunk, stepRows(3 * m, &.{500}, m, m + 1, 2 * m)); // the old grid point, not a cut here
+    try std.testing.expectError(error.BadChunk, stepRows(3 * m, &.{}, 3 * m, 1, 2 * m));
 }
 
 test "glm request starts: starts 1 and 2 rows apart each end a chunk, and a step from each runs to the next" {
@@ -159,11 +158,11 @@ test "glm request starts: starts 1 and 2 rows apart each end a chunk, and a step
     for (ends) |end| {
         try std.testing.expectEqual(end, nextCut(len, &cuts, at));
         try std.testing.expect(coldCut(len, &cuts, at));
-        try std.testing.expectEqual(end - at, try stepRows(len, &cuts, at, end - at + 1));
+        try std.testing.expectEqual(end - at, try stepRows(len, &cuts, at, end - at + 1, 2 * m));
         at = end;
     }
     try std.testing.expect(!coldCut(len, &cuts, 1002));
-    try std.testing.expectError(error.BadChunk, stepRows(len, &cuts, 1002, 2));
+    try std.testing.expectError(error.BadChunk, stepRows(len, &cuts, 1002, 2, 2 * m));
 }
 
 /// The prompts and starts the tests here cut: the grid alone, starts off and on it, past the prompt, and close starts.
@@ -220,14 +219,16 @@ test "glm request starts: rank 0's step rows (Leader.chunk) are the rows each ot
         var steps: usize = 0;
         while (start < c.len) : (steps += 1) {
             const left = c.len - start;
-            const n = leaderRows(c.len, c.cuts, start, false);
-            try std.testing.expectEqual(@min(left, n), try stepRows(c.len, c.cuts, start, @min(left, n + 1)));
-            const w = leaderRows(c.len, c.cuts, start, true); // a solo or paired step: two grid steps left
-            if (start + prefill_rows + 1 < c.len) { // wide steps clear of cuts agree across ranks; crossing cuts refuse
-                const wide = stepRows(c.len, c.cuts, start, @min(left, w + 1));
-                if (!clearOfCuts(c.cuts, start, @min(left, w))) {
-                    try std.testing.expectError(error.BadChunk, wide);
-                } else try std.testing.expectEqual(@min(left, w), try wide);
+            const n = leaderRows(c.len, c.cuts, start, 0);
+            try std.testing.expectEqual(@min(left, n), try stepRows(c.len, c.cuts, start, @min(left, n + 1), 2 * prefill_rows));
+            for ([_]usize{ 2 * prefill_rows, 4 * prefill_rows }) |width| { // a paired or solo step's rows
+                const w = leaderRows(c.len, c.cuts, start, width);
+                if (start + prefill_rows + 1 < c.len) { // wide steps clear of cuts agree across ranks; crossing cuts refuse
+                    const wide = stepRows(c.len, c.cuts, start, @min(left, w + 1), width);
+                    if (!clearOfCuts(c.cuts, start, @min(left, w))) {
+                        try std.testing.expectError(error.BadChunk, wide);
+                    } else try std.testing.expectEqual(@min(left, w), try wide);
+                }
             }
             start += @min(left, n);
         }
@@ -240,28 +241,28 @@ test "glm request starts: clearOfCuts and stepRows allow wide steps clear of cut
     const len = 6 * m;
     // Cut strictly after the pair: clearOfCuts and stepRows accept the wide step.
     try std.testing.expect(clearOfCuts(&.{3 * m}, 0, 2 * m));
-    try std.testing.expectEqual(@as(usize, 2 * m), try stepRows(len, &.{3 * m}, 0, 2 * m + 1));
+    try std.testing.expectEqual(@as(usize, 2 * m), try stepRows(len, &.{3 * m}, 0, 2 * m + 1, 2 * m));
     // Cut exactly at start + 2*C: ends the wide step cleanly without being stepped over.
     try std.testing.expect(clearOfCuts(&.{2 * m}, 0, 2 * m));
-    try std.testing.expectEqual(@as(usize, 2 * m), try stepRows(len, &.{2 * m}, 0, 2 * m + 1));
+    try std.testing.expectEqual(@as(usize, 2 * m), try stepRows(len, &.{2 * m}, 0, 2 * m + 1, 2 * m));
     // Cuts inside (start, start+C), at start+C, or inside (start+C, start+2*C) all block the wide step.
     for ([_]u32{ 500, m, m + 500, 2 * m - 1 }) |c| {
         try std.testing.expect(!clearOfCuts(&.{c}, 0, 2 * m));
-        try std.testing.expectError(error.BadChunk, stepRows(len, &.{c}, 0, 2 * m + 1));
+        try std.testing.expectError(error.BadChunk, stepRows(len, &.{c}, 0, 2 * m + 1, 2 * m));
     }
     // Cuts at or before start do not block a wide step starting at start.
     const cuts = [_]u32{ 512, 2557, 3069, 39640 };
     try std.testing.expect(clearOfCuts(&cuts, 3069, 2 * m));
     try std.testing.expect(clearOfCuts(&cuts, 39640, 2 * m));
-    try std.testing.expectEqual(@as(usize, 2 * m), try stepRows(50000, &cuts, 39640, 2 * m + 1));
+    try std.testing.expectEqual(@as(usize, 2 * m), try stepRows(50000, &cuts, 39640, 2 * m + 1, 2 * m));
     // Walk a full prompt taking wide steps whenever clearOfCuts holds: every step lands on a cold cut and agrees.
     var at: usize = 0;
     var wide_taken: usize = 0;
     while (at < 50000) {
         const left = 50000 - at;
         const can_wide = at + m + 1 < 50000 and clearOfCuts(&cuts, at, @min(left, 2 * m));
-        const n = leaderRows(50000, &cuts, at, can_wide);
-        const got = try stepRows(50000, &cuts, at, @min(left, n + 1));
+        const n = leaderRows(50000, &cuts, at, if (can_wide) 2 * m else 0);
+        const got = try stepRows(50000, &cuts, at, @min(left, n + 1), 2 * m);
         try std.testing.expectEqual(@min(left, n), got);
         if (can_wide) wide_taken += 1;
         at += got;
@@ -306,7 +307,7 @@ test "glm capped steps: uncapped from a cold cut is rank 0's plain step; off-gri
         var at: usize = 0;
         while (at < c.len) : (at = nextCut(c.len, c.cuts, at)) {
             try std.testing.expectEqual(at, chunkStart(c.len, c.cuts, at));
-            try std.testing.expectEqual(leaderRows(c.len, c.cuts, at, false), cappedEnd(c.len, c.cuts, at, 0) - at);
+            try std.testing.expectEqual(leaderRows(c.len, c.cuts, at, 0), cappedEnd(c.len, c.cuts, at, 0) - at);
         }
     }
     const m = prefill_rows;

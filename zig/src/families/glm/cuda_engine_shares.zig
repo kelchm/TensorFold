@@ -79,7 +79,7 @@ pub fn states(e: anytype) ![]fw.State {
         e.gpa.free(out);
     }
     for (out, e.local) |*s, *l| {
-        s.* = try fw.State.initWindowFormat(e.gpa, e.d, &l.w, e.capacity, e.settings.kv8, e.mtp);
+        s.* = try fw.State.initSized(e.gpa, e.d, &l.w, e.capacity, e.settings.kv8, null, e.mtp, e.settings.ringWidth());
         made += 1;
     }
     return out;
@@ -94,7 +94,7 @@ pub fn fill(e: anytype) !void {
 
 /// A new sequence: its state on the engine's own share, and at TP=1 each other share's.
 pub fn seq(e: anytype) !Seq {
-    var st = try fw.State.initWindowFormat(e.gpa, e.d, &e.w, e.capacity, e.settings.kv8, e.mtp);
+    var st = try fw.State.initSized(e.gpa, e.d, &e.w, e.capacity, e.settings.kv8, null, e.mtp, e.settings.ringWidth());
     errdefer st.deinit();
     return .{ .st = st, .more = if (e.local.len > 0) try states(e) else &.{} };
 }

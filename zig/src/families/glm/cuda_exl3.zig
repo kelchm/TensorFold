@@ -239,7 +239,7 @@ pub const top_k = 8;
 /// Rows a call to the common experts takes: each call reads every expert's weights, so a prompt pass needs few calls.
 pub const chunk_rows = 1024;
 /// The prompt item plan has no decode grouper's shared-memory cap; one call covers a supported whole prompt pass.
-pub const prompt_rows = 4096;
+pub const prompt_rows = @import("cuda_state.zig").solo_rows;
 /// The common module's layer: a width table a projection, and the widths the loader found uniform.
 pub fn layer(w: Experts, count: usize, dims: usize, width: usize, limit: f32) common.Layer {
     return .{
