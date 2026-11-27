@@ -170,13 +170,15 @@ fn keyShape(e: *const engine.Engine, sm: usize, driver: c_int, shape: []u8, pin:
     const hex = std.fmt.bytesToHex(e.checkpoint_digest, .lower);
     const draft_hex = std.fmt.bytesToHex(if (e.drafter) |dr| dr.checkpoint_digest else @as([32]u8, @splat(0)), .lower);
     const tail: []const u8 = if (pin) |f| (if (f) " form factored" else " form classic") else "";
-    var p2_buf: [64]u8 = undefined;
-    const p2 = try std.fmt.bufPrint(&p2_buf, " ext{d}/{d} tiles{d}/{d} first{d}{s}", .{
+    var p2_buf: [96]u8 = undefined;
+    const p2 = try std.fmt.bufPrint(&p2_buf, " ext{d}/{d} tiles{d}/{d} first{d} exl3{d}/{d}{s}", .{
         @intFromBool(set.dflash_only),
         @intFromBool(set.dflash_q4_down),
         @intFromBool(set.verify_tiles.mla),
         @intFromBool(set.verify_tiles.ranges),
         @intFromBool(set.l2pf.shared_first),
+        @intFromBool(set.exl3_decode),
+        @intFromBool(set.exl3_nmajor),
         tail,
     });
     return std.fmt.bufPrint(shape, "sm{d} cuda{d} ranks{d} {s} drafter{d}/{d}/{s} layers{d} l2{d}/{d}/{d}/{d}/{d} warps{d} kda{d} mm{d} bits{d}/{d} kv8{d} pages{d} host{d} roce{d} p2p{s}/{s}/{s} pad{d} pdl{d} dsel{d} wide{d}{s}{s}", .{
@@ -282,7 +284,7 @@ test "GLM cost identity: the consumed key includes drafter precision and all tim
     e.drafter = &dr;
     var base: [512]u8 = undefined;
     const before = try keyShape(&e, 121, 13000, &base, null);
-    for (0..21) |which| {
+    for (0..23) |which| {
         const original = e.settings;
         switch (which) {
             0 => dr.bits = 0,
@@ -306,6 +308,8 @@ test "GLM cost identity: the consumed key includes drafter precision and all tim
             18 => e.settings.verify_tiles.mla = true,
             19 => e.settings.verify_tiles.ranges = true,
             20 => e.settings.l2pf.shared_first = true,
+            21 => e.settings.exl3_decode = true,
+            22 => e.settings.exl3_nmajor = true,
             else => unreachable,
         }
         var changed: [512]u8 = undefined;

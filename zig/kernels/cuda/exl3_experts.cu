@@ -421,3 +421,5 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_m8(cons
         float* __restrict__ y, int K, int D, int skip, const int* __restrict__ k2) {
     if (!other_width<8>(items, counts, k2, skip)) prompt_down<8>(Xd, Td, items, counts, members, svh_d, y, K, D, skip);
 }
+
+#include "exl3_glm_decode.cuh"

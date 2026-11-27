@@ -143,6 +143,14 @@ pub const Experts = struct {
     grouped: [3]Function, // one per codebook
     gateup: Function,
     down_combine: Function,
+    glm_decode: bool = false,
+    glm_nmajor: bool = false,
+    glm_gateup_flat: ?Function = null,
+    glm_gateup: ?Function = null,
+    glm_down: ?Function = null,
+    glm_gateup_flat_nmajor: ?Function = null,
+    glm_gateup_nmajor: ?Function = null,
+    glm_down_nmajor: ?Function = null,
     prompt: prompt.Kernels = undefined,
     plan_rotate: Function = undefined,
     plan_finish: Function = undefined,
@@ -174,6 +182,31 @@ pub const Experts = struct {
         e.gateup = try e.mod.function("tf_exl3_gateup_epilogue");
         e.down_combine = try e.mod.function("tf_exl3_down_combine");
         return e;
+    }
+
+    fn needGlmDecode(mod: Module, name: [:0]const u8) !Function {
+        return try mod.optionalFunction(name) orelse {
+            if (!@import("builtin").is_test) std.log.err("TF_GLM_EXL3_DECODE requires {s} in exl3_experts fatbin; rebuild fatbins or unset TF_GLM_EXL3_DECODE", .{name});
+            return error.MissingExl3DecodeKernel;
+        };
+    }
+
+    /// Resolve GLM's specialized 4-bit decode symbols only when TF_GLM_EXL3_DECODE is enabled.
+    pub fn prepareGlmDecode(e: *Experts, nmajor: bool) !void {
+        const flat = e.glm_gateup_flat orelse try needGlmDecode(e.mod, "tf_glm_exl3_decode_gateup_flat");
+        const gu = e.glm_gateup orelse try needGlmDecode(e.mod, "tf_glm_exl3_decode_gateup");
+        const dn = e.glm_down orelse try needGlmDecode(e.mod, "tf_glm_exl3_decode_down");
+        const flat_n: ?Function = if (nmajor) (e.glm_gateup_flat_nmajor orelse try needGlmDecode(e.mod, "tf_glm_exl3_decode_gateup_flat_nmajor")) else e.glm_gateup_flat_nmajor;
+        const gu_n: ?Function = if (nmajor) (e.glm_gateup_nmajor orelse try needGlmDecode(e.mod, "tf_glm_exl3_decode_gateup_nmajor")) else e.glm_gateup_nmajor;
+        const dn_n: ?Function = if (nmajor) (e.glm_down_nmajor orelse try needGlmDecode(e.mod, "tf_glm_exl3_decode_down_nmajor")) else e.glm_down_nmajor;
+        e.glm_gateup_flat = flat;
+        e.glm_gateup = gu;
+        e.glm_down = dn;
+        e.glm_gateup_flat_nmajor = flat_n;
+        e.glm_gateup_nmajor = gu_n;
+        e.glm_down_nmajor = dn_n;
+        e.glm_decode = true;
+        e.glm_nmajor = nmajor;
     }
 
     pub fn unload(e: *Experts) void {

@@ -86,7 +86,16 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     defer stamp.end();
     if (k.prof) |p| p.mark(stream, .router);
     defer if (k.prof) |p| p.mark(stream, .routed);
-    if (flat) return exl3.runDirect(k.exl3, stream, l.exl3.?, s.x3, x, x_stride, rows, l.count, d, l.routed.width, l.routed.limit);
+    if (flat) {
+        const w = l.exl3.?;
+        if (k.exl3.glm_decode and exl3.eligibleDecode(w, rows, l.count, d, l.routed.width, prompt)) {
+            // The top-k kernel wrote flat picks at the arena base; keep them live through rotation and epilogue.
+            const arena = s.x3.picks + exl3.picksBytes(rows);
+            const y = try exl3.directOut(w, s.x3, rows, l.count, d, l.routed.width, l.routed.limit);
+            return exl3.runDecode(k.exl3, k.experts.router, stream, w, arena, s.plan, x, x_stride, s.x3.picks, l.top_k, rows, l.count, l.routed.limit, y, s.eact);
+        }
+        return exl3.runDirect(k.exl3, stream, w, s.x3, x, x_stride, rows, l.count, d, l.routed.width, l.routed.limit);
+    }
     if (l.exl3) |w| return exl3.run(k.exl3, k.experts, stream, w, s.x3, s.plan, x, x_stride, s.pick, slots, rows, l.count, d, l.routed.width, l.routed.limit, prompt, s.ey, s.eact);
     if (l.tfq3) |tl| {
         const tk = k.tfq3 orelse return error.FormatNotLoaded;

@@ -4,8 +4,13 @@ const cuda = @import("cuda");
 const glm = @import("glm");
 const t = std.testing;
 const source = @embedFile("kernels/cuda/exl3_experts.cu");
+const decode_source = @embedFile("kernels/cuda/exl3_glm_decode.cuh");
 
 const Record = struct {
+    var gate_layout: usize = 0;
+    var down_layout: usize = 0;
+    var result: u64 = 0;
+    var partials: u64 = 0;
     var copies: usize = 0;
     var up: usize = 0;
     var down: usize = 0;
@@ -23,6 +28,10 @@ const Record = struct {
 
     fn reset() void {
         copies = 0;
+        gate_layout = 0;
+        down_layout = 0;
+        result = 0;
+        partials = 0;
         up = 0;
         down = 0;
         decode = 0;
@@ -62,6 +71,14 @@ const Record = struct {
                 item_picks[item_calls] = arg(u64, args, 1);
                 item_pairs[item_calls] = arg(i32, args, 6);
                 item_calls += 1;
+            },
+            30, 31, 33, 34 => {
+                gate_layout = @intFromPtr(f);
+                partials = arg(u64, args, 6);
+            },
+            32, 35 => {
+                down_layout = @intFromPtr(f);
+                result = arg(u64, args, 8);
             },
             9 => decode += 1,
             else => {},
@@ -189,4 +206,95 @@ test "GLM EXL3 prompt: shared-id guards precede payload loads and late-guard con
     try t.expectEqual(@as(usize, 2), std.mem.count(u8, bad, "if (e == skip) return;"));
     try t.expect(!guarded(bad, "void prompt_gu(", "tgateup<"));
     try t.expect(!guarded(bad, "void prompt_down(", "members[first"));
+    const item_guard = std.mem.indexOf(u8, decode_source, "if (item >= total) return;") orelse return error.MissingGuard;
+    const item_load = std.mem.indexOf(u8, decode_source, "items[3 * item]") orelse return error.MissingLoad;
+    const exp_guard = std.mem.indexOf(u8, decode_source, "if (e >= E) return;") orelse return error.MissingGuard;
+    const tbase_load = std.mem.indexOf(u8, decode_source, "const uint32_t* tbase") orelse return error.MissingLoad;
+    try t.expect(item_guard < item_load and item_load < exp_guard and exp_guard < tbase_load);
+}
+
+test "GLM EXL3 prompt: specialized verification uses native slot stride and optional N-major layout" {
+    var d: cuda.Driver = undefined;
+    d.api.cuLaunchKernel = Record.launch;
+    var router: cuda.grouped.Router = undefined;
+    inline for (.{ "plan_small", "plan_rows", "plan_rank", "plan_offsets", "plan_scatter", "plan_rank_rows", "plan_scatter_rows" }, .{ 1, 18, 2, 3, 4, 19, 20 }) |field, id| @field(router, field) = Record.function(&d, id);
+    var k: glm.exl3.Kernels = undefined;
+    k.prompt.rotate = Record.function(&d, 6);
+    k.glm_gateup = Record.function(&d, 30);
+    k.glm_gateup_flat = Record.function(&d, 31);
+    k.glm_down = Record.function(&d, 32);
+    k.glm_gateup_nmajor = Record.function(&d, 33);
+    k.glm_gateup_flat_nmajor = Record.function(&d, 34);
+    k.glm_down_nmajor = Record.function(&d, 35);
+    k.gateup = Record.function(&d, 13);
+    const w: glm.exl3.Experts = .{ .banks = .{ 101, 102, 103 }, .gt = 104, .ut = 105, .dt = 106, .k2 = 107, .suh_g = 108, .suh_u = 109, .svh_g = 110, .svh_u = 111, .suh_d = 112, .svh_d = 113, .shx = true };
+    const x3: glm.exl3.Scratch = .{ .picks = 0x100000000, .xg = 0, .xu = 0, .z = 0 };
+    const plan: cuda.grouped.Plan = .{ .members = 201, .items = 202, .counts = 203, .rank = 204, .hist = 205 };
+    for (2..17) |rows| for ([_]usize{ 8, 9 }) |slots| for ([_]bool{ false, true }) |enabled| {
+        k.glm_nmajor = enabled;
+        Record.reset();
+        try t.expect(glm.exl3.eligibleDecode(w, rows, 288, 4096, 1024, false));
+        const flat = slots == 8;
+        const arena = if (flat) x3.picks + glm.exl3.picksBytes(rows) else x3.picks;
+        const out: u64 = if (flat) try glm.exl3.directOut(w, x3, rows, 288, 4096, 1024, 7) else 0x700000000;
+        try glm.exl3.runDecode(&k, router, .{ .d = &d, .handle = null }, w, arena, plan, 0x200000000, 4096, if (flat) x3.picks else 0x300000000, slots, rows, 288, 7, out, 0x400000000);
+        const reordered = enabled and (rows == 4 or rows == 8 or rows == 16);
+        const expected_gate: usize = if (flat) 31 else 30;
+        try t.expectEqual(expected_gate + @as(usize, if (reordered) 3 else 0), Record.gate_layout);
+        try t.expectEqual(@as(usize, if (reordered) 35 else 32), Record.down_layout);
+        try t.expectEqual(rows * slots, @as(usize, @intCast(Record.pairs[0])));
+        try t.expectEqual(arena + rows * 4096 * 2, Record.partials);
+        const end = Record.partials + 2 * 4 * rows * slots * 1024 * 4;
+        try t.expect(end <= x3.picks + glm.exl3.scratchFor(rows, 4096, 1024, false, w)[0]);
+        if (flat) try t.expect(end <= out);
+        try t.expectEqual(out, Record.result);
+        try t.expectEqual(@as(usize, 0), Record.copies);
+    };
+    try t.expect(!glm.exl3.eligibleDecode(w, 1, 288, 4096, 1024, false));
+    try t.expect(!glm.exl3.eligibleDecode(w, 17, 288, 4096, 1024, false));
+    try t.expect(!glm.exl3.eligibleDecode(w, 8, 288, 4096, 1024, true));
+}
+
+test "GLM EXL3 prompt: prepareGlmDecode resolves decode symbols lazily and runDecode refuses unprepared kernels" {
+    const Fake = struct {
+        var allow_base = false;
+        var allow_nmajor = false;
+        fn getFn(out: *cuda.abi.Function, _: cuda.abi.Module, name: [*:0]const u8) callconv(.c) cuda.abi.Result {
+            const s = std.mem.span(name);
+            if (std.mem.endsWith(u8, s, "_nmajor")) {
+                if (!allow_nmajor) return cuda.abi.error_not_found;
+                out.* = @ptrFromInt(33);
+                return 0;
+            }
+            if (!allow_base) return cuda.abi.error_not_found;
+            out.* = @ptrFromInt(30);
+            return 0;
+        }
+        fn errStr(_: cuda.abi.Result, out: *?[*:0]const u8) callconv(.c) cuda.abi.Result {
+            out.* = null;
+            return 1;
+        }
+    };
+    var d: cuda.Driver = undefined;
+    d.api.cuModuleGetFunction = Fake.getFn;
+    d.api.cuGetErrorName = Fake.errStr;
+    d.api.cuGetErrorString = Fake.errStr;
+    d.api.cuLaunchKernel = Record.launch;
+    var k: glm.exl3.Kernels = .{ .mod = .{ .d = &d, .handle = null }, .group = undefined, .rot_in = undefined, .grouped = undefined, .gateup = undefined, .down_combine = undefined };
+    const router: cuda.grouped.Router = undefined;
+    const w: glm.exl3.Experts = .{ .banks = .{ 101, 102, 103 }, .gt = 104, .ut = 105, .dt = 106, .k2 = 107, .suh_g = 108, .suh_u = 109, .svh_g = 110, .svh_u = 111, .suh_d = 112, .svh_d = 113, .shx = true };
+    const plan: cuda.grouped.Plan = .{ .members = 201, .items = 202, .counts = 203, .rank = 204, .hist = 205 };
+    Record.reset();
+    try t.expectError(error.MissingExl3DecodeKernel, glm.exl3.runDecode(&k, router, .{ .d = &d, .handle = null }, w, 0x100000000, plan, 0x200000000, 4096, 0x300000000, 9, 4, 288, 7, 0x700000000, 0x400000000));
+    try t.expectEqual(@as(usize, 0), Record.routes);
+    try t.expectError(error.MissingExl3DecodeKernel, k.prepareGlmDecode(false));
+    try t.expect(!k.glm_decode and k.glm_gateup == null);
+    Fake.allow_base = true;
+    try k.prepareGlmDecode(false);
+    try t.expect(k.glm_decode and !k.glm_nmajor and k.glm_gateup != null and k.glm_gateup_nmajor == null);
+    try t.expectError(error.MissingExl3DecodeKernel, k.prepareGlmDecode(true));
+    try t.expect(!k.glm_nmajor and k.glm_gateup_nmajor == null);
+    Fake.allow_nmajor = true;
+    try k.prepareGlmDecode(true);
+    try t.expect(k.glm_decode and k.glm_nmajor and k.glm_gateup_nmajor != null and k.glm_down_nmajor != null);
 }

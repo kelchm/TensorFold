@@ -162,6 +162,38 @@ test "startup switches: verify_tiles and TF_GLM_L2PF_SHARED_FIRST agree across r
     }).?);
 }
 
+test "startup switches: TF_GLM_EXL3_DECODE and TF_GLM_EXL3_N_MAJOR agree across ranks" {
+    const Reader = struct {
+        fn on(key: [:0]const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "TF_GLM_EXL3_DECODE")) return "1";
+            if (std.mem.eql(u8, key, "TF_GLM_EXL3_N_MAJOR")) return "1";
+            return null;
+        }
+        fn badDecode(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_EXL3_DECODE")) "2" else null;
+        }
+        fn badNmajor(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_EXL3_N_MAJOR")) "yes" else null;
+        }
+    };
+    var problem: []const u8 = "";
+    const s = try Settings.read(Reader.on, &problem);
+    try std.testing.expect(s.exl3_decode and s.exl3_nmajor);
+    try std.testing.expectError(error.BadSetting, Settings.read(Reader.badDecode, &problem));
+    try std.testing.expectEqualStrings("TF_GLM_EXL3_DECODE: 0 or 1", problem);
+    try std.testing.expectError(error.BadSetting, Settings.read(Reader.badNmajor, &problem));
+    try std.testing.expectEqualStrings("TF_GLM_EXL3_N_MAJOR: 0 or 1", problem);
+    const h: [32]u8 = @splat(0);
+    try std.testing.expectEqual(Mismatch{ .field = .pair_experts, .rank = 1 }, mismatch(&.{
+        Fingerprint.of(2, 0, .{ .exl3_decode = true }, 8192, true, h, h, h),
+        Fingerprint.of(2, 1, .{}, 8192, true, h, h, h),
+    }).?);
+    try std.testing.expectEqual(Mismatch{ .field = .pair_experts, .rank = 1 }, mismatch(&.{
+        Fingerprint.of(2, 0, .{ .exl3_decode = true, .exl3_nmajor = true }, 8192, true, h, h, h),
+        Fingerprint.of(2, 1, .{ .exl3_decode = true }, 8192, true, h, h, h),
+    }).?);
+}
+
 test "startup switches: external drafter precision and checkpoint digest agree across ranks" {
     const h: [32]u8 = @splat(0);
     const d0 = ranks.hashBytes("drafter-a");

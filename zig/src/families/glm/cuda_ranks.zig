@@ -20,6 +20,8 @@ pub const Settings = struct {
     solo: bool = false, // TF_GLM_CHUNK_SOLO: 4096 (prompt buffers for two chunks a pass, while no stream decodes) or 2048
     keep_seqs: bool = false, // TF_GLM_KEEP_SEQS: 1 (a released slot keeps its sequence for its next request)
     pair: bool = true, // TF_GLM_PROMPT_PAIR: 1 (while no stream decodes, a prompt step takes two chunks, each one's exchanges under the other's sites) or 0
+    exl3_decode: bool = false, // TF_GLM_EXL3_DECODE=1: specialized uniform 4-bit TP2 routed experts for short verify windows
+    exl3_nmajor: bool = false, // TF_GLM_EXL3_N_MAJOR=1: output-major CTA traversal at 4, 8 and 16 rows
     pair_experts: bool = false, // TF_GLM_PAIR_EXPERTS=1: paired chunks share 128-pair NVFP4 routed-expert items (0: two 64-pair passes)
     index_split: u32 = 2048, // TF_GLM_INDEX_SPLIT: from this position on, rank 0 splits a prompt chunk's indexer rows (0: never)
     heat: ?heat.Bands = null, // TF_HEAT_HIGH and TF_HEAT_LOW (upstream's names): a prompt chunk waits on every rank's hottest zone
@@ -202,6 +204,12 @@ pub const Settings = struct {
                 return error.BadSetting;
             };
         }
+        inline for (.{ .{ "TF_GLM_EXL3_DECODE", "exl3_decode" }, .{ "TF_GLM_EXL3_N_MAJOR", "exl3_nmajor" } }) |flag| {
+            @field(s, flag[1]) = @import("sys").environment.value(bool, flag[0], get(flag[0]), false) catch {
+                problem.* = flag[0] ++ ": 0 or 1";
+                return error.BadSetting;
+            };
+        }
         if (get("TF_GLM_DRAFT_SPLIT")) |v| {
             if (std.mem.eql(u8, v, "1")) s.draft_split = true else if (!std.mem.eql(u8, v, "0")) {
                 problem.* = "TF_GLM_DRAFT_SPLIT: 0 or 1";
@@ -254,7 +262,7 @@ pub fn toolPieces(s: *Settings, comptime get: *const fn ([:0]const u8) ?[]const 
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 27, // 26, plus verify_tiles bits in tiled and shared_first in l2pf
+    layout: u32 = 28, // 27, plus exl3_decode and exl3_nmajor bits in pair_experts
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -357,7 +365,7 @@ pub const Fingerprint = extern struct {
             .kv_live_half = @intFromBool(s.kv_live_half),
             .pieces = s.pieces,
             .pair = @intFromBool(s.pair),
-            .pair_experts = @intFromBool(s.pair_experts),
+            .pair_experts = @as(u32, @intFromBool(s.pair_experts)) | (@as(u32, @intFromBool(s.exl3_decode)) << 1) | (@as(u32, @intFromBool(s.exl3_nmajor)) << 2),
             .layers = s.layers,
             .mtp = @as(u32, @intFromBool(mtp)) | (@as(u32, @intFromBool(s.dflash_only)) << 2) | (@as(u32, @intFromBool(s.dflash_q4_down)) << 3),
             .roce_multi = @intFromBool(s.roce_multi),
@@ -529,7 +537,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .kv_live_half => "TF_GLM_KV_LIVE_HALF",
         .pieces => "TF_GLM_OVERLAP_PIECES",
         .pair => "TF_GLM_PROMPT_PAIR",
-        .pair_experts => "TF_GLM_PAIR_EXPERTS",
+        .pair_experts => "TF_GLM_PAIR_EXPERTS / TF_GLM_EXL3_DECODE / TF_GLM_EXL3_N_MAJOR",
         .layers => "TF_GLM_LAYERS",
         .mtp => "--no-drafts, --drafter, TF_GLM_DFLASH_ONLY or TF_GLM_DFLASH_Q4_DOWN differs across ranks",
         .vision => "--vision (or its image tokens) given to some ranks and not others",
