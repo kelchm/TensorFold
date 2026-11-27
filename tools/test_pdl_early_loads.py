@@ -42,8 +42,12 @@ class Scan(unittest.TestCase):
     def test_weight_first_copies_pass(self):
         self.check(dump(121, "_ZN7tf_qmmf11qmmf_kernelILi2E", COPY, "ACQBULK"), 0)
         self.check(dump(121, "glm_mm16_rows", COPY, "ACQBULK"), 0)
+        self.check(dump(121, "glm_mm16_rows_ld", COPY, "ACQBULK"), 0)
         for bits in (4, 6, 8):
             self.check(dump(121, f"glm_mm{bits}_128s2", COPY, "ACQBULK"), 0)
+            self.check(dump(121, f"glm_mm{bits}_128s2_ld", COPY, "ACQBULK"), 0)
+        self.check(dump(121, "glm_mm4_128s2f", COPY, "ACQBULK"), 0)
+        self.check(dump(121, "glm_mm4_128s2f_ld", COPY, "ACQBULK"), 0)
 
     def test_copies_elsewhere_fail(self):
         self.check(dump(121, "glm_mm_reduce", COPY, "ACQBULK"), 1)

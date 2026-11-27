@@ -32,6 +32,7 @@ pub const Sets = struct {
     idol: *@import("contract_idol.zig").Set,
     idol_decoder: *@import("contract_idol_decoder.zig").Set,
     glm_moe: *@import("contract_glm_moe_direct.zig").Set,
+    glm_mm: *@import("contract_glm_mm.zig").Prompts,
     zonos3: *@import("contract_zonos3.zig").Set,
     hy4_ihc_hc: *@import("contract_hy4_hc.zig").Set,
     topk_rows: *@import("contract_topk_rows.zig").Set,
@@ -39,7 +40,7 @@ pub const Sets = struct {
     sparse_attn: *@import("contract_sparse_attn.zig").Set,
 
     /// Each set's kernels appended to `list`, in this order.
-    pub fn init(gpu: check.Gpu, s: cuda.Stream, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel), affine4: *cuda.qlinear.Affine4Kernels, cap: u32) !Sets {
+    pub fn init(gpu: check.Gpu, s: cuda.Stream, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel), affine4: *cuda.qlinear.Affine4Kernels, controls: cuda.Module, cap: u32) !Sets {
         const bf16_experts = try @import("contract_experts_bf16.zig").Set.init(gpu, s, a, list);
         errdefer bf16_experts.deinit();
         const mxfp4_experts = try @import("contract_experts_mxfp4.zig").Set.init(gpu, s, a, list);
@@ -93,6 +94,9 @@ pub const Sets = struct {
         errdefer idol.deinit();
         const idol_decoder = try @import("contract_idol_decoder.zig").Set.init(gpu, s, a, list);
         const glm_moe = try @import("contract_glm_moe_direct.zig").Set.init(gpu, s, a, list);
+        errdefer glm_moe.deinit();
+        const glm_mm = try @import("contract_glm_mm.zig").Prompts.create(a, gpu, s, controls, list);
+        errdefer glm_mm.destroy();
         const zonos3, const hy4_ihc_hc = try initPair(
             @import("contract_zonos3.zig").Set,
             @import("contract_hy4_hc.zig").Set,
@@ -131,6 +135,7 @@ pub const Sets = struct {
             .a = a,
             .idol_decoder = idol_decoder,
             .glm_moe = glm_moe,
+            .glm_mm = glm_mm,
             .zonos3 = zonos3,
             .hy4_ihc_hc = hy4_ihc_hc,
             .topk_rows = topk_rows,
@@ -145,6 +150,7 @@ pub const Sets = struct {
         sets.topk_rows.deinit();
         sets.hy4_ihc_hc.deinit();
         sets.zonos3.deinit();
+        sets.glm_mm.destroy();
         sets.glm_moe.deinit();
         sets.idol_decoder.deinit();
         sets.idol.deinit();

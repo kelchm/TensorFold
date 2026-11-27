@@ -187,11 +187,21 @@ pub fn fork(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
 /// Shared expert and its slot, before the slot sum; paired passes call this on the original exchange pieces.
 pub fn shared(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize, prompt: bool) !void {
     const bf16_slots = prompt and l.exl3 == null and l.tfq3 == null;
-    if (!k.early_shared) try sharedRows(k, stream, l, s, x, x_stride, lo, hi);
-    if (direct(k, l, hi, prompt)) { // body ran these rows direct: a decode window, filled whole; fill sums it (combineTail)
-        if (lo != 0) return error.BadWindow;
-        return;
+    const flat = direct(k, l, hi, prompt);
+    if (flat and lo != 0) return error.BadWindow;
+    if (!k.early_shared) {
+        const d = l.routed.dims;
+        const slots = l.top_k + 1;
+        const n = hi - lo;
+        const eb: usize = if (bf16_slots) 2 else 4;
+        const act = s.sact + lo * l.shared * 2;
+        try projection.matmul(k.set, stream, l.shared_gu, x + lo * x_stride * 2, x_stride, s.sgu + lo * 2 * l.shared * 2, s.mm_part, n, 2 * l.shared, d, false);
+        try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, act, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
+        // TF_GLM_SHARED_SLOT: shared-down straight into slot top_k (put_slot's rounding); else sy, then put_slot
+        if (!flat and try projection.matmulStrided(k.set, stream, l.shared_down, act, l.shared, s.ey + (lo * slots + l.top_k) * d * eb, slots * d, n, d, l.shared, !bf16_slots)) return;
+        try projection.matmul(k.set, stream, l.shared_down, act, l.shared, s.sy + lo * d * 4, s.mm_part, n, d, l.shared, true);
     }
+    if (flat) return; // body ran these rows direct: a decode window, filled whole; fill sums it (combineTail)
     try putSlot(k, stream, l, s, lo, hi, bf16_slots);
 }
 

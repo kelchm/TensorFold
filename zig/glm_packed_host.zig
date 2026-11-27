@@ -31,3 +31,26 @@ test "glm packed: every loaded matmul bucket and tiler has a measured resource r
     _ = try record("glm_mm16_rows");
     _ = try record("glm_mm_reduce");
 }
+
+test "glm packed: two-stage, strided and fast4 prompt geometry is registered without claiming unmeasured resources" {
+    inline for (.{ "glm_mm4_128s2", "glm_mm6_128s2", "glm_mm8_128s2", "glm_mm4_128s2_ld", "glm_mm6_128s2_ld", "glm_mm8_128s2_ld" }, 0..) |symbol, i| {
+        const bits: u8 = @intCast(4 + 2 * (i % 3));
+        const r = try record(symbol);
+        try t.expectEqualStrings("glm_mm", r.launch.image);
+        try t.expectEqual(@as(u32, 256), r.launch.threads);
+        try t.expectEqual(glm.mm.sharedBytesStages(bits, 128, 2), r.launch.dynamic);
+        try t.expectEqual(registry.none, registry.usageFor(r, .{ .major = 13, .minor = 3 }));
+    }
+    for ([_][]const u8{ "glm_mm4_128s2f", "glm_mm4_128s2f_ld", "tf_ctl_glm_mm4_128s2f_swap" }) |symbol| { // TF_GLM_MM_FAST4
+        const r = try record(symbol);
+        try t.expectEqual(glm.mm.sharedBytesStages(4, 128, 2), r.launch.dynamic);
+        try t.expectEqual(@as(u32, 256), r.launch.threads);
+        try t.expectEqualStrings(if (symbol[0] == 't') "contract_controls" else "glm_mm", r.launch.image);
+        try t.expectEqual(registry.none, registry.usageFor(r, .{ .major = 13, .minor = 3 }));
+    }
+    const ld = try record("glm_mm16_rows_ld"); // TF_GLM_SHARED_SLOT: glm_mm16_rows' launch, its usage pending
+    const parent = try record("glm_mm16_rows");
+    try t.expectEqual(parent.launch.dynamic, ld.launch.dynamic);
+    try t.expectEqual(parent.launch.threads, ld.launch.threads);
+    try t.expectEqual(registry.none, registry.usageFor(ld, .{ .major = 13, .minor = 3 }));
+}

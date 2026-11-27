@@ -97,6 +97,21 @@ __device__ __forceinline__ void bpairs8_fast(const uint32_t* __restrict__ p, uin
     }
 }
 
+// Nibbles u become BF16 128 + u less 136: u - 8 exactly (+0 for 8), in bpairs<4>'s pairs; SWAP: a control's halves.
+template <bool SWAP = false>
+__device__ __forceinline__ void bpairs4_fast(const uint32_t* __restrict__ p, uint32_t (&b)[8]) {
+    const uint32_t k136 = 0x43084308u;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t w = p[i >> 2], j = i & 3;
+        // byte j's low nibble to bits 0-3 (pair element 2 i), its high nibble to bits 16-19 (element 2 i + 1)
+        const uint32_t t = __byte_perm(w, w >> 4, SWAP ? (j + 4) | (j << 8) : j | ((j + 4) << 8));
+        const uint32_t a = (t & 0x000F000Fu) | 0x43004300u;
+        const __nv_bfloat162 d = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&a), *reinterpret_cast<const __nv_bfloat162*>(&k136));
+        b[i] = *reinterpret_cast<const uint32_t*>(&d);
+    }
+}
+
 template <int BITS, int BM, int WM, int STAGES>
 struct Tile {
     static constexpr int WN = 4, BN = 64, NT = 2, MT = BM / WM / 16, THREADS = WM * WN * 32;
@@ -110,10 +125,10 @@ struct Tile {
 };
 
 // ROWS_FIRST: row blocks fastest, so the blocks reading one weight tile run together and share it in L2 (prompts)
-template <int BITS, int BM, int WM, int STAGES, bool ROWS_FIRST = false, bool P2 = false>
+template <int BITS, int BM, int WM, int STAGES, bool ROWS_FIRST = false, bool P2 = false, bool LD = false, int F4 = 0>
 __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, long long ldx,
         const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part,
-        int f32, int M, int N, int K, int SK) {
+        int f32, int M, int N, int K, int SK, long long ldo = 0) {
     using T = Tile<BITS, BM, WM, STAGES>;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -251,7 +266,9 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
 #pragma unroll
         for (int j = 0; j < T::NT; ++j) {
             const uint32_t* words = pw + ((wn * T::NT + j) * 32 + lane) * T::WPC;
+            // F4 (4 bits): 1 takes bpairs4_fast's identical pairs, 2 their halves swapped (a planted control only)
             if constexpr (P2 && BITS == 8) bpairs8_fast(words, b[j]);
+            else if constexpr (BITS == 4 && F4 != 0) bpairs4_fast<F4 == 2>(words, b[j]);
             else bpairs<BITS>(words, b[j]);
         }
         float d[T::MT][T::NT][4];
@@ -302,6 +319,15 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
                     float* dst = part + ((long long)slice * M + row) * N + col;
                     dst[0] = v0;
                     dst[1] = v1;
+                } else if constexpr (LD) {  // out rows `ldo` elements apart (TF_GLM_SHARED_SLOT), one K slice
+                    if (f32) {
+                        float* dst = reinterpret_cast<float*>(out) + (long long)row * ldo + col;
+                        dst[0] = v0;
+                        dst[1] = v1;
+                    } else {
+                        *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(out) + (long long)row * ldo + col) =
+                            __floats2bfloat162_rn(v0, v1);
+                    }
                 } else if (f32) {
                     float* dst = reinterpret_cast<float*>(out) + (long long)row * N + col;
                     dst[0] = v0;
@@ -316,6 +342,7 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
 
 }  // namespace
 
+#ifndef GLM_MM_DEVICE_ONLY  // contract_glm_mm_controls.cuh takes mm_kernel without these entry points
 // The K slices' partials added in slice order, then rounded once.
 extern "C" __global__ void glm_mm_reduce(const float* __restrict__ part, void* __restrict__ out, long long total, int SK, int f32) {
     glm_pdl::enter();
@@ -357,6 +384,25 @@ GLM_MM_ALL(16)
 GLM_MM_PROMPT2(4)
 GLM_MM_PROMPT2(6)
 GLM_MM_PROMPT2(8)
+// The prompt kernels into out rows `ldo` elements apart (the shared expert's MoE slot, TF_GLM_SHARED_SLOT); SK 1.
+extern "C" __global__ void __launch_bounds__(256) glm_mm16_rows_ld(const __nv_bfloat16* __restrict__ x, long long ldx,
+    const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part,
+    int f32, int M, int N, int K, int SK, long long ldo) { mm_kernel<16, 128, 2, 3, true, false, true>(x, ldx, w, s, out, part, f32, M, N, K, SK, ldo); }
+#define GLM_MM_PROMPT2_LD(B)                                                                                           \
+    extern "C" __global__ void __launch_bounds__(256, 2) glm_mm##B##_128s2_ld(const __nv_bfloat16* __restrict__ x,    \
+        long long ldx, const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out,          \
+        float* __restrict__ part, int f32, int M, int N, int K, int SK, long long ldo) {                              \
+        mm_kernel<B, 128, 2, 2, false, true, true>(x, ldx, w, s, out, part, f32, M, N, K, SK, ldo); }
+GLM_MM_PROMPT2_LD(4)
+GLM_MM_PROMPT2_LD(6)
+GLM_MM_PROMPT2_LD(8)
+// TF_GLM_MM_FAST4: glm_mm4_128s2 and its _ld with bpairs4_fast's B pairs, bit for bit bpairs<4>'s, so the same sums.
+extern "C" __global__ void __launch_bounds__(256, 2) glm_mm4_128s2f(const __nv_bfloat16* __restrict__ x, long long ldx,
+    const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part,
+    int f32, int M, int N, int K, int SK) { mm_kernel<4, 128, 2, 2, false, true, false, 1>(x, ldx, w, s, out, part, f32, M, N, K, SK); }
+extern "C" __global__ void __launch_bounds__(256, 2) glm_mm4_128s2f_ld(const __nv_bfloat16* __restrict__ x, long long ldx,
+    const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part,
+    int f32, int M, int N, int K, int SK, long long ldo) { mm_kernel<4, 128, 2, 2, false, true, true, 1>(x, ldx, w, s, out, part, f32, M, N, K, SK, ldo); }
 
 // -- tiling at load: ops.cu's packed rows and fp16 scales [N][K / 64] -> the tiled chunks and scales ---------------
 template <int BITS>
@@ -409,3 +455,4 @@ extern "C" __global__ void glm_mm_tile16(const __nv_bfloat16* __restrict__ src, 
 #pragma unroll
     for (int v = 0; v < 16; ++v) dst[c * 16 + v] = src[(long long)n * K + g * 64 + frag_k(lane, v)];
 }
+#endif  // GLM_MM_DEVICE_ONLY

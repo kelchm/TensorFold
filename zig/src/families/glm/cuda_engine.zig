@@ -187,7 +187,7 @@ pub const Engine = struct {
         if (o.settings.tiled) e.m.packs = &e.packs;
         const cap = try ctx.capability();
         if (o.settings.dflash_q4_down) try e.m.q4.prepareWide(e.m.mods[5]);
-        if (o.settings.prompt_s2 and has_packs and cap == 121) try e.m.mm.preparePrompt2(e.m.mods[7]);
+        if ((o.settings.prompt_s2 or e.m.mm.fast4) and has_packs and cap == 121) try e.m.mm.preparePrompt2(e.m.mods[7]);
         if (o.settings.exl3_decode and world == 2 and cap == 121) try e.m.exl3.prepareGlmDecode(o.settings.exl3_nmajor);
         if (o.settings.verify_tiles.enabled()) e.verify_tiles = o.settings.verify_tiles.gate(cap, world, o.settings.pages, o.settings.kv_host);
         if (held.count == 1 and o.settings.l2pf.want(cap, world)) e.l2pf = try l2pf_mod.L2pf.init(gpa, d, &e.w, o.settings.l2pf);

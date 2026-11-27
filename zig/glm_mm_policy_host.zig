@@ -69,3 +69,48 @@ test "two-stage packed prompt kernels dispatch 4/6/8-bit prompts and leave verif
     try mm.matmul(&k, .{}, 4096, 2048, .{ .w = 8192, .s = 12288, .n = 4096, .k = 2048, .bits = 4 }, 16384, 32768, 128, false, true);
     try std.testing.expectEqual(@as(u32, 64), cuda.symbols[0]);
 }
+
+test "TF_GLM_SHARED_SLOT: a one-launch call takes its strided kernel and grid with the row stride, others none" {
+    var k = kernels;
+    k.prompt_s2 = .{ .{ .id = 2004 }, .{ .id = 2006 }, .{ .id = 2008 } };
+    const w: mm.Tiled = .{ .w = 8192, .s = 12288, .n = 4096, .k = 2048, .bits = 4 };
+    cuda.count = 0;
+    try std.testing.expect(!try mm.matmulStrided(&k, .{}, 4096, 2048, w, 16384, 9 * 4096, 2048, false, true)); // none loaded
+    k.strided = .{ .prompt = .{ .id = 4096 }, .packed_prompt = .{ .{ .id = 4097 }, .{ .id = 4098 }, .{ .id = 4099 } } };
+    for ([_]u8{ 16, 4, 6, 8 }, 0..) |bits, wi| for ([_]usize{ 1, 3, 127, 128, 129, 2048 }) |rows| for ([_]bool{ false, true }) |one| {
+        var t = w;
+        t.bits = bits;
+        cuda.count = 0;
+        const took = try mm.matmulStrided(&k, .{}, 4096, 2048, t, 16384, 9 * 4096, rows, bits == 8, one);
+        try std.testing.expectEqual(one or rows >= 128, took);
+        if (!took) {
+            try std.testing.expectEqual(@as(usize, 0), cuda.count);
+            continue;
+        }
+        try std.testing.expectEqual(@as(usize, 1), cuda.count);
+        try std.testing.expectEqual(@as(u32, 4096 + @as(u32, @intCast(wi))), cuda.symbols[0]);
+        try std.testing.expectEqual(@as(c_longlong, 9 * 4096), cuda.last_ll);
+        const strided = cuda.configs[0];
+        const args = cuda.nargs[0];
+        try mm.matmul(&k, .{}, 4096, 2048, t, 16384, 32768, rows, bits == 8, one); // the call it stands for
+        try std.testing.expectEqual(@as(usize, 2), cuda.count);
+        try std.testing.expectEqual(cuda.configs[1].grid, strided.grid);
+        try std.testing.expectEqual(cuda.configs[1].block, strided.block);
+        try std.testing.expectEqual(cuda.configs[1].pdl, strided.pdl);
+        if (one or wi == 0) try std.testing.expectEqual(cuda.configs[1].shared, strided.shared) else try std.testing.expectEqual(mm.sharedBytesStages(bits, 128, 2), strided.shared);
+        try std.testing.expectEqual(cuda.nargs[1] + 1, args);
+    };
+    k.prompt_fixed_k = true; // its prompt calls take K slices: put_slot keeps them
+    try std.testing.expect(!try mm.matmulStrided(&k, .{}, 4096, 2048, w, 16384, 9 * 4096, 2048, false, true));
+    k.prompt_fixed_k = false;
+    try std.testing.expectError(error.BadShape, mm.matmulStrided(&k, .{}, 4096, 2048, w, 16384, 4095, 2048, false, true));
+    try std.testing.expectError(error.BadShape, mm.matmulStrided(&k, .{}, 4096, 2048, w, 16386, 9 * 4096, 2048, false, true));
+}
+
+test "TF_GLM_MM_FAST4: 4-bit prompt kernels take the f symbols, every other width its own" {
+    try std.testing.expectEqualStrings("glm_mm4_128s2f", mm.promptSymbol(4, true, ""));
+    try std.testing.expectEqualStrings("glm_mm4_128s2f_ld", mm.promptSymbol(4, true, "_ld"));
+    try std.testing.expectEqualStrings("glm_mm4_128s2", mm.promptSymbol(4, false, ""));
+    try std.testing.expectEqualStrings("glm_mm6_128s2_ld", mm.promptSymbol(6, true, "_ld"));
+    try std.testing.expectEqualStrings("glm_mm8_128s2", mm.promptSymbol(8, true, ""));
+}

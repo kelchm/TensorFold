@@ -773,3 +773,10 @@ from 1 through 64 (and 1 through 128 for `pc`), multiple items, shared and separ
 nonfinite inputs, untouched skipped slots, and constant-weight FP64 accumulator stress (`contract_exl3_prompt_ref.zig`).
 Planted controls drop the last active member (narrow and `pc`), pass the active expert id as `skip`, or hand 128-member
 items to the 64-member down kernel.
+
+GLM's packed two-stage prompt projections (`glm_mm{4,6,8}_128s2`), 4-bit BF16-subtraction decode (`glm_mm4_128s2f`,
+`TF_GLM_MM_FAST4=1`), and strided shared-slot writers (`glm_mm16_rows_ld`, `glm_mm{4,6,8}_128s2_ld`, `glm_mm4_128s2f_ld`,
+`TF_GLM_SHARED_SLOT=1`) register in `contract_glm_mm.zig` and `contract_glm_mm_slot.zig` as byte replacements of their
+three-stage / `tf_glm_put_slot` parents over served TP=1 and TP=2 shapes, tile edges, and nonfinite plants. Planted
+controls drop the last prompt row, swap each 4-bit B pair's halves (`tf_ctl_glm_mm4_128s2f_swap`), stride a slot short,
+or write into slot 7.
