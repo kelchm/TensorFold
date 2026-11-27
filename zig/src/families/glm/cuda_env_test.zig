@@ -22,6 +22,7 @@ const switches = [_]Name{
     .{ .name = "TF_GLM_L2PF_SHARED_FIRST" },
     .{ .name = "TF_GLM_EXL3_DECODE" },
     .{ .name = "TF_GLM_EXL3_N_MAJOR" },
+    .{ .name = "TF_GLM_PACKED_PROMPT_S2" },
     .{ .name = "TF_GLM_PDL", .default = true },
     .{ .name = "TF_GLM_PROMPT_STEPS", .default = true },
     .{ .name = "TF_GLM_SHARED", .default = true },

@@ -158,10 +158,12 @@ test "GLM kernels: every body opens with the dependency wait" {
 
 test "weight-first prologues: weights before the wait, the kernel before's outputs only after it" {
     try std.testing.expect(prologue(@embedFile("glm_mm.cu"), "grid_launch();", "for (int it", "loadW(", "loadX("));
+    try std.testing.expect(prologue(@embedFile("glm_mm.cu"), "grid_launch();", "for (int it", "loadPW(", "loadPX("));
     try std.testing.expect(prologue(@embedFile("qmmf_body.cuh"), "#ifdef TF_QMMF_WFIRST", "#else", "load(s, g0 + s, 2)", "load(s, g0 + s, 1)"));
     try std.testing.expect(!prologue("grid_launch(); loadX(0); grid_wait(); loadW(0); for (int it", "grid_launch();", "for (int it", "loadW(", "loadX("));
     try std.testing.expect(!prologue("grid_launch(); loadW(0); loadX(0); grid_wait(); loadX(1); for (int it", "grid_launch();", "for (int it", "loadW(", "loadX("));
     try std.testing.expect(weightsOnly(@embedFile("glm_mm.cu"), "auto loadW = [&]"));
+    try std.testing.expect(weightsOnly(@embedFile("glm_mm.cu"), "auto loadPW = [&]"));
     try std.testing.expect(weightsOnly(@embedFile("qmmf_body.cuh"), "if (!(what & 2)) return;"));
     try std.testing.expect(!weightsOnly("auto loadW = [&](int st) { cp16(pw, x + st * 8);\n    };", "auto loadW = [&]"));
     try std.testing.expect(!weightsOnly("if (!(what & 2)) return; cp16(pw, w + row * ldx);\n    };", "if (!(what & 2)) return;"));

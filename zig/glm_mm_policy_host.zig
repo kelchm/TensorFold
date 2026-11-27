@@ -44,3 +44,28 @@ test "fixed K prompt experiment uses the same shape split across bucket, offset 
     };
     try std.testing.expect(!kernels.prompt_fixed_k);
 }
+
+test "two-stage packed prompt kernels dispatch 4/6/8-bit prompts and leave verify, fixed-k and bf16 unchanged" {
+    var k = kernels;
+    k.prompt_s2 = .{ .{ .id = 2004 }, .{ .id = 2006 }, .{ .id = 2008 } };
+    for ([_]u8{ 4, 6, 8 }) |bits| {
+        const w: mm.Tiled = .{ .w = 8192, .s = 12288, .n = 4096, .k = 2048, .bits = bits };
+        for ([_]usize{ 1, 64, 127, 128, 129, 2048 }) |rows| {
+            cuda.count = 0;
+            try mm.matmul(&k, .{}, 4096, 2048, w, 16384, 32768, rows, false, true);
+            try std.testing.expectEqual(@as(usize, 1), cuda.count);
+            try std.testing.expectEqual(@as(u32, bits) + 2000, cuda.symbols[0]);
+            try std.testing.expectEqual(@divExact(mm.sharedBytes(bits, 128), 3) * 2, cuda.configs[0].shared);
+        }
+        cuda.count = 0;
+        try mm.matmul(&k, .{}, 4096, 2048, w, 16384, 32768, 8, false, false);
+        try std.testing.expectEqual(@as(u32, 16), cuda.symbols[0]);
+    }
+    cuda.count = 0;
+    try mm.matmul(&k, .{}, 4096, 2048, .{ .w = 8192, .s = 0, .n = 4096, .k = 2048, .bits = 16 }, 16384, 32768, 256, false, true);
+    try std.testing.expectEqual(@as(u32, 512), cuda.symbols[0]);
+    k.prompt_fixed_k = true;
+    cuda.count = 0;
+    try mm.matmul(&k, .{}, 4096, 2048, .{ .w = 8192, .s = 12288, .n = 4096, .k = 2048, .bits = 4 }, 16384, 32768, 128, false, true);
+    try std.testing.expectEqual(@as(u32, 64), cuda.symbols[0]);
+}

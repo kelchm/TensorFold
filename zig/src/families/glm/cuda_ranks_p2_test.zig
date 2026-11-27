@@ -194,6 +194,30 @@ test "startup switches: TF_GLM_EXL3_DECODE and TF_GLM_EXL3_N_MAJOR agree across 
     }).?);
 }
 
+test "startup switches: TF_GLM_PACKED_PROMPT_S2 agrees across ranks" {
+    const Reader = struct {
+        fn on(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_PACKED_PROMPT_S2")) "1" else null;
+        }
+        fn off(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_PACKED_PROMPT_S2")) "0" else null;
+        }
+        fn bad(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_PACKED_PROMPT_S2")) "2" else null;
+        }
+    };
+    var problem: []const u8 = "";
+    try std.testing.expect((try Settings.read(Reader.on, &problem)).prompt_s2);
+    try std.testing.expect(!(try Settings.read(Reader.off, &problem)).prompt_s2);
+    try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
+    try std.testing.expectEqualStrings("TF_GLM_PACKED_PROMPT_S2: 0 or 1", problem);
+    const h: [32]u8 = @splat(0);
+    try std.testing.expectEqual(Mismatch{ .field = .bits, .rank = 1 }, mismatch(&.{
+        Fingerprint.of(2, 0, .{ .prompt_s2 = true }, 8192, true, h, h, h),
+        Fingerprint.of(2, 1, .{}, 8192, true, h, h, h),
+    }).?);
+}
+
 test "startup switches: external drafter precision and checkpoint digest agree across ranks" {
     const h: [32]u8 = @splat(0);
     const d0 = ranks.hashBytes("drafter-a");

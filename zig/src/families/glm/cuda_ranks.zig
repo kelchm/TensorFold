@@ -11,6 +11,7 @@ pub const Settings = struct {
     kv8: bool = false, // --kv-cache fp8, supplied by the native options rather than an environment override
     pages: bool = false, // TF_KV_PAGES as `open` resolves it (with the world and --kv-cache): every sequence on pages
     prompt_fixed_k: bool = false, // TF_GLM_PROMPT_K: one (default) or shape (experimental fixed K slices)
+    prompt_s2: bool = false, // TF_GLM_PACKED_PROMPT_S2=1: two-stage 4/6/8-bit packed prompt projections
     tiled: bool = true, // TF_GLM_MM: 1 (the bf16 linears on glm_mm, tiled at load) or 0
     split: bool = true, // TF_GLM_PREFILL_REDUCE: split (each rank glues its own rows), ring or gather
     ring: bool = false, // TF_GLM_PREFILL_REDUCE=ring: split, its exchanges passed along the ring (cuda_relay)
@@ -204,7 +205,7 @@ pub const Settings = struct {
                 return error.BadSetting;
             };
         }
-        inline for (.{ .{ "TF_GLM_EXL3_DECODE", "exl3_decode" }, .{ "TF_GLM_EXL3_N_MAJOR", "exl3_nmajor" } }) |flag| {
+        inline for (.{ .{ "TF_GLM_EXL3_DECODE", "exl3_decode" }, .{ "TF_GLM_EXL3_N_MAJOR", "exl3_nmajor" }, .{ "TF_GLM_PACKED_PROMPT_S2", "prompt_s2" } }) |flag| {
             @field(s, flag[1]) = @import("sys").environment.value(bool, flag[0], get(flag[0]), false) catch {
                 problem.* = flag[0] ++ ": 0 or 1";
                 return error.BadSetting;
@@ -262,7 +263,7 @@ pub fn toolPieces(s: *Settings, comptime get: *const fn ([:0]const u8) ?[]const 
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 28, // 27, plus exl3_decode and exl3_nmajor bits in pair_experts
+    layout: u32 = 29, // 28, plus prompt_s2 bit in bits
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -376,7 +377,7 @@ pub const Fingerprint = extern struct {
             .solo = @intFromBool(s.solo),
             .keep_seqs = @intFromBool(s.keep_seqs),
             .l2pf = s.l2pf.words(),
-            .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
+            .bits = (@as(u32, @intFromBool(s.prompt_s2)) << 16) | (@as(u32, s.dense_bits) << 8) | s.head_bits,
             .capacity = capacity,
             .heat_high = if (s.heat) |b| b.high_c else 0,
             .heat_low = if (s.heat) |b| b.low_c else 0,
@@ -552,7 +553,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .kv_host_gib => "TF_GLM_KV_HOST_GIB",
         .solo => "TF_GLM_CHUNK_SOLO",
         .l2pf => "TF_GLM_L2PF, _SHARED_FIRST, _MB, _CTAS or _PACE_GBPS",
-        .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
+        .bits => "TF_GLM_DENSE_BITS, TF_GLM_HEAD_BITS or TF_GLM_PACKED_PROMPT_S2",
         .capacity => "the sequence capacity (the context)",
         .drafter_bits => "--drafter-bits",
         .heat_high => "TF_HEAT_HIGH",

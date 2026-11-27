@@ -40,6 +40,7 @@ pub const Packed = struct {
 /// glm_mm's bf16 kernels by row bucket, the K-slice reduce and the tiling.
 pub const Kernels = struct {
     by_rows: [4]cuda.Function, // bf16: 16, 32, 64, 128 rows a block
+    prompt_s2: ?[3]cuda.Function = null, // 4, 6 and 8 bits, two-stage 128-row prompt blocks
     packed_rows: [3][4]cuda.Function, // 4, 6 and 8 bits, as by_rows
     prompt: cuda.Function, // 128-row blocks, row blocks fastest: a prompt's blocks share each weight tile in L2
     reduce: cuda.Function,
@@ -64,6 +65,15 @@ pub const Kernels = struct {
         try k.prompt.allowDynamicShared(smem(128));
         k.pdl = cuda_pdl.on();
         return k;
+    }
+
+    pub fn preparePrompt2(k: *Kernels, mod: cuda.Module) !void {
+        var fns: [3]cuda.Function = undefined;
+        inline for (widths[1..], 0..) |bits, i| {
+            fns[i] = try mod.function(std.fmt.comptimePrint("glm_mm{d}_128s2", .{bits}));
+            try fns[i].allowDynamicShared(@divExact(sharedBytes(bits, 128), 3) * 2);
+        }
+        k.prompt_s2 = fns;
     }
 };
 
@@ -126,6 +136,8 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
         const row_blocks: u32 = @intCast((rows + bm - 1) / bm);
         if (big and wi == 0) {
             try cuda.launch.launch(k.prompt, .{ .grid = .{ .x = row_blocks, .y = cols }, .block = .{ .x = 256 }, .shared = smem(128), .pdl = k.pdl }, s, &a);
+        } else if (big and one and k.prompt_s2 != null) {
+            try cuda.launch.launch(k.prompt_s2.?[wi - 1], .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = 256 }, .shared = @divExact(sharedBytes(w.bits, bm), 3) * 2, .pdl = k.pdl }, s, &a);
         } else { // packed prompts take the 128-row bucket's blocks, one slice
             const f = if (wi == 0) k.by_rows[i] else k.packed_rows[wi - 1][i];
             try cuda.launch.launch(f, .{ .grid = .{ .x = cols, .y = row_blocks, .z = @intCast(sk) }, .block = .{ .x = if (bm <= 32) 128 else 256 }, .shared = sharedBytes(w.bits, bm), .pdl = k.pdl }, s, &a);
