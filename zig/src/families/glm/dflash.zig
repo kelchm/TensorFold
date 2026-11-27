@@ -50,6 +50,16 @@ pub fn confidence() !f64 {
     return @import("sys").environment.read(f64, "TF_GLM_DRAFT_CONFIDENCE", 0.7);
 }
 
+/// TF_GLM_SHARED_DRAFT_CONFIDENCE: chain-chance cut for multi-stream rounds; unset falls back to confidence().
+pub fn sharedConfidence() !f64 {
+    return (try @import("sys").environment.read(?f64, "TF_GLM_SHARED_DRAFT_CONFIDENCE", null)) orelse try confidence();
+}
+
+/// DFlash2 chain-chance cut for single-stream (`shared=false`) or multi-stream shared (`shared=true`) rounds.
+pub fn confidenceFor(shared: bool) !f64 {
+    return if (shared) sharedConfidence() else confidence();
+}
+
 /// The drafter MLP split: two ranks as before; three or more with `wide` (Settings.draftWide) and 256-aligned shares.
 pub const MlpSplit = struct { split: bool, ff: usize };
 pub fn mlpSplit(world: usize, wide: bool) MlpSplit {

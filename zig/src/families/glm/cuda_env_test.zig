@@ -37,7 +37,7 @@ const switches = [_]Name{
     .{ .name = "TF_GLM_PRICED_WINDOWS" },
 };
 const counts = [_][:0]const u8{"TF_GLM_DFLASH2_LOG"};
-const reals = [_][:0]const u8{"TF_GLM_DRAFT_CONFIDENCE"};
+const reals = [_][:0]const u8{ "TF_GLM_DRAFT_CONFIDENCE", "TF_GLM_SHARED_DRAFT_CONFIDENCE" };
 /// The rank variables, aliases of --rank and --tp (fabric/mesh/launch.zig reads them).
 const ranks = [_][:0]const u8{ "TF_GLM_RANK", "TF_GLM_WORLD" };
 /// The window GLM may serve past config.json's: GLM's raisedCeiling reads it at the open, after these rows' check.
@@ -183,14 +183,26 @@ test "GLM strict env: the DFlash2 cut is a finite chance from 0 to 1, read as a 
         }
         for ([_][]const u8{ "nan", "-nan", "inf", "-inf", "1e999", "-0.1", "-1", "1.01", "2", "text", " 0.5", "0.5 " }) |raw| try check(name, raw, false);
     }
-    const confidence = @import("dflash.zig").confidence;
+    const dflash = @import("dflash.zig");
     _ = env.unsetenv("TF_GLM_DRAFT_CONFIDENCE");
+    _ = env.unsetenv("TF_GLM_SHARED_DRAFT_CONFIDENCE");
     defer _ = env.unsetenv("TF_GLM_DRAFT_CONFIDENCE");
-    try t.expectEqual(@as(f64, 0.7), try confidence());
+    defer _ = env.unsetenv("TF_GLM_SHARED_DRAFT_CONFIDENCE");
+    try t.expectEqual(@as(f64, 0.7), try dflash.confidence());
+    try t.expectEqual(@as(f64, 0.7), try dflash.sharedConfidence());
     _ = env.setenv("TF_GLM_DRAFT_CONFIDENCE", "0.5", 1);
-    try t.expectEqual(@as(f64, 0.5), try confidence());
+    try t.expectEqual(@as(f64, 0.5), try dflash.confidenceFor(false));
+    try t.expectEqual(@as(f64, 0.5), try dflash.confidenceFor(true));
+    _ = env.setenv("TF_GLM_SHARED_DRAFT_CONFIDENCE", "0.35", 1);
+    try t.expectEqual(@as(f64, 0.5), try dflash.confidenceFor(false));
+    try t.expectEqual(@as(f64, 0.35), try dflash.confidenceFor(true));
+    try @import("cuda_env.zig").startup();
+    _ = env.setenv("TF_GLM_SHARED_DRAFT_CONFIDENCE", "1.5", 1);
+    try t.expectError(error.InvalidEnvironment, dflash.sharedConfidence());
+    try t.expectError(error.InvalidEnvironment, @import("cuda_env.zig").startup());
+    _ = env.unsetenv("TF_GLM_SHARED_DRAFT_CONFIDENCE");
     _ = env.setenv("TF_GLM_DRAFT_CONFIDENCE", "1.5", 1);
-    try t.expectError(error.InvalidEnvironment, confidence());
+    try t.expectError(error.InvalidEnvironment, dflash.confidence());
     try t.expectError(error.InvalidEnvironment, @import("cuda_env.zig").startup());
 }
 

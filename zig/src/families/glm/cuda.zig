@@ -121,6 +121,7 @@ test {
     _ = engine;
     _ = follow;
     _ = lanes;
+    _ = copy_policy;
     _ = @import("cuda_zero_budget_test.zig");
     _ = native;
     _ = native_dsa;

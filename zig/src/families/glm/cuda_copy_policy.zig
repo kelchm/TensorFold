@@ -61,10 +61,10 @@ pub fn held(ptr: *anyopaque, s: *lanes.Stream, _: @import("std").mem.Allocator) 
     return .{ .count = @intCast((lanes.mtp_policy.Controls{ .floor = self.mtp_confidence }).prefix(out)) };
 }
 
-/// A priced parallel block leaves raw chances for the shared calibrator; off preserves the original product cut.
+/// A priced parallel block leaves raw chances for the shared calibrator; off preserves the product cut.
 pub fn blockChances(requests: anytype, records: anytype, priced: bool) !void {
     const dflash = @import("dflash.zig");
-    const cut = if (priced) @as(f64, 0) else try dflash.confidence();
+    const cut = if (priced) @as(f64, 0) else try dflash.confidenceFor(requests.len > 1);
     for (requests, records) |r, l| {
         l.held_n = @min(r.depth, dflash.BLOCK - 1);
         if (priced) continue;
@@ -130,4 +130,53 @@ pub fn draftBlock(self: *@import("cuda_lanes.zig").Lanes, requests: []const lane
         if ((commit_mask & (@as(u16, 1) << @intCast(i))) != 0) l.pending_rows = null;
     }
     try blockChances(requests, records[0..requests.len], self.x.e.m.priced_windows);
+}
+
+test "blockChances: TF_GLM_SHARED_DRAFT_CONFIDENCE overrides multi-stream rounds while preserving lone cuts" {
+    const std = @import("std");
+    const sys = @import("sys");
+    const t = std.testing;
+    const Lane = struct { held_n: usize = 0, chances: [7]f64 = @splat(0.85) };
+    const Req = struct { depth: usize };
+    _ = sys.env.unsetenv("TF_GLM_DRAFT_CONFIDENCE");
+    _ = sys.env.unsetenv("TF_GLM_SHARED_DRAFT_CONFIDENCE");
+    defer {
+        _ = sys.env.unsetenv("TF_GLM_DRAFT_CONFIDENCE");
+        _ = sys.env.unsetenv("TF_GLM_SHARED_DRAFT_CONFIDENCE");
+    }
+    const one_req = [_]Req{.{ .depth = 7 }};
+    const two_req = [_]Req{ .{ .depth = 7 }, .{ .depth = 7 } };
+    // (a) Unset shared cut inherits TF_GLM_DRAFT_CONFIDENCE (0.70 default -> 0.85^2=0.7225 kept, 0.85^3=0.614 cut).
+    var l1: Lane = .{};
+    var s0: Lane = .{};
+    var s1: Lane = .{};
+    try blockChances(&one_req, &[_]*Lane{&l1}, false);
+    try blockChances(&two_req, &[_]*Lane{ &s0, &s1 }, false);
+    for ([_]Lane{ l1, s0, s1 }) |ln| {
+        try t.expectEqual(@as(usize, 7), ln.held_n);
+        for (ln.chances[0..2]) |p| try t.expectEqual(@as(f64, 0.85), p);
+        for (ln.chances[2..]) |p| try t.expectEqual(@as(f64, 0), p);
+    }
+    // (b) Explicit TF_GLM_SHARED_DRAFT_CONFIDENCE=0.35 keeps 0.85^6=0.377 on shared rounds while lone stays at 0.70.
+    _ = sys.env.setenv("TF_GLM_DRAFT_CONFIDENCE", "0.70", 1);
+    _ = sys.env.setenv("TF_GLM_SHARED_DRAFT_CONFIDENCE", "0.35", 1);
+    l1 = .{};
+    s0 = .{};
+    s1 = .{};
+    try blockChances(&one_req, &[_]*Lane{&l1}, false);
+    try blockChances(&two_req, &[_]*Lane{ &s0, &s1 }, false);
+    for (l1.chances[0..2]) |p| try t.expectEqual(@as(f64, 0.85), p);
+    for (l1.chances[2..]) |p| try t.expectEqual(@as(f64, 0), p);
+    for ([_]Lane{ s0, s1 }) |ln| {
+        for (ln.chances[0..6]) |p| try t.expectEqual(@as(f64, 0.85), p);
+        try t.expectEqual(@as(f64, 0), ln.chances[6]);
+    }
+    // (c) Malformed shared cut is rejected by environment.parse and blockChances on multi-stream rounds.
+    for ([_][]const u8{ "bad", "-0.1", "1.05", "nan", "inf" }) |raw| {
+        try t.expectError(error.InvalidEnvironment, sys.environment.parse("TF_GLM_SHARED_DRAFT_CONFIDENCE", raw));
+    }
+    _ = sys.env.setenv("TF_GLM_SHARED_DRAFT_CONFIDENCE", "1.2", 1);
+    s0 = .{};
+    s1 = .{};
+    try t.expectError(error.InvalidEnvironment, blockChances(&two_req, &[_]*Lane{ &s0, &s1 }, false));
 }
