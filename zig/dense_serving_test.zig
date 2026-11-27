@@ -15,7 +15,8 @@ test "dense serving: owned CUDA images retain their reviewed lane and decode byt
     try std.testing.expectEqualStrings("9d9faedafd8e06afd667839a187118b6b220c794c2948532f0a849f901627a23", &hash(@embedFile("kernels/cuda/prefill_attention.cu")));
     const group = @embedFile("kernels/cuda/qmm_group.cu");
     try std.testing.expectEqualStrings("ceff4ee13e97b5aa93cbe7a1edc9a524c78aaa145dd1e5c82dcb05a3011aae23", &hash(group[0..16095]));
-    try std.testing.expectEqualStrings("8780fd710be3ce2f04e53fa1e69eb062809d3bec6391d9bd49983d0588e374d0", &hash(group));
+    // Three FP32-output tile-2 instantiations for GLM DFlash2 split down appended at the end; BF16 instances unchanged
+    try std.testing.expectEqualStrings("d2406fead811cf8ecd2e26f96fa8fce85577ec28924344221ad9a3cae6b2d6b1", &hash(group));
     // #2825 hoists copy addresses before the K loop; copy order and math match prefill_kernel.
     try std.testing.expectEqualStrings("e3724114b87cae6f6f761b2f86357f05b1693d84a0233e4d58ce46349fa853f6", &hash(@embedFile("kernels/cuda/qmm_prefill.cu")));
     // KIA14 adds all_rows (false keeps selection/arithmetic); #4706 adds TF_QWEN_PDL prologues
