@@ -4,10 +4,16 @@ const std = @import("std");
 const cuda = @import("cuda");
 const cuda_pdl = @import("cuda_pdl.zig");
 
-/// qmm_group.cu's tile-2 instantiations (LaneTile<64, 16, 64, 1, 4, 8>, bf16 and fp32 out).
-const group_symbol = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
+/// qmm_group.cu's tile-2 instantiations (16..128 rows bf16 out, and 16-row fp32 out for DFlash2 split down).
+const group_symbol = cuda.qlinear.symbols.group;
+const verify32_symbol = cuda.qlinear.symbols.verify32;
+const verify64_symbol = cuda.qlinear.symbols.verify64;
+const verify128_symbol = cuda.qlinear.symbols.verify128;
 const group_f32_symbol = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb1ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
-const group_smem: u32 = 35328; // LaneTile<64, 16, 64, 1, 4, 8>::SMEM
+const group_smem: u32 = cuda.qlinear.group_smem;
+const verify32_smem: u32 = cuda.qlinear.verify_smem;
+const verify64_smem: u32 = cuda.qlinear.verify64_smem;
+const verify128_smem: u32 = cuda.qlinear.verify128_smem;
 
 /// qmm_group.cu's Part and Parts, passed by value: four projections at most, one used here.
 const Part = extern struct { w: u64, scales: u64, biases: u64, out: u64, n: c_int, npad: c_int, sk: c_int, tiles: c_int, first: c_int };
@@ -22,6 +28,9 @@ pub const Q4 = struct { w: u64, s: u64, b: u64, n: usize, k: usize, npad: usize 
 
 pub const Kernels = struct {
     group_f32: ?cuda.Function = null,
+    verify32: ?cuda.Function = null,
+    verify64: ?cuda.Function = null,
+    verify128: ?cuda.Function = null,
     group: cuda.Function,
     pack_dense: cuda.Function,
     transpose: cuda.Function,
@@ -29,14 +38,30 @@ pub const Kernels = struct {
 
     /// From the qmm_group and affine4_pack modules.
     pub fn load(group: cuda.Module, ops: cuda.Module, ctx: *const cuda.Context) !Kernels {
-        const k: Kernels = .{
+        var k: Kernels = .{
             .group = try group.function(group_symbol),
             .pack_dense = try ops.function("tf_pack_dense"),
             .transpose = try ops.function("tf_transpose_pad16"),
             .gb10 = try ctx.attribute(.compute_capability_major) == 12 and try ctx.attribute(.compute_capability_minor) == 1,
         };
         try k.group.allowDynamicShared(group_smem);
+        k.verify32 = try group.optionalFunction(verify32_symbol);
+        if (k.verify32) |f| try f.allowDynamicShared(verify32_smem);
+        k.verify64 = try group.optionalFunction(verify64_symbol);
+        if (k.verify64) |f| try f.allowDynamicShared(verify64_smem);
+        k.verify128 = try group.optionalFunction(verify128_symbol);
+        if (k.verify128) |f| try f.allowDynamicShared(verify128_smem);
         return k;
+    }
+
+    /// Largest single-launch row step: 128 on FP32 multi-slab, else the highest contiguous BF16 verify tier loaded.
+    pub fn maxRows(ks: *const Kernels, wide: bool) usize {
+        if (wide) return 128;
+        if (ks.verify32 != null) {
+            if (ks.verify64 != null) return if (ks.verify128 != null) 128 else 64;
+            return 32;
+        }
+        return 16;
     }
 
     /// Resolve the FP32-output tile-2 kernel only when TF_GLM_DFLASH_Q4_DOWN=1 requests Q4 down projections.
@@ -90,20 +115,29 @@ pub fn pack(ks: *const Kernels, stream: cuda.Stream, words: u64, scales: u64, bi
     }
 }
 
-/// qmm.matmul of a Q4 (tile 2, up to 16 rows): x bf16 (`ldx` apart), group sums xs fp32 [rows][k/64] -> out bf16.
+/// qmm.matmul of a Q4 (up to ks.maxRows(false) rows): x bf16 (`ldx` apart), group sums xs fp32 [rows][k/64] -> bf16.
 pub fn matmul(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize) !void {
     return matmulOutput(ks, stream, x, ldx, xs, q, out, rows, false);
 }
 
 /// A row-parallel projection retains its unrounded accumulator until after tensor-parallel summation.
 pub fn matmulOutput(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize, wide: bool) !void {
-    if (rows == 0 or rows > 16) return error.WindowTooWide;
+    if (rows == 0 or rows > 128) return error.WindowTooWide;
+    const f: cuda.Function, const shared: u32, const rows_t: usize = if (wide)
+        .{ ks.group_f32 orelse return error.MissingWideQ4Kernel, group_smem, (rows + 15) / 16 }
+    else if (rows <= 16)
+        .{ ks.group, group_smem, 1 }
+    else if (rows <= 32)
+        .{ ks.verify32 orelse return error.WindowTooWide, verify32_smem, 1 }
+    else if (rows <= 64)
+        .{ ks.verify64 orelse return error.WindowTooWide, verify64_smem, 1 }
+    else
+        .{ ks.verify128 orelse return error.WindowTooWide, verify128_smem, 1 };
     const sk = splitK(q.n, q.k);
     const tiles = (q.n + 63) / 64;
     var parts: Parts = std.mem.zeroes(Parts);
     parts.count = 1;
     parts.p[0] = .{ .w = q.w, .scales = q.s, .biases = q.b, .out = out, .n = @intCast(q.n), .npad = @intCast(q.npad), .sk = @intCast(sk), .tiles = @intCast(tiles), .first = 0 };
-    const rows_t = (rows + 15) / 16;
     const clusters = rows_t * tiles; // one part: a cluster is the sk K slices of one column tile
     var a: cuda.Args = .{};
     a.add(x);
@@ -113,11 +147,10 @@ pub fn matmulOutput(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize,
     const cfg: cuda.Config = .{
         .grid = .{ .x = @intCast(clusters * sk) },
         .block = .{ .x = 128 },
-        .shared = group_smem,
+        .shared = shared,
         .cluster = if (sk > 1) .{ .x = @intCast(sk) } else null,
         .pdl = ks.gb10 and cuda_pdl.on(),
     };
-    const f = if (wide) (ks.group_f32 orelse return error.MissingWideQ4Kernel) else ks.group;
     try cuda.launch.launch(f, cfg, stream, &a);
 }
 
@@ -184,4 +217,159 @@ test "GLM Q4: load skips FP32 down symbol until prepareWide enables it" {
     try std.testing.expectEqual(@as(usize, 2), Fake.smem_calls);
     try matmulOutput(&ks, stream, 0, 4096, 0, q, 0, 8, true);
     try std.testing.expectEqual(@as(usize, 42), Fake.last_launched);
+}
+
+test "GLM Q4: wide BF16 verify tiers and FP32 multi-slab dispatch exact grids, smem, and degradation" {
+    const t = std.testing;
+    const Rec = struct {
+        var allow: [4]bool = .{ true, true, true, true }; // verify32, verify64, verify128, f32
+        var smem_by_fn: [64]u32 = @splat(0);
+        var func: usize = 0;
+        var grid_x: c_uint = 0;
+        var shared: c_uint = 0;
+        var cluster_x: c_uint = 0;
+        var arg_m: c_int = 0;
+        var arg_ldx: c_int = 0;
+        var arg_rows_t: c_int = 0;
+        var arg_c: c_int = 0;
+        fn getFn(out: *cuda.abi.Function, _: cuda.abi.Module, name: [*:0]const u8) callconv(.c) cuda.abi.Result {
+            const s = std.mem.span(name);
+            if (std.mem.eql(u8, s, group_symbol)) {
+                out.* = @ptrFromInt(10);
+                return 0;
+            }
+            if (std.mem.eql(u8, s, verify32_symbol)) {
+                if (!allow[0]) return cuda.abi.error_not_found;
+                out.* = @ptrFromInt(32);
+                return 0;
+            }
+            if (std.mem.eql(u8, s, verify64_symbol)) {
+                if (!allow[1]) return cuda.abi.error_not_found;
+                out.* = @ptrFromInt(40);
+                return 0;
+            }
+            if (std.mem.eql(u8, s, verify128_symbol)) {
+                if (!allow[2]) return cuda.abi.error_not_found;
+                out.* = @ptrFromInt(48);
+                return 0;
+            }
+            if (std.mem.eql(u8, s, group_f32_symbol)) {
+                if (!allow[3]) return cuda.abi.error_not_found;
+                out.* = @ptrFromInt(56);
+                return 0;
+            }
+            out.* = @ptrFromInt(11);
+            return 0;
+        }
+        fn setAttr(f: cuda.abi.Function, _: cuda.abi.FunctionAttribute, v: c_int) callconv(.c) cuda.abi.Result {
+            const id = @intFromPtr(f);
+            if (id < smem_by_fn.len) smem_by_fn[id] = @intCast(v);
+            return 0;
+        }
+        fn devAttr(out: *c_int, a: cuda.abi.DeviceAttribute, _: cuda.abi.Device) callconv(.c) cuda.abi.Result {
+            out.* = if (a == .compute_capability_major) 12 else 1;
+            return 0;
+        }
+        fn captureArgs(params: ?[*]?*anyopaque) void {
+            const p = params.?;
+            arg_m = @as(*const c_int, @ptrCast(@alignCast(p[3].?))).*;
+            arg_ldx = @as(*const c_int, @ptrCast(@alignCast(p[5].?))).*;
+            arg_rows_t = @as(*const c_int, @ptrCast(@alignCast(p[6].?))).*;
+            arg_c = @as(*const c_int, @ptrCast(@alignCast(p[7].?))).*;
+        }
+        fn launch(f: cuda.abi.Function, gx: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, sh: c_uint, _: cuda.abi.Stream, params: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+            func = @intFromPtr(f);
+            grid_x = gx;
+            shared = sh;
+            cluster_x = 0;
+            captureArgs(params);
+            return 0;
+        }
+        fn launchEx(c: *const cuda.abi.LaunchConfig, f: cuda.abi.Function, params: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+            func = @intFromPtr(f);
+            grid_x = c.grid_x;
+            shared = c.shared_bytes;
+            cluster_x = 0;
+            if (c.attrs) |attrs| for (attrs[0..c.num_attrs]) |at| if (at.id == .cluster_dimension) {
+                cluster_x = at.value.cluster_dim.x;
+            };
+            captureArgs(params);
+            return 0;
+        }
+    };
+    var d: cuda.Driver = undefined;
+    d.api.cuModuleGetFunction = Rec.getFn;
+    d.api.cuFuncSetAttribute = Rec.setAttr;
+    d.api.cuDeviceGetAttribute = Rec.devAttr;
+    d.api.cuLaunchKernel = Rec.launch;
+    d.api.cuLaunchKernelEx = Rec.launchEx;
+    const ctx: cuda.Context = .{ .d = &d, .device = 0, .handle = null };
+    const mod: cuda.Module = .{ .d = &d, .handle = null };
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    const q: Q4 = .{ .w = 0x1000, .s = 0x2000, .b = 0x3000, .n = 4096, .k = 4096, .npad = 4096 };
+    const tiles: usize = 64;
+    const sk = splitK(q.n, q.k);
+    try t.expectEqual(@as(usize, 4), sk);
+    // 1) All BF16 verify tiers present: load sets exact dynamic smem and maxRows(false) == 128.
+    Rec.allow = .{ true, true, true, true };
+    Rec.smem_by_fn = @splat(0);
+    var ks = try Kernels.load(mod, mod, &ctx);
+    try ks.prepareWide(mod);
+    try t.expectEqual(@as(usize, 128), ks.maxRows(false));
+    try t.expectEqual(@as(usize, 128), ks.maxRows(true));
+    try t.expectEqual(group_smem, Rec.smem_by_fn[10]);
+    try t.expectEqual(verify32_smem, Rec.smem_by_fn[32]);
+    try t.expectEqual(verify64_smem, Rec.smem_by_fn[40]);
+    try t.expectEqual(verify128_smem, Rec.smem_by_fn[48]);
+    try t.expectEqual(group_smem, Rec.smem_by_fn[56]);
+    const cases = [_]struct { rows: usize, func: usize, smem: u32 }{
+        .{ .rows = 1, .func = 10, .smem = group_smem },
+        .{ .rows = 16, .func = 10, .smem = group_smem },
+        .{ .rows = 17, .func = 32, .smem = verify32_smem },
+        .{ .rows = 32, .func = 32, .smem = verify32_smem },
+        .{ .rows = 33, .func = 40, .smem = verify64_smem },
+        .{ .rows = 64, .func = 40, .smem = verify64_smem },
+        .{ .rows = 65, .func = 48, .smem = verify128_smem },
+        .{ .rows = 128, .func = 48, .smem = verify128_smem },
+    };
+    for (cases) |c| {
+        try matmulOutput(&ks, stream, 0x4000, 4608, 0x5000, q, 0x6000, c.rows, false);
+        try t.expectEqual(c.func, Rec.func);
+        try t.expectEqual(c.smem, Rec.shared);
+        try t.expectEqual(@as(c_uint, @intCast(tiles * sk)), Rec.grid_x);
+        try t.expectEqual(@as(c_uint, @intCast(sk)), Rec.cluster_x);
+        try t.expectEqual(@as(c_int, @intCast(c.rows)), Rec.arg_m);
+        try t.expectEqual(@as(c_int, @intCast(if (c.rows == 1) q.k else 4608)), Rec.arg_ldx);
+        try t.expectEqual(@as(c_int, 1), Rec.arg_rows_t);
+        try t.expectEqual(@as(c_int, @intCast(sk)), Rec.arg_c);
+    }
+    // 2) Wide FP32 multi-slab dispatch on group_f32 across 1..128 rows (including non-multiples of 16).
+    for ([_]usize{ 1, 16, 17, 24, 32, 64, 128 }) |rows| {
+        try matmulOutput(&ks, stream, 0x4000, 4608, 0x5000, q, 0x6000, rows, true);
+        const rows_t = (rows + 15) / 16;
+        try t.expectEqual(@as(usize, 56), Rec.func);
+        try t.expectEqual(group_smem, Rec.shared);
+        try t.expectEqual(@as(c_uint, @intCast(rows_t * tiles * sk)), Rec.grid_x);
+        try t.expectEqual(@as(c_uint, @intCast(sk)), Rec.cluster_x);
+        try t.expectEqual(@as(c_int, @intCast(rows)), Rec.arg_m);
+        try t.expectEqual(@as(c_int, @intCast(if (rows == 1) q.k else 4608)), Rec.arg_ldx);
+        try t.expectEqual(@as(c_int, @intCast(rows_t)), Rec.arg_rows_t);
+        try t.expectEqual(@as(c_int, @intCast(sk)), Rec.arg_c);
+    }
+    try t.expectError(error.WindowTooWide, matmulOutput(&ks, stream, 0, 4096, 0, q, 0, 0, false));
+    try t.expectError(error.WindowTooWide, matmulOutput(&ks, stream, 0, 4096, 0, q, 0, 129, false));
+    try t.expectError(error.WindowTooWide, matmulOutput(&ks, stream, 0, 4096, 0, q, 0, 129, true));
+    // 3) Optional wide BF16 symbols degrade maxRows contiguously and refuse missing tiers cleanly.
+    Rec.allow = .{ true, true, false, false };
+    const k64 = try Kernels.load(mod, mod, &ctx);
+    try t.expectEqual(@as(usize, 64), k64.maxRows(false));
+    try t.expectError(error.WindowTooWide, matmulOutput(&k64, stream, 0, 4096, 0, q, 0, 65, false));
+    Rec.allow = .{ true, false, true, false };
+    const k32 = try Kernels.load(mod, mod, &ctx);
+    try t.expectEqual(@as(usize, 32), k32.maxRows(false));
+    try t.expectError(error.WindowTooWide, matmulOutput(&k32, stream, 0, 4096, 0, q, 0, 33, false));
+    Rec.allow = .{ false, true, true, false };
+    const k16 = try Kernels.load(mod, mod, &ctx);
+    try t.expectEqual(@as(usize, 16), k16.maxRows(false));
+    try t.expectError(error.WindowTooWide, matmulOutput(&k16, stream, 0, 4096, 0, q, 0, 17, false));
 }

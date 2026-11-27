@@ -33,9 +33,10 @@ pub const DraftHead = union(enum) {
     pub fn project(h: DraftHead, q4k: *const q4.Kernels, tfq3k: ?*const cuda.tfq3.Kernels, stream: cuda.Stream, x: u64, xs: u64, out: u64, rows: usize) !void {
         switch (h) {
             .q4 => |q| {
+                const step = q4k.maxRows(false);
                 var r0: usize = 0;
-                while (r0 < rows) : (r0 += 16) {
-                    const take = @min(16, rows - r0);
+                while (r0 < rows) : (r0 += step) {
+                    const take = @min(step, rows - r0);
                     try q4.matmul(q4k, stream, x + r0 * q.k * 2, q.k, xs + r0 * (q.k / 64) * 4, q, out + r0 * q.n * 2, take);
                 }
             },

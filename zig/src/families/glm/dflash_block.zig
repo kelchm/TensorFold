@@ -18,7 +18,7 @@ fn set(e: anytype) glue.Set {
     return .{ .glue = &e.m.glue, .mm = &e.m.mm };
 }
 
-/// out[m, n] = x[m, k] . w^T, bf16 out (`wide`: unrounded fp32 rank partials): 4 bits 16 rows a launch, or glm_mm.
+/// out[m, n] = x[m, k] . w^T, bf16 out (`wide`: unrounded fp32 rank partials): 4-bit wide tiles, or glm_mm.
 fn lin(dr: *const Drafter, e: anytype, x: u64, w: df.Lin, out: u64, m: usize, wide: bool) !void {
     switch (w) {
         .bf16 => |t| try mm.matmul(&e.m.mm, e.stream, x, t.k, t, out, dr.part, m, wide, false),
@@ -29,10 +29,11 @@ fn lin(dr: *const Drafter, e: anytype, x: u64, w: df.Lin, out: u64, m: usize, wi
             a.add(@as(i32, @intCast(q.k)));
             a.add(dr.gs);
             try go(dr.k.gsum, .{ .x = @intCast(m) }, 128, e, &a);
+            const step = e.m.q4.maxRows(wide);
+            const elem_bytes: usize = if (wide) 4 else 2;
             var r0: usize = 0;
-            while (r0 < m) : (r0 += 16) {
-                const rows = @min(16, m - r0);
-                const elem_bytes: usize = if (wide) 4 else 2;
+            while (r0 < m) : (r0 += step) {
+                const rows = @min(step, m - r0);
                 try q4.matmulOutput(&e.m.q4, e.stream, x + r0 * q.k * 2, q.k, dr.gs + r0 * (q.k / 64) * 4, q, out + r0 * q.n * elem_bytes, rows, wide);
             }
         },
