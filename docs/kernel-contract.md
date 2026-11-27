@@ -765,3 +765,11 @@ padded projection rows and nonfinite inputs. Two controls corrupt the table (rea
 sharing row 0's q and y scratch). The segments' projection rows reach their streams in one `tf_glm_kda_copy_segs`
 launch when 16-byte aligned, a byte replacement of `cuMemcpyDtoDAsync` a segment over poisoned gaps; its control
 copies each segment one unit short. `TF_GLM_KDA_SEGS=0` keeps the per-segment launches.
+
+GLM's uniform 4-bit EXL3 prompt replacements (`tf_exl3_prompt_gu_glm`, `tf_exl3_prompt_down_glm`,
+`tf_exl3_prompt_gu_glm_pc` and `tf_exl3_prompt_down_glm_h`) register as byte replacements of the retained common
+`tf_exl3_prompt_gu` and `tf_exl3_prompt_down` kernels with shared-slot skip (`int skip`). Cases cover every item size
+from 1 through 64 (and 1 through 128 for `pc`), multiple items, shared and separate rotations, both activation modes,
+nonfinite inputs, untouched skipped slots, and constant-weight FP64 accumulator stress (`contract_exl3_prompt_ref.zig`).
+Planted controls drop the last active member (narrow and `pc`), pass the active expert id as `skip`, or hand 128-member
+items to the 64-member down kernel.

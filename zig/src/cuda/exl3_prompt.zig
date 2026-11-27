@@ -8,6 +8,13 @@ const Function = @import("module.zig").Function;
 const Stream = @import("stream.zig").Stream;
 
 pub const tile = 64;
+/// TF_EXL3_PROMPT_GU's GLM gate/up: tf_exl3_prompt_gu_glm, or pc (tf_exl3_prompt_gu_glm_pc, shared rotation only).
+pub const Gu = enum { plain, pc };
+/// A launch's geometry: route tile, gate/up threads and opt-in shared bytes, down blocks per item (halves).
+pub const Geometry = struct { tile: usize, threads: u32, shared: u32 = 0, halves: usize = 1 };
+pub const narrow: Geometry = .{ .tile = tile, .threads = 256 };
+/// pc: 128-member items, 640 threads, PSMEM bytes (exl3_prompt_glm_pc.cuh); down takes each 64-member half.
+pub const pc: Geometry = .{ .tile = 2 * tile, .threads = 640, .shared = 96832, .halves = 2 };
 pub const Scratch = struct { xg: u64, xu: u64, xd: u64, rows: usize, slots: usize };
 /// A group's verified half-bit width: its own field, else uniform_k2; 0 when unverified or the two disagree.
 fn verified(group: u32, uniform: u32) u32 {
@@ -62,10 +69,10 @@ pub fn scratch(base: u64, l: ex.Layer, rows: usize, slots: usize) !Scratch {
     _ = std.math.add(u64, base, total) catch return error.Exl3Shape;
     return .{ .xg = base, .xu = if (l.shared_input) base else base + ns[0], .xd = base + ns[0] + ns[1], .rows = rows, .slots = slots };
 }
-fn go(f: Function, s: Stream, grid: [3]usize, threads: u32, values: anytype) !void {
+fn go(f: Function, s: Stream, grid: [3]usize, threads: u32, shared: u32, values: anytype) !void {
     var args: launch.Args = .{};
     inline for (values) |v| args.add(v);
-    try launch.launch(f, .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = threads } }, s, &args);
+    try launch.launch(f, .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = threads }, .shared = shared }, s, &args);
 }
 fn i(n: usize) i32 {
     return @intCast(n);
@@ -78,7 +85,14 @@ pub const Kernels = struct {
     down_k6: Function, // 3-bit down, down's arguments
     gateup_m: [3]Function, // mixed widths at 2, 3 and 4 bits: gateup's arguments, then the per-expert widths
     down_m: [3]Function,
+    gateup_glm: ?Function = null,
+    down_glm: ?Function = null,
+    gateup_glm_pc: ?Function = null, // TF_EXL3_PROMPT_GU=pc, and the half-item down kernel
+    down_glm_h: ?Function = null,
+    gu: Gu = .plain,
     pub fn resolve(mod: Module) !Kernels {
+        const wide = try mod.function("tf_exl3_prompt_gu_glm_pc");
+        try wide.allowDynamicShared(pc.shared);
         return .{
             .rotate = try mod.function("tf_exl3_prompt_rotate"),
             .gateup = try mod.function("tf_exl3_prompt_gu"),
@@ -87,10 +101,29 @@ pub const Kernels = struct {
             .down_k6 = try mod.function("tf_exl3_prompt_down_k6"),
             .gateup_m = .{ try mod.function("tf_exl3_prompt_gu_m4"), try mod.function("tf_exl3_prompt_gu_m6"), try mod.function("tf_exl3_prompt_gu_m8") },
             .down_m = .{ try mod.function("tf_exl3_prompt_down_m4"), try mod.function("tf_exl3_prompt_down_m6"), try mod.function("tf_exl3_prompt_down_m8") },
+            .gateup_glm = try mod.function("tf_exl3_prompt_gu_glm"),
+            .down_glm = try mod.function("tf_exl3_prompt_down_glm"),
+            .gateup_glm_pc = wide,
+            .down_glm_h = try mod.function("tf_exl3_prompt_down_glm_h"),
         };
+    }
+    /// GLM opts into ahead-staged 4-bit prompt kernels (and TF_EXL3_PROMPT_GU=pc); 3-bit and mixed keep common kernels.
+    pub fn runGlm(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan, y: u64, skip: ?usize) !void {
+        const w = widths(l);
+        if (w.gu != 8 or w.d != 8) return k.run(e, router, s, l, x, stride, picks, rows, sc, p, y, skip);
+        if (y % 16 != 0 or sc.xd % 8 != 0) return error.Exl3Shape;
+        var tuned = k;
+        const wide = k.gu == .pc and l.shared_input; // separate gate and up rotations keep tf_exl3_prompt_gu_glm
+        tuned.gateup = (if (wide) k.gateup_glm_pc else k.gateup_glm) orelse return error.Exl3Shape;
+        tuned.down = (if (wide) k.down_glm_h else k.down_glm) orelse return error.Exl3Shape;
+        try tuned.runAt(e, router, s, l, x, stride, picks, rows, sc, p, y, skip, if (wide) pc else narrow);
     }
     /// `skip` is the shared expert's id, equal to the routed count; its output slot stays owned by the caller.
     pub fn run(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan, y: u64, skip: ?usize) !void {
+        return k.runAt(e, router, s, l, x, stride, picks, rows, sc, p, y, skip, narrow);
+    }
+    /// `g`'s items: the plan, the gate/up grid and block, and down's blocks per item.
+    fn runAt(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan, y: u64, skip: ?usize, g: Geometry) !void {
         if (!eligible(l) or rows == 0 or rows > sc.rows or stride < l.dims or stride > std.math.maxInt(i32)) return error.Exl3Shape;
         _ = try bytes(l, rows, sc.slots);
         if (skip) |id| if (id != l.experts or l.experts == grouped.max_experts) return error.Exl3Shape;
@@ -98,26 +131,27 @@ pub const Kernels = struct {
         const skip_id: i32 = if (skip) |id| i(id) else -1;
         const pairs = rows * sc.slots;
         const w = widths(l);
-        try router.route(s, picks, pairs, count, tile, p);
+        if (g.tile != tile and (w.gu != 8 or w.d != 8)) return error.Exl3Shape;
+        try router.route(s, picks, pairs, count, g.tile, p);
         if (l.shared_input) {
-            try go(k.rotate, s, .{ rows, l.dims / 128, 1 }, 32, .{ x, i(stride), l.suh_g, sc.xg, i(l.dims) });
+            try go(k.rotate, s, .{ rows, l.dims / 128, 1 }, 32, 0, .{ x, i(stride), l.suh_g, sc.xg, i(l.dims) });
         } else {
             var args: launch.Args = .{};
             inline for (.{ x, i(stride), @as(i32, @backingInt(ex.DType.bf16)), picks, l.suh_g, l.suh_u, sc.xg, sc.xu, i(l.dims), i(sc.slots), i(l.experts) }) |v| args.add(v);
             try launch.launch(e.rot_in, .{ .grid = .{ .x = @intCast(pairs), .y = @intCast(l.dims / 128), .z = 2 }, .block = .{ .x = 32 } }, s, &args);
         }
-        const items = grouped.maxItems(pairs, count, tile);
+        const items = grouped.maxItems(pairs, count, g.tile);
         const gu = .{ sc.xg, sc.xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode, skip_id };
         if (built(w.gu)) {
-            try go(if (w.gu == 6) k.gateup_k6 else k.gateup, s, .{ l.width / 128, items, 1 }, 256, gu);
+            try go(if (w.gu == 6) k.gateup_k6 else k.gateup, s, .{ l.width / 128, items, 1 }, g.threads, g.shared, gu);
         } else for (k.gateup_m, mixed_widths) |f, k2| { // a launch a width the layer has
-            if (l.mixed_gu & @as(u32, 1) << k2 != 0) try go(f, s, .{ l.width / 128, items, 1 }, 256, gu ++ .{l.gate_k2});
+            if (l.mixed_gu & @as(u32, 1) << k2 != 0) try go(f, s, .{ l.width / 128, items, 1 }, 256, 0, gu ++ .{l.gate_k2});
         }
         const dn = .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, y, i(l.width), i(l.dims), skip_id };
         if (built(w.d)) {
-            try go(if (w.d == 6) k.down_k6 else k.down, s, .{ l.dims / 256, items, 1 }, 256, dn);
+            try go(if (w.d == 6) k.down_k6 else k.down, s, .{ l.dims / 256, items * g.halves, 1 }, 256, 0, dn);
         } else for (k.down_m, mixed_widths) |f, k2| {
-            if (l.mixed_d & @as(u32, 1) << k2 != 0) try go(f, s, .{ l.dims / 256, items, 1 }, 256, dn ++ .{l.down_k2});
+            if (l.mixed_d & @as(u32, 1) << k2 != 0) try go(f, s, .{ l.dims / 256, items, 1 }, 256, 0, dn ++ .{l.down_k2});
         }
     }
 };

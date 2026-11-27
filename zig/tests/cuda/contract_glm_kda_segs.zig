@@ -9,7 +9,7 @@ const check = @import("check.zig");
 const Rig = @import("contract_rig.zig").Rig;
 const kda = glm.kda;
 const dk = kda.dk;
-const window = 17; // covers fw.window_rows (8) and ragged multi-tile segments crossing the 16-row step boundary
+const window = 17; // covers multi-tile segments crossing the 16-row step boundary (within fw.window_rows = 32)
 const taps = 3; // a conv window's rows
 
 /// A planted fault in chainSegs' table; each must go red at the shapes gate.

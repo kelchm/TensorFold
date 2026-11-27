@@ -290,6 +290,22 @@ pub fn run_(gpu: Gpu) !void {
             }
         }
     };
+    // TF_EXL3_PROMPT_GU=pc: every slot row's bytes match ahead-staged kernels (separate rotations stay on 64-member)
+    {
+        var pc = k;
+        pc.prompt.gu = .pc;
+        for ([_]bool{ true, false }) |one| {
+            const s = try weights(&r, one, .{ 8, 8, 8 });
+            for ([_]usize{ 1, 40, 200, 1000, glm.exl3.chunk_rows + 6 }) |rows| {
+                const x = try r.bfs(rows * D, 1.0);
+                const pk = try picks(&r, rows);
+                const n = rows * slots * D * 4;
+                const plain = try r.back((try run(&r, &k, &ek, s, x, pk, rows, true)).ey, n);
+                const got = try r.back((try run(&r, &pc, &ek, s, x, pk, rows, true)).ey, n);
+                try check.expect(std.mem.eql(u8, plain, got), "glm-exl3 TF_EXL3_PROMPT_GU=pc: {d} rows, {s} match ahead-staged bytes", .{ rows, if (one) "one rotation" else "a rotation an expert" });
+            }
+        }
+    }
     // a NaN in one row's input: that row's routed slots NaN, every other row finite
     for ([_][3]u16{ .{ 8, 8, 8 }, .{ 6, 6, 8 } }) |halves| {
         const s = try weights(&r, true, halves);

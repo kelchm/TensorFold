@@ -266,3 +266,13 @@ test "stable profile: GLM's direct switches register their off and on directions
     // timing sections and waiting for an upload choose no policy
     for ([_][]const u8{ "TF_GLM_PROF", "TF_GLM_LINK_WAIT" }) |name| try t.expect(p.registered(name) == null);
 }
+
+test "stable profile: the EXL3 prompt gate/up kernel registers as identical, only pc reported, plain unless set" {
+    const e = p.entry(.TF_EXL3_PROMPT_GU);
+    try t.expectEqual(p.Class.identical, e.class);
+    try t.expect(e.applies("glm5_next", "cuda") and e.applies("glm_moe_dsa", "cuda") and !e.applies("qwen3_5", "cuda") and !e.applies("glm5_next", "metal"));
+    try t.expect(p.resolve(.stable, .TF_EXL3_PROMPT_GU, null) == null);
+    try t.expect(e.differs("pc"));
+    for ([_][]const u8{ "0", "" }) |raw| try t.expect(!e.differs(raw));
+    try t.expectEqual(p.Switch.TF_EXL3_PROMPT_GU, p.registered("TF_EXL3_PROMPT_GU").?);
+}

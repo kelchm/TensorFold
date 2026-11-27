@@ -226,6 +226,14 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
 /// The selected common EXL3 owner. This file adapts the family's checkpoint shard and slot layout only.
 pub const Kernels = cuda.exl3_experts.Experts;
 const common = cuda.exl3_experts;
+/// TF_EXL3_PROMPT_GU (GLM scope, checked at startup): 0 or unset tf_exl3_prompt_gu_glm, pc its warp-specialized form.
+pub fn promptGu(raw: ?[]const u8) common.prompt.Gu {
+    return @fromBackingInt(@intCast(@import("sys").environment.value(u32, "TF_EXL3_PROMPT_GU", raw, 0) catch 0));
+}
+/// promptGu of the process environment.
+pub fn promptGuSet() common.prompt.Gu {
+    return @fromBackingInt(@intCast(@import("sys").environment.read(u32, "TF_EXL3_PROMPT_GU", 0) catch 0));
+}
 pub const Scratch = struct { picks: u64, xg: u64, xu: u64, z: u64 };
 pub const top_k = 8;
 /// Rows a call to the common experts takes: each call reads every expert's weights, so a prompt pass needs few calls.
@@ -302,7 +310,7 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
         var at: usize = 0;
         while (at < rows) : (at += prompt_rows) {
             const n: usize = @min(prompt_rows, rows - at);
-            try k.prompt.run(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, picks + at * slots * 4, n, scratch, plan_buf, ey + at * slots * dims * 4, count);
+            try k.prompt.runGlm(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, picks + at * slots * 4, n, scratch, plan_buf, ey + at * slots * dims * 4, count);
         }
         return;
     }

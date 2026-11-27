@@ -90,6 +90,7 @@ pub const Modules = struct {
         m.glue = try glue.Kernels.load(m.mods[6]);
         m.exl3 = try exl3.Kernels.load(d);
         errdefer m.exl3.unload();
+        m.exl3.prompt.gu = exl3.promptGuSet();
         m.mm = try mm_mod.Kernels.load(m.mods[7]);
         m.mla = if (roped) try cuda.mla.Mla.load(d) else null;
         errdefer if (m.mla) |*x| x.unload();

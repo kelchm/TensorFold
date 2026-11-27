@@ -23,6 +23,7 @@ pub const Sets = struct {
     grouped: *Grouped,
     flashnext: *@import("contract_flashnext_more.zig").Set,
     exl3: *@import("contract_exl3.zig").Set,
+    exl3_prompt: *@import("contract_exl3_prompt.zig").Group,
     shared_down: *SharedDown,
     prompt: *Prompt,
     muse: *@import("contract_muse.zig").Group,
@@ -73,6 +74,8 @@ pub const Sets = struct {
             gpu.gpa.destroy(exl3);
         }
         try exl3.add(gpu, s, list);
+        const exl3_prompt = try @import("contract_exl3_prompt.zig").Group.create(a, gpu, s, list);
+        errdefer exl3_prompt.destroy();
         const shared_down = try SharedDown.create(gpu, s, &modelopt.lane, a, list);
         errdefer shared_down.deinit();
         const prompt = try gpu.gpa.create(Prompt);
@@ -119,6 +122,7 @@ pub const Sets = struct {
             .grouped = grouped,
             .flashnext = flashnext,
             .exl3 = exl3,
+            .exl3_prompt = exl3_prompt,
             .shared_down = shared_down,
             .prompt = prompt,
             .joint_schema = joint_schema,
@@ -149,6 +153,7 @@ pub const Sets = struct {
         sets.prompt.deinit();
         sets.gpa.destroy(sets.prompt);
         sets.shared_down.deinit();
+        sets.exl3_prompt.destroy();
         sets.exl3.deinit();
         sets.gpa.destroy(sets.exl3);
         sets.flashnext.deinit();

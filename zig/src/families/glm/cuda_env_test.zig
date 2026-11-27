@@ -47,7 +47,7 @@ const reals = [_][:0]const u8{ "TF_GLM_DRAFT_CONFIDENCE", "TF_GLM_SHARED_DRAFT_C
 const ranks = [_][:0]const u8{ "TF_GLM_RANK", "TF_GLM_WORLD" };
 /// The window GLM may serve past config.json's: GLM's raisedCeiling reads it at the open, after these rows' check.
 const windows = [_][:0]const u8{"TF_GLM_CONTEXT_CEILING"};
-const words = [_][:0]const u8{ "TF_GLM_EXPERT_FORM", "TF_GLM_KDA_STEP_WARPS" };
+const words = [_][:0]const u8{ "TF_GLM_EXPERT_FORM", "TF_GLM_KDA_STEP_WARPS", "TF_EXL3_PROMPT_GU" };
 const added = [_][:0]const u8{ "TF_GLM_INDEX_CUDA", "TF_GLM_INDEX_SPLIT", "TF_GLM_KV_HOST_GIB" };
 
 /// The row by name without `rule`, so a missing row fails an assertion instead of panicking.
@@ -91,7 +91,7 @@ test "GLM strict env: every GLM reader's name is a glm row, and the glm scope ho
     for (ranks) |name| try t.expectEqual(e.Kind.u32, (try row(name)).kind);
     var n: usize = 0;
     for (e.rules) |r| if (r.scope == .glm) {
-        try t.expect(std.mem.startsWith(u8, r.name, "TF_GLM_"));
+        try t.expect(std.mem.startsWith(u8, r.name, "TF_GLM_") or std.mem.eql(u8, r.name, "TF_EXL3_PROMPT_GU"));
         n += 1;
     };
     try t.expectEqual(switches.len + counts.len + reals.len + windows.len + words.len + added.len + ranks.len, n);
@@ -118,6 +118,21 @@ test "GLM strict env: the expert form takes classic or factored, leaves blank to
     try t.expectEqual(@as(?u64, 0), try e.value(?u64, words[0], "classic", null));
     try t.expectEqual(@as(?u64, 1), try e.value(?u64, words[0], "factored", null));
     for ([_][]const u8{ "Classic", "FACTORED", "0", "1", "race", "auto", " classic", "factored " }) |raw| try check(words[0], raw, false);
+}
+
+test "GLM strict env: EXL3 prompt gate/up accepts 0 or pc and refuses other words" {
+    const name = "TF_EXL3_PROMPT_GU";
+    const exl3 = @import("cuda_exl3.zig");
+    try t.expectEqualSlices([]const u8, &.{ "0", "pc" }, (try row(name)).words);
+    for ([_]?[]const u8{ null, "", " ", " \t\r\n", "0", " 0 " }) |raw| {
+        try t.expectEqual(@import("cuda").exl3_experts.prompt.Gu.plain, exl3.promptGu(raw));
+        if (raw) |v| try check(name, v, true);
+    }
+    for ([_][]const u8{ "pc", " pc\t" }) |raw| {
+        try t.expectEqual(@import("cuda").exl3_experts.prompt.Gu.pc, exl3.promptGu(raw));
+        try check(name, raw, true);
+    }
+    for ([_][]const u8{ "1", "PC", "wide", "plain" }) |raw| try check(name, raw, false);
 }
 
 test "GLM strict env: KDA step warps accept auto, 8, 4 or 2 and refuse other words" {

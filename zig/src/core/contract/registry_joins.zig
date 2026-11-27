@@ -59,6 +59,7 @@ pub const nvcc_133_after = @import("flashnext_tile_records.zig").cuda_133 ++
 pub const cuda_pending = @import("qwen_whole_records.zig").records ++
     @import("flashnext_tile_records.zig").pending ++
     @import("exl3_prompt_pending.zig").records ++
+    @import("exl3_prompt_glm_records.zig").records ++
     @import("nemotron_draw_records.zig").records ++
     @import("cuda_lane_pending.zig").records ++
     @import("moss_image_encoder_records.zig").records ++
@@ -183,4 +184,5 @@ test {
     _ = @import("hy4_ihc_hc_records.zig");
     _ = @import("glm_kda_segs_records.zig");
     _ = @import("glm_hc_split_records.zig");
+    _ = @import("exl3_prompt_glm_records.zig");
 }
