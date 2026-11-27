@@ -314,6 +314,12 @@ extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1(const unsigned sh
   glm_pdl::enter();
   glm_top1<false>(logits, n, lo, out);
 }
+extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1_rows(const unsigned short* logits, int64_t n,
+                                                                    unsigned lo, unsigned* out) {
+  glm_pdl::enter();
+  const int64_t r = static_cast<int64_t>(blockIdx.x);
+  glm_top1<false>(logits + r * n, n, lo, out + static_cast<size_t>(r) * 4);
+}
 // The pick with its slice's softmax sum in out[2]: an MTP draft's chance (--mtp-confidence) across the ranks.
 extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1_sums(const unsigned short* logits, int64_t n,
                                                                      unsigned lo, unsigned* out) {

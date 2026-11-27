@@ -47,6 +47,7 @@ pub const Kernels = struct {
     combine_tail: cuda.Function,
     slice_sum: cuda.Function,
     top1: cuda.Function,
+    top1_rows: ?cuda.Function = null,
     top1_sums: cuda.Function,
     put_words: cuda.Function,
     embed_b16: cuda.Function,
@@ -90,7 +91,12 @@ pub const Kernels = struct {
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
-        inline for (@typeInfo(Kernels).@"struct".field_names) |name| @field(k, name) = try m.function("tf_glm_" ++ name);
+        inline for (@typeInfo(Kernels).@"struct".field_names) |name| {
+            @field(k, name) = if (@typeInfo(@FieldType(Kernels, name)) == .optional)
+                try m.optionalFunction("tf_glm_" ++ name)
+            else
+                try m.function("tf_glm_" ++ name);
+        }
         try k.bmm_tile.allowDynamicShared(bmm_tile_smem);
         try k.bmm_tile1.allowDynamicShared(bmm_tile1_smem[1]);
         try k.chunks_16.allowDynamicShared(chunksSmem(16));
@@ -335,4 +341,32 @@ test "the wrappers' shape rules as glue.py's" {
     try std.testing.expectError(error.NoSwigluBlock, swigluBlock(96));
     try std.testing.expectEqual(@as(i64, 512), pow2(288 + 1)); // _topk's BLOCK for 288 experts
     try std.testing.expectEqual(@as(i64, 16), pow2(8 + 1)); // its SLOTP for top-8 and the shared slot
+}
+
+test "Kernels.load resolves optional tf_glm_top1_rows when present and leaves it null on older fatbins" {
+    const Mock = struct {
+        var have_rows = true;
+        fn getFn(out: *cuda.abi.Function, _: cuda.abi.Module, name: [*:0]const u8) callconv(.c) cuda.abi.Result {
+            const s = std.mem.span(name);
+            if (std.mem.eql(u8, s, "tf_glm_top1_rows")) {
+                if (!have_rows) return cuda.abi.error_not_found;
+                out.* = @ptrFromInt(99);
+                return 0;
+            }
+            out.* = @ptrFromInt(17);
+            return 0;
+        }
+        fn setAttr(_: cuda.abi.Function, _: cuda.abi.FunctionAttribute, _: c_int) callconv(.c) cuda.abi.Result {
+            return 0;
+        }
+    };
+    var d: cuda.Driver = undefined;
+    d.api.cuModuleGetFunction = Mock.getFn;
+    d.api.cuFuncSetAttribute = Mock.setAttr;
+    Mock.have_rows = true;
+    const with_rows = try Kernels.load(.{ .d = &d, .handle = null });
+    try std.testing.expectEqual(@as(usize, 99), @intFromPtr(with_rows.top1_rows.?.handle));
+    Mock.have_rows = false;
+    const legacy = try Kernels.load(.{ .d = &d, .handle = null });
+    try std.testing.expect(legacy.top1_rows == null);
 }

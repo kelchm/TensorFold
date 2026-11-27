@@ -53,7 +53,14 @@ pub fn greedyRows(e: *Engine, logits: u64, rows: usize, out: []u32) !void {
     const world = e.share.world;
     const bytes = rows * pair_bytes;
     const mine = e.pairs.ptr + e.share.rank * bytes;
-    for (0..rows) |r| {
+    if (e.m.glue.top1_rows) |f| {
+        var a: cuda.Args = .{};
+        a.add(logits);
+        a.add(@as(i64, @intCast(e.share.vocab.len())));
+        a.add(@as(u32, @intCast(e.share.vocab.lo)));
+        a.add(mine);
+        try cuda_pdl.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, e.stream, &a);
+    } else for (0..rows) |r| {
         var a: cuda.Args = .{};
         a.add(logits + r * e.share.vocab.len() * 2);
         a.add(@as(i64, @intCast(e.share.vocab.len())));
@@ -102,12 +109,21 @@ test "verifyShared drawShared batches greedy top-1 into one gather and falls bac
     const Seq = @import("cuda_engine_types.zig").Seq;
     const vocab_len: usize = 64;
     const base_logits: u64 = 0x100000;
+    const h_top1: cuda.abi.Function = @ptrFromInt(1);
+    const h_top1_rows: cuda.abi.Function = @ptrFromInt(2);
     const Mock = struct {
         var r0: [14][4]u32 = undefined;
         var r1: [14][4]u32 = undefined;
         var pairs_dev: [2 * 32][4]u32 = undefined;
         var row_for_slot: [32]usize = undefined;
         var top1_calls: usize = 0;
+        var top1_rows_calls: usize = 0;
+        var last_grid_x: c_uint = 0;
+        var last_block_x: c_uint = 0;
+        var last_logits: u64 = 0;
+        var last_n: i64 = 0;
+        var last_lo: u32 = 0;
+        var last_out: u64 = 0;
         var gathers: usize = 0;
         var gather_bytes: usize = 0;
         var syncs: usize = 0;
@@ -115,19 +131,42 @@ test "verifyShared drawShared batches greedy top-1 into one gather and falls bac
         var sampled_gathers: usize = 0;
         fn reset() void {
             top1_calls = 0;
+            top1_rows_calls = 0;
+            last_grid_x = 0;
+            last_block_x = 0;
+            last_logits = 0;
+            last_n = 0;
+            last_lo = 0;
+            last_out = 0;
             gathers = 0;
             gather_bytes = 0;
             syncs = 0;
             downloads = 0;
             sampled_gathers = 0;
         }
-        fn launch(_: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, params: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+        fn launch(func: cuda.abi.Function, gx: c_uint, _: c_uint, _: c_uint, bx: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, params: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
             const logits = @as(*const u64, @ptrCast(@alignCast(params.?[0].?))).*;
+            const n = @as(*const i64, @ptrCast(@alignCast(params.?[1].?))).*;
+            const lo = @as(*const u32, @ptrCast(@alignCast(params.?[2].?))).*;
             const dst = @as(*const u64, @ptrCast(@alignCast(params.?[3].?))).*;
-            const row = @as(usize, @intCast((logits - base_logits) / (vocab_len * 2)));
-            const idx = @as(usize, @intCast((dst - @intFromPtr(&pairs_dev)) / pair_bytes));
-            pairs_dev[idx] = r0[row];
-            row_for_slot[idx] = row;
+            last_grid_x = gx;
+            last_block_x = bx;
+            last_logits = logits;
+            last_n = n;
+            last_lo = lo;
+            last_out = dst;
+            const row0 = @as(usize, @intCast((logits - base_logits) / (vocab_len * 2)));
+            const idx0 = @as(usize, @intCast((dst - @intFromPtr(&pairs_dev)) / pair_bytes));
+            if (func == h_top1_rows) {
+                for (0..@intCast(gx)) |r| {
+                    pairs_dev[idx0 + r] = r0[row0 + r];
+                    row_for_slot[idx0 + r] = row0 + r;
+                }
+                top1_rows_calls += 1;
+                return 0;
+            }
+            pairs_dev[idx0] = r0[row0];
+            row_for_slot[idx0] = row0;
             top1_calls += 1;
             return 0;
         }
@@ -218,7 +257,8 @@ test "verifyShared drawShared batches greedy top-1 into one gather and falls bac
     e.structured = false;
     e.profiling_prompt = null;
     e.stream = .{ .d = &d, .handle = null };
-    e.m.glue.top1 = .{ .d = &d, .handle = null };
+    e.m.glue.top1 = .{ .d = &d, .handle = h_top1 };
+    e.m.glue.top1_rows = .{ .d = &d, .handle = h_top1_rows };
     e.pairs = .{ .d = &d, .ptr = @intFromPtr(&Mock.pairs_dev), .len = @sizeOf(@TypeOf(Mock.pairs_dev)), .borrowed = true };
     e.smp.d = &d;
     e.smp.vocab = 2 * vocab_len;
@@ -243,11 +283,18 @@ test "verifyShared drawShared batches greedy top-1 into one gather and falls bac
         segs[i] = .{ .st = &seqs[i].st, .row0 = off, .rows = w };
         off += w;
     }
-    // 1) All-greedy 4-stream shared draw: 1 gather, 1 sync, 1 download, identical outputs and per-slot rows_at.
+    // 1) All-greedy 4-stream shared draw with top1_rows: 1 launch (grid.x=14), 1 gather, 1 sync, 1 download.
     try t.expect(canBatchGreedy(&e, &parts, 14));
     Mock.reset();
     try drawShared(&e, &b, &parts, &segs, 14);
-    try t.expectEqual(@as(usize, 14), Mock.top1_calls);
+    try t.expectEqual(@as(usize, 1), Mock.top1_rows_calls);
+    try t.expectEqual(@as(usize, 0), Mock.top1_calls);
+    try t.expectEqual(@as(c_uint, 14), Mock.last_grid_x);
+    try t.expectEqual(@as(c_uint, 1024), Mock.last_block_x);
+    try t.expectEqual(base_logits, Mock.last_logits);
+    try t.expectEqual(@as(i64, @intCast(vocab_len)), Mock.last_n);
+    try t.expectEqual(@as(u32, 0), Mock.last_lo);
+    try t.expectEqual(e.pairs.ptr, Mock.last_out);
     try t.expectEqual(@as(usize, 1), Mock.gathers);
     try t.expectEqual(@as(usize, 14 * pair_bytes), Mock.gather_bytes);
     try t.expectEqual(@as(usize, 1), Mock.syncs);
@@ -256,6 +303,23 @@ test "verifyShared drawShared batches greedy top-1 into one gather and falls bac
     try t.expectEqual(@as(u32, 3), e.slot);
     try t.expectEqual(&seqs[3], e.cur);
     for (segs, 0..) |g, i| try t.expectEqual(b.fnormed + g.row0 * e.c.hidden * 2, seqs[i].rows_at);
+    // Legacy fatbin fallback (top1_rows == null): 14 per-row top1 launches, 1 gather, identical outputs.
+    e.m.glue.top1_rows = null;
+    Mock.reset();
+    @memset(&out_batched, 0);
+    try drawShared(&e, &b, &parts, &segs, 14);
+    try t.expectEqual(@as(usize, 0), Mock.top1_rows_calls);
+    try t.expectEqual(@as(usize, 14), Mock.top1_calls);
+    try t.expectEqual(@as(usize, 1), Mock.gathers);
+    try t.expectEqualSlices(u32, &expected, &out_batched);
+    // Single-row greedyRows still dispatches 1-row top1 even when top1_rows is loaded.
+    e.m.glue.top1_rows = .{ .d = &d, .handle = h_top1_rows };
+    Mock.reset();
+    var one_tok: [1]u32 = .{0};
+    try greedyRows(&e, base_logits, 1, &one_tok);
+    try t.expectEqual(@as(usize, 0), Mock.top1_rows_calls);
+    try t.expectEqual(@as(usize, 1), Mock.top1_calls);
+    try t.expectEqual(expected[0], one_tok[0]);
     // Single-part loop produces the exact same tokens with 4 separate gathers/syncs/downloads.
     Mock.reset();
     for (0..4) |i| {
