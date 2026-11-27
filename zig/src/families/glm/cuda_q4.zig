@@ -4,12 +4,14 @@ const std = @import("std");
 const cuda = @import("cuda");
 const cuda_pdl = @import("cuda_pdl.zig");
 
-/// qmm_group.cu's tile-2 instantiations (16..128 rows bf16 out, and 16-row fp32 out for DFlash2 split down).
+/// qmm_group.cu's tile-2 instantiations (16..128 rows bf16 out, and 16/32/64-row fp32 out for DFlash2 split down).
 const group_symbol = cuda.qlinear.symbols.group;
 const verify32_symbol = cuda.qlinear.symbols.verify32;
 const verify64_symbol = cuda.qlinear.symbols.verify64;
 const verify128_symbol = cuda.qlinear.symbols.verify128;
 const group_f32_symbol = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb1ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
+const verify32_f32_symbol = "_ZN12tf_qmm_group12group_kernelILi64ELi32ELi64ELi1ELi4ELi5ELb1ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
+const verify64_f32_symbol = "_ZN12tf_qmm_group12group_kernelILi64ELi64ELi64ELi1ELi4ELi4ELb1ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
 const group_smem: u32 = cuda.qlinear.group_smem;
 const verify32_smem: u32 = cuda.qlinear.verify_smem;
 const verify64_smem: u32 = cuda.qlinear.verify64_smem;
@@ -28,6 +30,8 @@ pub const Q4 = struct { w: u64, s: u64, b: u64, n: usize, k: usize, npad: usize 
 
 pub const Kernels = struct {
     group_f32: ?cuda.Function = null,
+    verify32_f32: ?cuda.Function = null,
+    verify64_f32: ?cuda.Function = null,
     verify32: ?cuda.Function = null,
     verify64: ?cuda.Function = null,
     verify128: ?cuda.Function = null,
@@ -64,7 +68,7 @@ pub const Kernels = struct {
         return 16;
     }
 
-    /// Resolve the FP32-output tile-2 kernel only when TF_GLM_DFLASH_Q4_DOWN=1 requests Q4 down projections.
+    /// Resolve FP32-output tile-2 kernels only when TF_GLM_DFLASH_Q4_DOWN=1 requests Q4 down projections.
     pub fn prepareWide(k: *Kernels, group: cuda.Module) !void {
         if (k.group_f32 != null) return;
         const f = try group.optionalFunction(group_f32_symbol) orelse {
@@ -72,7 +76,13 @@ pub const Kernels = struct {
             return error.MissingWideQ4Kernel;
         };
         try f.allowDynamicShared(group_smem);
+        const v32 = try group.optionalFunction(verify32_f32_symbol);
+        if (v32) |g| try g.allowDynamicShared(verify32_smem);
+        const v64 = try group.optionalFunction(verify64_f32_symbol);
+        if (v64) |g| try g.allowDynamicShared(verify64_smem);
         k.group_f32 = f;
+        k.verify32_f32 = v32;
+        k.verify64_f32 = v64;
     }
 };
 
@@ -120,11 +130,24 @@ pub fn matmul(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u
     return matmulOutput(ks, stream, x, ldx, xs, q, out, rows, false);
 }
 
+/// Pick the widest loaded FP32-output tile avoiding redundant weight reads across 1..128 rows.
+fn wideTile(ks: *const Kernels, rows: usize) !struct { cuda.Function, u32, usize } {
+    const base = ks.group_f32 orelse return error.MissingWideQ4Kernel;
+    if (rows <= 16) return .{ base, group_smem, 1 };
+    if (rows <= 32) {
+        if (ks.verify32_f32) |f| return .{ f, verify32_smem, 1 };
+        return .{ base, group_smem, (rows + 15) / 16 };
+    }
+    if (ks.verify64_f32) |f| return .{ f, verify64_smem, (rows + 63) / 64 };
+    if (ks.verify32_f32) |f| return .{ f, verify32_smem, (rows + 31) / 32 };
+    return .{ base, group_smem, (rows + 15) / 16 };
+}
+
 /// A row-parallel projection retains its unrounded accumulator until after tensor-parallel summation.
 pub fn matmulOutput(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize, wide: bool) !void {
     if (rows == 0 or rows > 128) return error.WindowTooWide;
     const f: cuda.Function, const shared: u32, const rows_t: usize = if (wide)
-        .{ ks.group_f32 orelse return error.MissingWideQ4Kernel, group_smem, (rows + 15) / 16 }
+        try wideTile(ks, rows)
     else if (rows <= 16)
         .{ ks.group, group_smem, 1 }
     else if (rows <= 32)
@@ -174,6 +197,9 @@ test "GLM Q4: load skips FP32 down symbol until prepareWide enables it" {
                 out.* = @ptrFromInt(42);
                 return 0;
             }
+            if (std.mem.eql(u8, s, verify32_f32_symbol) or std.mem.eql(u8, s, verify64_f32_symbol)) {
+                return cuda.abi.error_not_found;
+            }
             out.* = @ptrFromInt(11);
             return 0;
         }
@@ -207,7 +233,7 @@ test "GLM Q4: load skips FP32 down symbol until prepareWide enables it" {
     const stream: cuda.Stream = .{ .d = &d, .handle = null };
     const q: Q4 = .{ .w = 0, .s = 0, .b = 0, .n = 4096, .k = 4096, .npad = 4096 };
     var ks = try Kernels.load(mod, mod, &ctx);
-    try std.testing.expect(ks.group_f32 == null);
+    try std.testing.expect(ks.group_f32 == null and ks.verify32_f32 == null and ks.verify64_f32 == null);
     try std.testing.expectEqual(@as(usize, 1), Fake.smem_calls);
     try std.testing.expectError(error.MissingWideQ4Kernel, matmulOutput(&ks, stream, 0, 4096, 0, q, 0, 8, true));
     try std.testing.expectError(error.MissingWideQ4Kernel, ks.prepareWide(mod));
@@ -222,7 +248,7 @@ test "GLM Q4: load skips FP32 down symbol until prepareWide enables it" {
 test "GLM Q4: wide BF16 verify tiers and FP32 multi-slab dispatch exact grids, smem, and degradation" {
     const t = std.testing;
     const Rec = struct {
-        var allow: [4]bool = .{ true, true, true, true }; // verify32, verify64, verify128, f32
+        var allow: [6]bool = .{ true, true, true, true, true, true }; // v32, v64, v128, f32, v32_f32, v64_f32
         var smem_by_fn: [64]u32 = @splat(0);
         var func: usize = 0;
         var grid_x: c_uint = 0;
@@ -256,6 +282,16 @@ test "GLM Q4: wide BF16 verify tiers and FP32 multi-slab dispatch exact grids, s
             if (std.mem.eql(u8, s, group_f32_symbol)) {
                 if (!allow[3]) return cuda.abi.error_not_found;
                 out.* = @ptrFromInt(56);
+                return 0;
+            }
+            if (std.mem.eql(u8, s, verify32_f32_symbol)) {
+                if (!allow[4]) return cuda.abi.error_not_found;
+                out.* = @ptrFromInt(60);
+                return 0;
+            }
+            if (std.mem.eql(u8, s, verify64_f32_symbol)) {
+                if (!allow[5]) return cuda.abi.error_not_found;
+                out.* = @ptrFromInt(62);
                 return 0;
             }
             out.* = @ptrFromInt(11);
@@ -310,8 +346,8 @@ test "GLM Q4: wide BF16 verify tiers and FP32 multi-slab dispatch exact grids, s
     const tiles: usize = 64;
     const sk = splitK(q.n, q.k);
     try t.expectEqual(@as(usize, 4), sk);
-    // 1) All BF16 verify tiers present: load sets exact dynamic smem and maxRows(false) == 128.
-    Rec.allow = .{ true, true, true, true };
+    // 1) All BF16 and FP32 verify tiers present: load + prepareWide set exact dynamic smem.
+    Rec.allow = .{ true, true, true, true, true, true };
     Rec.smem_by_fn = @splat(0);
     var ks = try Kernels.load(mod, mod, &ctx);
     try ks.prepareWide(mod);
@@ -322,7 +358,9 @@ test "GLM Q4: wide BF16 verify tiers and FP32 multi-slab dispatch exact grids, s
     try t.expectEqual(verify64_smem, Rec.smem_by_fn[40]);
     try t.expectEqual(verify128_smem, Rec.smem_by_fn[48]);
     try t.expectEqual(group_smem, Rec.smem_by_fn[56]);
-    const cases = [_]struct { rows: usize, func: usize, smem: u32 }{
+    try t.expectEqual(verify32_smem, Rec.smem_by_fn[60]);
+    try t.expectEqual(verify64_smem, Rec.smem_by_fn[62]);
+    const bf16_cases = [_]struct { rows: usize, func: usize, smem: u32 }{
         .{ .rows = 1, .func = 10, .smem = group_smem },
         .{ .rows = 16, .func = 10, .smem = group_smem },
         .{ .rows = 17, .func = 32, .smem = verify32_smem },
@@ -332,7 +370,7 @@ test "GLM Q4: wide BF16 verify tiers and FP32 multi-slab dispatch exact grids, s
         .{ .rows = 65, .func = 48, .smem = verify128_smem },
         .{ .rows = 128, .func = 48, .smem = verify128_smem },
     };
-    for (cases) |c| {
+    for (bf16_cases) |c| {
         try matmulOutput(&ks, stream, 0x4000, 4608, 0x5000, q, 0x6000, c.rows, false);
         try t.expectEqual(c.func, Rec.func);
         try t.expectEqual(c.smem, Rec.shared);
@@ -343,32 +381,75 @@ test "GLM Q4: wide BF16 verify tiers and FP32 multi-slab dispatch exact grids, s
         try t.expectEqual(@as(c_int, 1), Rec.arg_rows_t);
         try t.expectEqual(@as(c_int, @intCast(sk)), Rec.arg_c);
     }
-    // 2) Wide FP32 multi-slab dispatch on group_f32 across 1..128 rows (including non-multiples of 16).
-    for ([_]usize{ 1, 16, 17, 24, 32, 64, 128 }) |rows| {
-        try matmulOutput(&ks, stream, 0x4000, 4608, 0x5000, q, 0x6000, rows, true);
-        const rows_t = (rows + 15) / 16;
-        try t.expectEqual(@as(usize, 56), Rec.func);
-        try t.expectEqual(group_smem, Rec.shared);
-        try t.expectEqual(@as(c_uint, @intCast(rows_t * tiles * sk)), Rec.grid_x);
-        try t.expectEqual(@as(c_uint, @intCast(sk)), Rec.cluster_x);
-        try t.expectEqual(@as(c_int, @intCast(rows)), Rec.arg_m);
-        try t.expectEqual(@as(c_int, @intCast(if (rows == 1) q.k else 4608)), Rec.arg_ldx);
-        try t.expectEqual(@as(c_int, @intCast(rows_t)), Rec.arg_rows_t);
-        try t.expectEqual(@as(c_int, @intCast(sk)), Rec.arg_c);
+    // 2) Wide FP32 dispatch across full (v32+v64), partial (v32-only, v64-only), and group_f32-only fallback sets.
+    const WideCase = struct { rows: usize, func: usize, smem: u32, rows_t: usize };
+    const sets = [_]struct { v32: bool, v64: bool, want: [7]WideCase }{
+        .{ .v32 = true, .v64 = true, .want = .{
+            .{ .rows = 16, .func = 56, .smem = group_smem, .rows_t = 1 },
+            .{ .rows = 17, .func = 60, .smem = verify32_smem, .rows_t = 1 },
+            .{ .rows = 32, .func = 60, .smem = verify32_smem, .rows_t = 1 },
+            .{ .rows = 33, .func = 62, .smem = verify64_smem, .rows_t = 1 },
+            .{ .rows = 64, .func = 62, .smem = verify64_smem, .rows_t = 1 },
+            .{ .rows = 65, .func = 62, .smem = verify64_smem, .rows_t = 2 },
+            .{ .rows = 128, .func = 62, .smem = verify64_smem, .rows_t = 2 },
+        } },
+        .{ .v32 = true, .v64 = false, .want = .{
+            .{ .rows = 16, .func = 56, .smem = group_smem, .rows_t = 1 },
+            .{ .rows = 17, .func = 60, .smem = verify32_smem, .rows_t = 1 },
+            .{ .rows = 32, .func = 60, .smem = verify32_smem, .rows_t = 1 },
+            .{ .rows = 33, .func = 60, .smem = verify32_smem, .rows_t = 2 },
+            .{ .rows = 64, .func = 60, .smem = verify32_smem, .rows_t = 2 },
+            .{ .rows = 65, .func = 60, .smem = verify32_smem, .rows_t = 3 },
+            .{ .rows = 128, .func = 60, .smem = verify32_smem, .rows_t = 4 },
+        } },
+        .{ .v32 = false, .v64 = true, .want = .{
+            .{ .rows = 16, .func = 56, .smem = group_smem, .rows_t = 1 },
+            .{ .rows = 17, .func = 56, .smem = group_smem, .rows_t = 2 },
+            .{ .rows = 32, .func = 56, .smem = group_smem, .rows_t = 2 },
+            .{ .rows = 33, .func = 62, .smem = verify64_smem, .rows_t = 1 },
+            .{ .rows = 64, .func = 62, .smem = verify64_smem, .rows_t = 1 },
+            .{ .rows = 65, .func = 62, .smem = verify64_smem, .rows_t = 2 },
+            .{ .rows = 128, .func = 62, .smem = verify64_smem, .rows_t = 2 },
+        } },
+        .{ .v32 = false, .v64 = false, .want = .{
+            .{ .rows = 16, .func = 56, .smem = group_smem, .rows_t = 1 },
+            .{ .rows = 17, .func = 56, .smem = group_smem, .rows_t = 2 },
+            .{ .rows = 32, .func = 56, .smem = group_smem, .rows_t = 2 },
+            .{ .rows = 33, .func = 56, .smem = group_smem, .rows_t = 3 },
+            .{ .rows = 64, .func = 56, .smem = group_smem, .rows_t = 4 },
+            .{ .rows = 65, .func = 56, .smem = group_smem, .rows_t = 5 },
+            .{ .rows = 128, .func = 56, .smem = group_smem, .rows_t = 8 },
+        } },
+    };
+    for (sets) |set| {
+        Rec.allow = .{ true, true, true, true, set.v32, set.v64 };
+        var kw = try Kernels.load(mod, mod, &ctx);
+        try kw.prepareWide(mod);
+        for (set.want) |w| {
+            try matmulOutput(&kw, stream, 0x4000, 4608, 0x5000, q, 0x6000, w.rows, true);
+            try t.expectEqual(w.func, Rec.func);
+            try t.expectEqual(w.smem, Rec.shared);
+            try t.expectEqual(@as(c_uint, @intCast(w.rows_t * tiles * sk)), Rec.grid_x);
+            try t.expectEqual(@as(c_uint, @intCast(sk)), Rec.cluster_x);
+            try t.expectEqual(@as(c_int, @intCast(w.rows)), Rec.arg_m);
+            try t.expectEqual(@as(c_int, 4608), Rec.arg_ldx);
+            try t.expectEqual(@as(c_int, @intCast(w.rows_t)), Rec.arg_rows_t);
+            try t.expectEqual(@as(c_int, @intCast(sk)), Rec.arg_c);
+        }
     }
     try t.expectError(error.WindowTooWide, matmulOutput(&ks, stream, 0, 4096, 0, q, 0, 0, false));
     try t.expectError(error.WindowTooWide, matmulOutput(&ks, stream, 0, 4096, 0, q, 0, 129, false));
     try t.expectError(error.WindowTooWide, matmulOutput(&ks, stream, 0, 4096, 0, q, 0, 129, true));
     // 3) Optional wide BF16 symbols degrade maxRows contiguously and refuse missing tiers cleanly.
-    Rec.allow = .{ true, true, false, false };
+    Rec.allow = .{ true, true, false, false, false, false };
     const k64 = try Kernels.load(mod, mod, &ctx);
     try t.expectEqual(@as(usize, 64), k64.maxRows(false));
     try t.expectError(error.WindowTooWide, matmulOutput(&k64, stream, 0, 4096, 0, q, 0, 65, false));
-    Rec.allow = .{ true, false, true, false };
+    Rec.allow = .{ true, false, true, false, false, false };
     const k32 = try Kernels.load(mod, mod, &ctx);
     try t.expectEqual(@as(usize, 32), k32.maxRows(false));
     try t.expectError(error.WindowTooWide, matmulOutput(&k32, stream, 0, 4096, 0, q, 0, 33, false));
-    Rec.allow = .{ false, true, true, false };
+    Rec.allow = .{ false, true, true, false, false, false };
     const k16 = try Kernels.load(mod, mod, &ctx);
     try t.expectEqual(@as(usize, 16), k16.maxRows(false));
     try t.expectError(error.WindowTooWide, matmulOutput(&k16, stream, 0, 4096, 0, q, 0, 17, false));
