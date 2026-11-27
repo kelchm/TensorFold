@@ -86,6 +86,7 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
 | `TF_GLM_PROMPT_STEPS` | Exactly `0` or `1`; default on (GLM prompt passes in chunks); read on rank 0 |
 | `TF_GLM_MULTI_PREFILL` | Exactly `0` or `1`; default off (`1` batches fresh short text prompts up to 512 tokens in one pass beside stepped fills); read on rank 0 |
 | `TF_GLM_SHARED` | Exactly `0` or `1`; default on (GLM windows share a forward); read on rank 0 |
+| `TF_GLM_SHARED_KDA_WIDE` | Exactly `0` or `1`, agreed across ranks; unset inherits `TF_GLM_KDA_DECODE_WIDE`. `0` runs multi-stream shared verify KDA segments on the single-kernel chain below 64 rows while leaving lone decode windows on `TF_GLM_KDA_DECODE_WIDE` |
 | `TF_GLM_DSEL` | Exactly `0` or `1`; default on (a GLM decode window's DSA select runs on many CTAs; 0 keeps one CTA a row) |
 | `TF_GLM_DSCORES` | Exactly `0` or `1`; default on (a GLM decode window's DSA index scores run on glm_index_scores; 0 keeps tf_glm_scores) |
 | `TF_GLM_MOE_DIRECT` | Exactly `0` or `1`; default off. On, a GLM decode window's EXL3 experts read the top-k kernel's flat picks and leave their slot rows in place, summed with the shared expert's row by one kernel: no row copies and no slot write, the same bytes (#3570) |

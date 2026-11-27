@@ -16,6 +16,7 @@ pub const Settings = struct {
     split: bool = true, // TF_GLM_PREFILL_REDUCE: split (each rank glues its own rows), ring or gather
     ring: bool = false, // TF_GLM_PREFILL_REDUCE=ring: split, its exchanges passed along the ring (cuda_relay)
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE: 1 (decode windows on KDA's three-kernel chain) or 0
+    shared_kda_wide: bool = true, // TF_GLM_SHARED_KDA_WIDE: shared verify KDA chains (unset: inherits kda_wide)
     kda_pad: bool = false, // TF_GLM_KDA_PAD: 1 (an uneven fused KDA input, padded at load, tiled for glm_mm) or 0
     pieces: u32 = 3, // TF_GLM_OVERLAP_PIECES: a prompt chunk's exchanges in this many row pieces (1: whole); unset, 8 under solo on the wire.
     solo: bool = false, // TF_GLM_CHUNK_SOLO: 4096 (prompt buffers for two chunks a pass, while no stream decodes) or 2048
@@ -109,6 +110,10 @@ pub const Settings = struct {
                 return error.BadSetting;
             }
         }
+        s.shared_kda_wide = @import("sys").environment.value(bool, "TF_GLM_SHARED_KDA_WIDE", get("TF_GLM_SHARED_KDA_WIDE"), s.kda_wide) catch {
+            problem.* = "TF_GLM_SHARED_KDA_WIDE: 0 or 1";
+            return error.BadSetting;
+        };
         if (get("TF_GLM_ROCE_MULTI")) |v| {
             if (std.mem.eql(u8, v, "1")) s.roce_multi = true else if (std.mem.eql(u8, v, "0")) s.roce_multi = false else {
                 problem.* = "TF_GLM_ROCE_MULTI: 0 or 1";
@@ -266,7 +271,7 @@ pub fn toolPieces(s: *Settings, comptime get: *const fn ([:0]const u8) ?[]const 
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 32, // 31, plus roce_fuse
+    layout: u32 = 33, // 32, plus shared_kda_wide bit in kda_wide
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -366,7 +371,7 @@ pub const Fingerprint = extern struct {
             .prompt_fixed_k = @intFromBool(s.prompt_fixed_k),
             .tiled = @as(u32, @intFromBool(s.tiled)) | (@as(u32, @intFromBool(s.verify_tiles.mla)) << 1) | (@as(u32, @intFromBool(s.verify_tiles.ranges)) << 2),
             .split = if (!s.split) 0 else if (s.ring) 2 else 1,
-            .kda_wide = @intFromBool(s.kda_wide),
+            .kda_wide = @as(u32, @intFromBool(s.kda_wide)) | (@as(u32, @intFromBool(s.shared_kda_wide)) << 1),
             .kda_pad = @intFromBool(s.kda_pad),
             .kv_live_half = @intFromBool(s.kv_live_half),
             .pieces = s.pieces,
@@ -540,7 +545,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .prompt_fixed_k => "TF_GLM_PROMPT_K",
         .tiled => "TF_GLM_MM, TF_GLM_DECODE_MLA_WIDE or TF_GLM_DECODE_TILE_RANGES",
         .split => "TF_GLM_PREFILL_REDUCE",
-        .kda_wide => "TF_GLM_KDA_DECODE_WIDE",
+        .kda_wide => "TF_GLM_KDA_DECODE_WIDE or TF_GLM_SHARED_KDA_WIDE",
         .kda_pad => "TF_GLM_KDA_PAD",
         .kv_live_half => "TF_GLM_KV_LIVE_HALF",
         .pieces => "TF_GLM_OVERLAP_PIECES",

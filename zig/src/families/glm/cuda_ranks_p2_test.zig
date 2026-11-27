@@ -331,3 +331,51 @@ test "startup switches: rank-local P2 validation failures notify waiting peers t
         try std.testing.expectEqualStrings(c.name, w.refused[0] orelse "missing notification");
     }
 }
+
+test "startup switches: TF_GLM_SHARED_KDA_WIDE inherits TF_GLM_KDA_DECODE_WIDE, overrides independently, and agrees across ranks" {
+    const Reader = struct {
+        var kda: ?[]const u8 = null;
+        var shared: ?[]const u8 = null;
+        fn get(key: [:0]const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "TF_GLM_KDA_DECODE_WIDE")) return kda;
+            if (std.mem.eql(u8, key, "TF_GLM_SHARED_KDA_WIDE")) return shared;
+            return null;
+        }
+    };
+    var problem: []const u8 = "";
+    // Unset inherits TF_GLM_KDA_DECODE_WIDE (default true, or false when decode wide is 0).
+    Reader.kda = null;
+    Reader.shared = null;
+    const def = try Settings.read(Reader.get, &problem);
+    try std.testing.expect(def.kda_wide and def.shared_kda_wide);
+    Reader.kda = "0";
+    Reader.shared = null;
+    const both_off = try Settings.read(Reader.get, &problem);
+    try std.testing.expect(!both_off.kda_wide and !both_off.shared_kda_wide);
+    // Independent override in either direction.
+    Reader.kda = "1";
+    Reader.shared = "0";
+    const shared_off = try Settings.read(Reader.get, &problem);
+    try std.testing.expect(shared_off.kda_wide and !shared_off.shared_kda_wide);
+    Reader.kda = "0";
+    Reader.shared = "1";
+    const shared_on = try Settings.read(Reader.get, &problem);
+    try std.testing.expect(!shared_on.kda_wide and shared_on.shared_kda_wide);
+    // Malformed values are refused by name.
+    for ([_][]const u8{ "2", "yes", " 0" }) |bad_val| {
+        Reader.kda = "1";
+        Reader.shared = bad_val;
+        try std.testing.expectError(error.BadSetting, Settings.read(Reader.get, &problem));
+        try std.testing.expectEqualStrings("TF_GLM_SHARED_KDA_WIDE: 0 or 1", problem);
+    }
+    // Ranks with differing TF_GLM_SHARED_KDA_WIDE disagree on .kda_wide.
+    const h: [32]u8 = @splat(0);
+    try std.testing.expectEqual(@as(?Mismatch, null), mismatch(&.{
+        Fingerprint.of(2, 0, shared_off, 8192, true, h, h, h),
+        Fingerprint.of(2, 1, shared_off, 8192, true, h, h, h),
+    }));
+    try std.testing.expectEqual(Mismatch{ .field = .kda_wide, .rank = 1 }, mismatch(&.{
+        Fingerprint.of(2, 0, def, 8192, true, h, h, h),
+        Fingerprint.of(2, 1, shared_off, 8192, true, h, h, h),
+    }).?);
+}

@@ -39,7 +39,7 @@ fn typo(name: [:0]const u8) ?[]const u8 {
 test "settings from the environment: the defaults, the choices, and a refusal naming a bad value" {
     var problem: []const u8 = "";
     const s = try Settings.read(&fake, &problem);
-    try std.testing.expect(!s.split and s.kda_wide and s.pieces == 2 and s.heat.?.high_c == 92 and s.heat.?.low_c == 88);
+    try std.testing.expect(!s.split and s.kda_wide and s.shared_kda_wide and s.pieces == 2 and s.heat.?.high_c == 92 and s.heat.?.low_c == 88);
     try std.testing.expect(s.dense_bits == 4 and s.head_bits == 8);
     try std.testing.expectError(error.BadSetting, Settings.read(&bad, &problem));
     try std.testing.expectEqualStrings("TF_GLM_PREFILL_REDUCE: split, ring or gather", problem);

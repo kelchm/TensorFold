@@ -71,7 +71,7 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
                 v.saves.v = st.save_v + kv * 2;
                 v.saves.g = st.save_g + kv * 4;
                 v.saves.b = st.save_b + li * fw.window_rows * st.heads * 4;
-                try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), f.kda_wide);
+                try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), chainWide(f, r.segs.len));
             }
             if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
         },
@@ -87,4 +87,22 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
         },
     }
+}
+
+/// Multi-stream shared verify rounds use `shared_kda_wide`; lone rounds keep `kda_wide`.
+pub fn chainWide(f: *const fw.Forward, segs: usize) bool {
+    return if (segs > 1) f.shared_kda_wide else f.kda_wide;
+}
+
+test "shared KDA chain uses shared_kda_wide on multi-stream segments and kda_wide on a lone segment" {
+    var f: fw.Forward = undefined;
+    f.kda_wide = true;
+    f.shared_kda_wide = false;
+    try std.testing.expect(chainWide(&f, 1));
+    try std.testing.expect(!chainWide(&f, 2));
+    try std.testing.expect(!chainWide(&f, 4));
+    f.kda_wide = false;
+    f.shared_kda_wide = true;
+    try std.testing.expect(!chainWide(&f, 1));
+    try std.testing.expect(chainWide(&f, 2));
 }

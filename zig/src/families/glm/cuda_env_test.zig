@@ -30,6 +30,7 @@ const switches = [_]Name{
     .{ .name = "TF_GLM_PROMPT_STEPS", .default = true },
     .{ .name = "TF_GLM_MULTI_PREFILL" },
     .{ .name = "TF_GLM_SHARED", .default = true },
+    .{ .name = "TF_GLM_SHARED_KDA_WIDE", .default = true },
     .{ .name = "TF_GLM_DSEL", .default = true },
     .{ .name = "TF_GLM_DSCORES", .default = true },
     .{ .name = "TF_GLM_MOE_DIRECT" },

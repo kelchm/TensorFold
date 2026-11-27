@@ -179,7 +179,7 @@ fn keyShape(e: *const engine.Engine, sm: usize, driver: c_int, shape: []u8, pin:
     const draft_hex = std.fmt.bytesToHex(if (e.drafter) |dr| dr.checkpoint_digest else @as([32]u8, @splat(0)), .lower);
     const tail: []const u8 = if (pin) |f| (if (f) " form factored" else " form classic") else "";
     var p2_buf: [128]u8 = undefined;
-    const p2 = try std.fmt.bufPrint(&p2_buf, " ext{d}/{d} tiles{d}/{d} first{d} exl3{d}/{d} fuse{d}{s}{s}", .{
+    const p2 = try std.fmt.bufPrint(&p2_buf, " ext{d}/{d} tiles{d}/{d} first{d} exl3{d}/{d} fuse{d} skda{d}{s}{s}", .{
         @intFromBool(set.dflash_only),
         @intFromBool(set.dflash_q4_down),
         @intFromBool(set.verify_tiles.mla),
@@ -188,6 +188,7 @@ fn keyShape(e: *const engine.Engine, sm: usize, driver: c_int, shape: []u8, pin:
         @intFromBool(set.exl3_decode),
         @intFromBool(set.exl3_nmajor),
         @intFromBool(set.roce_fuse),
+        @intFromBool(set.shared_kda_wide),
         if (e.drafter != null and e.m.priced_windows) " pricedWindows" else "",
         tail,
     });
@@ -418,6 +419,12 @@ test "GLM cost identity: a record kept at one named form is not reused at the ot
     var mixed = classic;
     mixed.fact = 1;
     try std.testing.expect(reuses(mixed, false, null) and !reuses(mixed, false, true) and !reuses(mixed, false, false));
+    // toggling TF_GLM_SHARED_KDA_WIDE produces a distinct lane-cost cache identity
+    var alt_buf: [512]u8 = undefined;
+    const wide_shape = try keyShape(&e, 121, 13000, &shapes[0], null);
+    e.settings.shared_kda_wide = false;
+    const slim_shape = try keyShape(&e, 121, 13000, &alt_buf, null);
+    try std.testing.expect(!std.mem.eql(u8, wide_shape, slim_shape));
 }
 
 test "GLM cost identity: a raced line names the more common form and the widths where the other runs" {

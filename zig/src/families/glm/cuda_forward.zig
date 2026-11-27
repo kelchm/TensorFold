@@ -188,6 +188,7 @@ pub const Forward = struct {
     ranks: []const Rank, // every rank of a local check, or this process's one
     exchange: Exchange,
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE (the Python family's default): decode windows on KDA's three-kernel chain
+    shared_kda_wide: bool = true, // TF_GLM_SHARED_KDA_WIDE: shared verify KDA chains (unset: inherits kda_wide)
     pieces: ?*const Pieces = null, // a prompt chunk's exchanges in row pieces on a second stream (null: whole)
     split: bool = true, // TF_GLM_PREFILL_REDUCE=split (the default with send/recv): each rank glues its own rows
     ring: bool = false, // TF_GLM_PREFILL_REDUCE=ring: split, its exchanges passed along the ring (cuda_relay)

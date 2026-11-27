@@ -29,6 +29,7 @@ const fw = struct {
         pieces: ?*u8,
         split: bool,
         kda_wide: bool,
+        shared_kda_wide: bool = true,
         ring: bool = false,
         taps: ?Taps = null,
         pub fn run(f: *Forward, ids: []const i32) !void {
@@ -74,7 +75,7 @@ const engine = struct {
         seqs: [32]Seq = @splat(.{}),
         bp: fw.Buffers,
         share: struct { vocab: Vocab = .{} } = .{},
-        settings: struct { split: bool = true, ring: bool = true, kda_wide: bool = true } = .{},
+        settings: struct { split: bool = true, ring: bool = true, kda_wide: bool = true, shared_kda_wide: bool = true } = .{},
         d: u8 = 0,
         m: u8 = 0,
         stream: u8 = 0,

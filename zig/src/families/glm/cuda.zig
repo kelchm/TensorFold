@@ -112,6 +112,7 @@ test {
     _ = shard;
     _ = weights;
     _ = forward;
+    _ = @import("cuda_shared.zig");
     _ = relay;
     _ = quant;
     _ = q4;
