@@ -32,6 +32,12 @@ pub const STEP_ROWS: usize = 32; // a verify's tap rows (the shared windows' row
 pub const TAP_ROW: usize = taps_mod.layers.len * D * 2; // bytes of one row's taps
 
 /// Device bytes a stream's context ring takes (K and V of every layer).
+pub const snapshot = @import("dflash_snapshot.zig");
+
+comptime {
+    if (snapshot.window != WIN or snapshot.bands != LAYERS * 2 or snapshot.stride != KVW * 2) @compileError("draft snapshot ring shape");
+}
+
 pub const ring_bytes: u64 = LAYERS * 2 * @as(u64, @intCast(WIN)) * KVW * 2;
 
 /// taps_prefill's rows: a prompt pass's taps whole (TF_GLM_CHUNK_SOLO: two chunks); an ingest keeps its window's.
@@ -89,6 +95,7 @@ pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, a_ba
 pub const Slot = struct {
     ring: ?cuda.DeviceBuffer = null,
     from: i64 = 0, // the first position the ring holds for this sequence
+    prompt_history: snapshot.History = .{}, // contiguous, initialized rows ending at a prompt cut
     v_step: u64 = 0, // the verify that wrote its rows (Drafter.verifies then)
     v_row0: usize = 0,
     v_rows: usize = 0,
@@ -211,7 +218,7 @@ pub const Drafter = struct {
         return .{ .f = dr.k.tap, .out = if (chunk) dr.taps_prefill else dr.taps_step };
     }
 
-    fn slot(dr: *Drafter, i: u32) !*Slot {
+    pub fn slot(dr: *Drafter, i: u32) !*Slot {
         if (i >= dr.slots.items.len) try dr.slots.appendNTimes(dr.gpa, .{}, i + 1 - dr.slots.items.len);
         const s = &dr.slots.items[i];
         if (s.ring == null) s.ring = try cuda.DeviceBuffer.alloc(dr.d, ring_bytes);
@@ -223,6 +230,7 @@ pub const Drafter = struct {
         const s = try dr.slot(i);
         s.from = @intCast(from);
         s.v_rows = 0;
+        s.prompt_history = .{};
     }
 
     /// A verify on slot `i` wrote `rows` tap rows at row `row0` of taps_step, for positions pos0...
@@ -338,8 +346,13 @@ pub fn promptRun(ring: u64, taps: u64, start: usize, rows: usize, len: usize, ro
 
 pub fn ingestPrompt(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize, row0: usize) !void {
     const s = try dr.slot(i);
-    const run = (try promptRun(s.ring.?.ptr, dr.taps_prefill, start, rows, len, row0, dr.tap_rows)) orelse return;
+    const run = (try promptRun(s.ring.?.ptr, dr.taps_prefill, start, rows, len, row0, dr.tap_rows)) orelse {
+        s.prompt_history = .{};
+        return;
+    };
+    errdefer s.prompt_history = .{};
     try dr.ingest(e, &.{run});
+    s.prompt_history.append(@intCast(run.pos0), run.n);
 }
 
 test "GLM embedding: DFlash generated IDs are checked before their upload" {

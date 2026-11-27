@@ -509,6 +509,8 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.GlmKvShareMoved => "TF_GLM_KV_SHARE is now TF_KV_SHARE, the prompt store every family on the KV pool shares: set that instead",
         error.GlmRequestStartsWithSharedKv => "TF_GLM_REQUEST_STARTS=1 cannot be used with TF_KV_SHARE above 0: unset request starts or disable shared KV",
         error.GlmRequestStartsWithLearnConversations => "TF_GLM_REQUEST_STARTS=1 cannot be used with --learn-conversations: unset request starts or serve without it",
+        error.GlmDraftSnapshotWithSharedKv => "TF_GLM_DFLASH_SNAP_CONTEXT=1 requires copied snapshots: set TF_KV_SHARE=0",
+        error.GlmDraftSnapshotWithoutDrafter => "TF_GLM_DFLASH_SNAP_CONTEXT=1 requires enabled drafts and --drafter",
         error.GlmShareNeedsPages => "TF_KV_SHARE keeps prompts as KV pool pages: set TF_KV_PAGES=on as well",
         error.GlmShareTooMany => std.fmt.comptimePrint("TF_KV_SHARE keeps at most {d} states: set {d} or fewer", .{ kv.most_snaps, kv.most_snaps }),
         error.BadCopyPolicy => "TF_GLM_COPIES: expected 0 or 1 for verified root/context copies",

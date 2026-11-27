@@ -16,6 +16,7 @@ const switches = [_]Name{
     .{ .name = "TF_GLM_LINK_WAIT" },
     .{ .name = "TF_GLM_DFLASH_ONLY" },
     .{ .name = "TF_GLM_DFLASH_Q4_DOWN" },
+    .{ .name = "TF_GLM_DFLASH_SNAP_CONTEXT" },
     .{ .name = "TF_GLM_COPY_8_16" },
     .{ .name = "TF_GLM_DECODE_MLA_WIDE" },
     .{ .name = "TF_GLM_DECODE_TILE_RANGES" },

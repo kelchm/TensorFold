@@ -15,9 +15,15 @@ pub fn requestStartsAlone(learn_conversations: bool) !void {
     if (on and try kp.sharing() > 0) return error.GlmRequestStartsWithSharedKv;
 }
 
+/// The draft tail is private to the external DFlash2 model and to copied snapshots.
+pub fn draftSnapshotMode(enabled: bool, shared: usize, drafts: bool, external: bool) !void {
+    if (!enabled) return;
+    if (shared != 0) return error.GlmDraftSnapshotWithSharedKv;
+    if (!drafts or !external) return error.GlmDraftSnapshotWithoutDrafter;
+}
+
 /// Rank-local P2 option checks, run inside startup.open's tp_watch boundary so peers hear refusals immediately.
 pub fn validateRankOptions(set: @import("cuda_ranks.zig").Settings, shared: usize, drafts: bool, external: bool, drafter_bits: u8) !void {
-    _ = shared;
     if (set.dflash_q4_down and (!external or !drafts or drafter_bits != 4)) {
         if (!@import("builtin").is_test) std.log.err("TF_GLM_DFLASH_Q4_DOWN=1 requires enabled DFlash2 and --drafter-bits 4", .{});
         return error.BadSetting;
@@ -25,6 +31,23 @@ pub fn validateRankOptions(set: @import("cuda_ranks.zig").Settings, shared: usiz
     if (set.dflash_only and (!external or !drafts)) {
         if (!@import("builtin").is_test) std.log.err("TF_GLM_DFLASH_ONLY=1 requires --drafter and enabled drafts", .{});
         return error.BadSetting;
+    }
+    try draftSnapshotMode(set.dflash_snap_context, shared, drafts, external);
+}
+
+test "startup switches: a draft snapshot requires an external drafter and copied KV only when enabled" {
+    for ([_]usize{ 0, 1, 8 }) |shared| {
+        for ([_]bool{ false, true }) |drafts| {
+            for ([_]bool{ false, true }) |external| {
+                try draftSnapshotMode(false, shared, drafts, external);
+                const expected = draftSnapshotMode(true, shared, drafts, external);
+                if (shared > 0) {
+                    try std.testing.expectError(error.GlmDraftSnapshotWithSharedKv, expected);
+                } else if (!drafts or !external) {
+                    try std.testing.expectError(error.GlmDraftSnapshotWithoutDrafter, expected);
+                } else try expected;
+            }
+        }
     }
 }
 

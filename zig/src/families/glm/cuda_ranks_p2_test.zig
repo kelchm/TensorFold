@@ -218,6 +218,35 @@ test "startup switches: TF_GLM_PACKED_PROMPT_S2 agrees across ranks" {
     }).?);
 }
 
+test "startup switches: TF_GLM_DFLASH_SNAP_CONTEXT is off by default, 0 or 1, and agrees across ranks" {
+    const Reader = struct {
+        fn absent(_: [:0]const u8) ?[]const u8 {
+            return null;
+        }
+        fn on(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_DFLASH_SNAP_CONTEXT")) "1" else null;
+        }
+        fn off(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_DFLASH_SNAP_CONTEXT")) "0" else null;
+        }
+        fn bad(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_DFLASH_SNAP_CONTEXT")) "2" else null;
+        }
+    };
+    var problem: []const u8 = "";
+    try std.testing.expect(!(try Settings.read(Reader.absent, &problem)).dflash_snap_context);
+    const on = try Settings.read(Reader.on, &problem);
+    try std.testing.expect(on.dflash_snap_context);
+    try std.testing.expect(!(try Settings.read(Reader.off, &problem)).dflash_snap_context);
+    try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
+    try std.testing.expectEqualStrings("TF_GLM_DFLASH_SNAP_CONTEXT: 0 or 1", problem);
+    const h: [32]u8 = @splat(0);
+    try std.testing.expectEqual(Mismatch{ .field = .mtp, .rank = 1 }, mismatch(&.{
+        Fingerprint.of(2, 0, on, 8192, true, h, h, h),
+        Fingerprint.of(2, 1, .{}, 8192, true, h, h, h),
+    }).?);
+}
+
 test "startup switches: external drafter precision and checkpoint digest agree across ranks" {
     const h: [32]u8 = @splat(0);
     const d0 = ranks.hashBytes("drafter-a");
@@ -264,6 +293,7 @@ test "startup switches: rank-local P2 validation failures notify waiting peers t
     const cases = [_]struct { set: Settings, args: Args, err: anyerror, name: []const u8 }{
         .{ .set = .{ .dflash_q4_down = true }, .args = .{ .bits = 0 }, .err = error.BadSetting, .name = "BadSetting" },
         .{ .set = .{ .dflash_only = true }, .args = .{ .external = false }, .err = error.BadSetting, .name = "BadSetting" },
+        .{ .set = .{ .dflash_snap_context = true }, .args = .{ .share = 1 }, .err = error.GlmDraftSnapshotWithSharedKv, .name = "GlmDraftSnapshotWithSharedKv" },
     };
     for (cases) |c| {
         var w: World = .{};

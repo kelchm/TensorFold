@@ -382,8 +382,8 @@ pub const Engine = struct {
         if (len == 0 or len + fw.window_rows >= e.cur.st.capacity) return error.PromptTooLong;
         const r = from orelse return 0;
         if (r.at == 0 or r.at >= len or !prompt_cuts.coldCut(len, e.cur.cuts.items, r.at)) return error.BadResume;
+        if ((e.snaps.get(r.id) orelse return error.NoKeptState).pos != r.at) return error.BadResume;
         try e.restoreState(r.id);
-        if (e.drafter) |dr| try dr.restart(e.slot, r.at); // the rows before it were never tapped
         return r.at;
     }
 

@@ -26,7 +26,7 @@ pub const Part = walk.Part;
 /// Latent caches a plan carries at most: full GLM-5.3's 78 DSA layers and its MTP layer (GLM-5.3-Flash: 12).
 pub const max_caches = 79;
 pub const Plan = struct {
-    parts: [5 * max_caches + 2]Part = undefined,
+    parts: [5 * max_caches + 2 + 2 * @import("dflash_snapshot.zig").bands]Part = undefined,
     count: usize = 0,
     len: usize = 0,
     ids: []const u32 = &.{}, // a paged sequence's pages in row order

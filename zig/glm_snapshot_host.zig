@@ -17,33 +17,48 @@ const Sizing = struct {
     fn zero(_: u64, _: u8, _: usize) callconv(.c) cuda.abi.Result {
         return 0;
     }
+    fn driver() cuda.Driver {
+        var d: cuda.Driver = undefined;
+        d.api.cuMemAlloc_v2 = alloc;
+        d.api.cuMemFree_v2 = free;
+        d.api.cuMemsetD8_v2 = zero;
+        return d;
+    }
+    fn weights(layers: *[glm.config.max_layers]glm.weights.Layer) !glm.weights.Weights {
+        var w: glm.weights.Weights = undefined;
+        w.config = .{};
+        w.share = try glm.shard.Share.of(&w.config, 0, 2);
+        w.layers = layers[0..w.config.layers];
+        for (w.layers, 0..) |*l, i| {
+            l.* = undefined;
+            l.mixer = switch (w.config.kind(@intCast(i))) {
+                .mla => .{ .mla = undefined },
+                .kda => .{ .kda = undefined },
+            };
+        }
+        return w;
+    }
+    fn engine(seq: anytype, w: *const glm.weights.Weights) glm.engine.Engine {
+        var e: glm.engine.Engine = undefined;
+        e.cur = seq;
+        e.local = &.{};
+        e.c = w.config;
+        e.mtp = true;
+        e.settings = .{};
+        e.share_pages = false;
+        e.drafter = null;
+        e.capacity = seq.st.capacity;
+        return e;
+    }
 };
 
 test "GLM snapshots: a short prefix fits 4 GiB even with a 524288-token configured window" {
-    var d: cuda.Driver = undefined;
-    d.api.cuMemAlloc_v2 = Sizing.alloc;
-    d.api.cuMemFree_v2 = Sizing.free;
-    d.api.cuMemsetD8_v2 = Sizing.zero;
-    var w: glm.weights.Weights = undefined;
-    w.config = .{};
-    w.share = try glm.shard.Share.of(&w.config, 0, 2);
+    var d = Sizing.driver();
     var layers: [glm.config.max_layers]glm.weights.Layer = undefined;
-    w.layers = layers[0..w.config.layers];
-    for (w.layers, 0..) |*l, i| {
-        l.* = undefined;
-        l.mixer = switch (w.config.kind(@intCast(i))) {
-            .mla => .{ .mla = undefined },
-            .kda => .{ .kda = undefined },
-        };
-    }
-    var e: glm.engine.Engine = undefined;
-    var seq: @TypeOf(e.cur.*) = .{ .st = try glm.forward.State.init(t.allocator, &d, &w, glm.native.capacity(524288)) };
+    var w = try Sizing.weights(&layers);
+    var seq: @typeInfo(@FieldType(glm.engine.Engine, "cur")).pointer.child = .{ .st = try glm.forward.State.init(t.allocator, &d, &w, glm.native.capacity(524288)) };
     defer seq.st.deinit();
-    e.cur = &seq;
-    e.local = &.{};
-    e.c = w.config;
-    e.mtp = true;
-    e.capacity = seq.st.capacity;
+    var e = Sizing.engine(&seq, &w);
     for ([_]u32{ 2048, 34816, 266240 }) |at| {
         std.debug.print("GLM snapshot sizing rank=0 world=2 at={d} bytes={d} arena={d}\n", .{ at, glm.native.snap_bytes(&e, at), seq.st.arena.buf.len });
     }
@@ -62,6 +77,7 @@ const Fixture = @import("test_support/glm_snap_fixture.zig").Fixture;
 test {
     _ = @import("glm_snapshot_host_ram.zig");
     _ = @import("glm_snapshot_kv8_host.zig");
+    _ = @import("glm_snapshot_draft_host.zig");
 }
 const pc = @import("engine_api").prompt_cache;
 const adapter = @import("copies");
@@ -405,30 +421,12 @@ test "GLM snapshots: FP8 prefix rows and separate scales restore for every rank 
 }
 
 test "GLM snapshots: 0.3 GiB fits the first default TP2 prefix at 256K but not a longer prefix" {
-    var d: cuda.Driver = undefined;
-    d.api.cuMemAlloc_v2 = Sizing.alloc;
-    d.api.cuMemFree_v2 = Sizing.free;
-    d.api.cuMemsetD8_v2 = Sizing.zero;
-    var w: glm.weights.Weights = undefined;
-    w.config = .{};
-    w.share = try glm.shard.Share.of(&w.config, 0, 2);
+    var d = Sizing.driver();
     var layers: [glm.config.max_layers]glm.weights.Layer = undefined;
-    w.layers = layers[0..w.config.layers];
-    for (w.layers, 0..) |*layer, i| {
-        layer.* = undefined;
-        layer.mixer = switch (w.config.kind(@intCast(i))) {
-            .mla => .{ .mla = undefined },
-            .kda => .{ .kda = undefined },
-        };
-    }
-    var e: glm.engine.Engine = undefined;
-    var seq: @TypeOf(e.cur.*) = .{ .st = try glm.forward.State.init(t.allocator, &d, &w, glm.native.capacity(262144)) };
+    var w = try Sizing.weights(&layers);
+    var seq: @typeInfo(@FieldType(glm.engine.Engine, "cur")).pointer.child = .{ .st = try glm.forward.State.init(t.allocator, &d, &w, glm.native.capacity(262144)) };
     defer seq.st.deinit();
-    e.cur = &seq;
-    e.local = &.{};
-    e.c = w.config;
-    e.mtp = true;
-    e.capacity = seq.st.capacity;
+    var e = Sizing.engine(&seq, &w);
     const minimum = glm.native.snap_min_bytes(&e);
     const budget: u64 = 322122547;
     try t.expectEqual(@as(u64, 257949696), minimum);

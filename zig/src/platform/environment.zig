@@ -200,6 +200,7 @@ const stock_rules = [_]Rule{
     .{ .name = "TF_GLM_LINK_WAIT", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_DFLASH_ONLY", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_DFLASH_Q4_DOWN", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_GLM_DFLASH_SNAP_CONTEXT", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_COPY_8_16", .scope = .glm, .kind = .flag, .forms = "0 or 1 (default 0); use 8-token prompt and 16-token reply matches for up to 15 copy drafts" },
     .{ .name = "TF_GLM_DECODE_MLA_WIDE", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_DECODE_TILE_RANGES", .scope = .glm, .kind = .flag, .forms = "0 or 1" },

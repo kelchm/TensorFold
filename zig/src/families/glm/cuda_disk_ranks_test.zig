@@ -85,6 +85,8 @@ const Rig = struct {
         e.cur = &x.seq;
         e.capacity = fixture.capacity;
         e.mtp = true;
+        e.settings = .{};
+        e.drafter = null;
         e.slot = 0;
         e.stream = .{ .d = &x.d, .handle = null };
         e.m.glue.put_words = .{ .d = &x.d, .handle = null };

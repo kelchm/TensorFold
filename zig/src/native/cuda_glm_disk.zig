@@ -12,7 +12,7 @@ const Engine = glm.engine.Engine;
 const Kept = glm.engine.Kept;
 const Allocator = std.mem.Allocator;
 
-pub const image: rows.Image = .{ .parts = parts, .gather = gather, .blank = blank, .scatter = scatter, .whole = whole };
+pub const image: rows.Image = .{ .parts = parts, .gather = gather, .blank = blank, .blank_bytes = blankBytes, .scatter = scatter, .whole = whole };
 
 /// Every rank's prefix bytes, read at attach (the process serves one model; rank 0 alone serves).
 var prefix_buf: [8]u64 = undefined;
@@ -22,6 +22,10 @@ var window_buf: [prefix_buf.len]u64 = undefined;
 
 fn engineOf(ptr: *anyopaque) *Engine {
     return @ptrCast(@alignCast(ptr));
+}
+
+fn blankBytes(ptr: *anyopaque, at: u32) u64 {
+    return glm.snapshots.targetBytes(engineOf(ptr), at);
 }
 
 fn parts(ptr: *anyopaque, at: u32, out: *std.ArrayList(rows.image.Part), a: Allocator) anyerror!void {
@@ -356,6 +360,8 @@ test "CUDA disk open: GLM gather zeros unwritten pooled-key tail and scratch spa
         e.share = w.share;
         e.capacity = cap;
         e.mtp = head;
+        e.settings = .{};
+        e.drafter = null;
         e.cur = &seq;
         e.share_pages = false;
         e.announce = 0;
@@ -408,6 +414,11 @@ test "CUDA disk open: GLM gather zeros unwritten pooled-key tail and scratch spa
         try std.testing.expectEqualSlices(u8, out_a, out_b);
         for (loose.items) |sp| for (out_a[@intCast(sp.off)..][0..@intCast(sp.len)]) |b| try std.testing.expectEqual(@as(u8, 0), b);
         try std.testing.expectEqualSlices(u8, seed_a[img.Words.bytes .. img.Words.bytes + sh.window], out_a[img.Words.bytes .. img.Words.bytes + sh.window]);
+        var dr: glm.dflash.Drafter = undefined;
+        e.drafter = &dr;
+        e.settings.dflash_snap_context = true;
+        try std.testing.expectEqual(glm.snapshots.targetBytes(e, at), image.blank_bytes.?(e, at));
+        try std.testing.expect(image.blank_bytes.?(e, at) < glm.snapshots.bytes(e, at));
     };
 }
 

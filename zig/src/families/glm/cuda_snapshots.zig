@@ -25,11 +25,41 @@ pub fn agree(e: anytype, budget: u64) !void {
     if (try e.shared(if (failed != null) 1 else 0) > 0) return failed orelse error.PeerSnapshotCache;
 }
 
-pub fn bytes(e: anytype, at: usize) u64 {
-    const head: ?usize = if (e.mtp) @min(e.capacity, std.math.add(usize, at, @import("cuda_state.zig").window_rows) catch return std.math.maxInt(u64)) else null;
+const draft = @import("dflash_snapshot.zig");
+
+fn draftEnabled(e: anytype) bool {
+    const T = @typeInfo(@TypeOf(e)).pointer.child;
+    if (!@hasField(T, "settings") or !@hasField(T, "drafter")) return false;
+    return e.settings.dflash_snap_context and !e.share_pages and e.drafter != null;
+}
+
+fn currentDraft(e: anytype, at: usize) draft.Saved {
+    if (!draftEnabled(e)) return .{};
+    const dr = e.drafter.?;
+    if (e.slot >= dr.slots.items.len) return .{};
+    const sl = &dr.slots.items[e.slot];
+    const ring = sl.ring orelse return .{};
+    if (ring.ptr == 0 or ring.len != draft.ring_bytes) return .{};
+    return .{ .end = at, .count = sl.prompt_history.rows(at) };
+}
+
+fn targetLen(e: anytype, at: usize) ?usize {
+    const head: ?usize = if (e.mtp) @min(e.capacity, std.math.add(usize, at, @import("cuda_state.zig").window_rows) catch return null) else null;
     // a paged sequence holds its request's rows: its prefix is counted to the capacity, in a window's bytes
-    const n = layout.Plan.size(&e.cur.st, &e.c, e.capacity, at, head, heldPages(e, at)) catch return std.math.maxInt(u64);
+    return layout.Plan.size(&e.cur.st, &e.c, e.capacity, at, head, heldPages(e, at)) catch null;
+}
+
+/// Target-only rounded pages for `at`, excluding any RAM-only DFlash2 draft tail (used by disk restores).
+pub fn targetBytes(e: anytype, at: usize) u64 {
+    const n = targetLen(e, at) orelse return std.math.maxInt(u64);
     return pages.rounded(n) catch std.math.maxInt(u64);
+}
+
+pub fn bytes(e: anytype, at: usize) u64 {
+    const n = targetLen(e, at) orelse return std.math.maxInt(u64);
+    // Reservation and promise callers can be planning another stream. Only keepAs knows its valid rows.
+    const rows = if (draftEnabled(e)) @min(at, draft.cap) else 0;
+    return pages.rounded(std.math.add(usize, n, draft.bytes(rows)) catch return std.math.maxInt(u64)) catch std.math.maxInt(u64);
 }
 
 pub fn keep(e: anytype) !u64 {
@@ -48,7 +78,10 @@ pub fn keepAs(e: anytype, id: u64) !void {
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
     const profiled = e.prompt_profs[0] != null;
     const started: i96 = if (profiled) std.Io.Clock.awake.now(e.io).toNanoseconds() else 0;
-    const plan = try layout.Plan.init(&e.cur.st, &e.c, e.cur.st.pos, if (e.mtp) e.cur.st.mtp_len else null, heldPages(e, e.cur.st.pos));
+    var plan = try layout.Plan.init(&e.cur.st, &e.c, e.cur.st.pos, if (e.mtp) e.cur.st.mtp_len else null, heldPages(e, e.cur.st.pos));
+    const target_len = plan.len;
+    const saved = currentDraft(e, e.cur.st.pos);
+    if (saved.count != 0) try draft.pack(&plan, e.drafter.?.slots.items[e.slot].ring.?, saved.end, saved.count);
     var lease = try pool.take(plan.len);
     errdefer {
         cuda.completion.drain(e.d, e.stream, "a failed GLM snapshot copy did not drain");
@@ -58,7 +91,8 @@ pub fn keepAs(e: anytype, id: u64) !void {
     errdefer e.gpa.free(cur);
     try pool.move(e.stream, &lease, &plan, true);
     try e.stream.synchronize();
-    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = plan.len, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .bases = .{ e.cur.st.base, e.cur.st.mtp_base }, .shared = plan.shared });
+    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = target_len, .packed_len = plan.len, .draft = saved, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .bases = .{ e.cur.st.base, e.cur.st.mtp_base }, .shared = plan.shared });
+    if (saved.count != 0) std.log.info("glm draft snapshot keep rank={d} slot={d} id={d} pos={d} rows={d} bytes={d}", .{ e.share.rank, e.slot, id, saved.end, saved.count, draft.bytes(saved.count) });
     if (profiled) {
         const wall_ms: f64 = @as(f64, @floatFromInt(std.Io.Clock.awake.now(e.io).toNanoseconds() - started)) / 1e6;
         std.log.info("glm prof snapshot rank={d} slot={d} id={d} pos={d} bytes={d} parts={d} wall_ms={d:.4}", .{ e.share.rank, e.slot, id, e.cur.st.pos, plan.len, plan.count, wall_ms });
@@ -69,7 +103,7 @@ pub fn keepAs(e: anytype, id: u64) !void {
 pub fn blankAs(e: anytype, id: u64, at: usize) !void {
     if (e.snaps.contains(id)) return error.StateKept;
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
-    var lease = try pool.take(bytes(e, at));
+    var lease = try pool.take(targetBytes(e, at));
     errdefer pool.give(&lease);
     const cur = try e.gpa.alloc(u1, e.cur.st.cur.len);
     @memset(cur, 0);
@@ -94,6 +128,7 @@ pub fn seal(e: anytype, id: u64, mtp_len: usize, bases: [2]usize, cur: u64) !voi
     if (n == 0 or n > s.lease.ids.items.len * pages.page) return error.SnapshotSize;
     for (s.cur, 0..) |*b, i| b.* = @intCast(cur >> @intCast(i) & 1);
     s.len = n;
+    s.packed_len = n;
     s.mtp_len = mtp_len;
     s.bases = bases;
 }
@@ -103,13 +138,36 @@ pub fn restore(e: anytype, id: u64) !void {
     if (s.len == 0) return error.UnsealedState;
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
     // the kept state's own parity picks the half a live-half keep carries; the slot's dead half stays as it is
-    const plan = try layout.Plan.initFor(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, s.shared, s.cur);
+    var plan = try layout.Plan.initFor(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, s.shared, s.cur);
     if (plan.len != s.len) return error.SnapshotSize;
+    // Publish the draft floor only after every transfer finishes; a missing tail leaves a cold drafter.
+    var restored: usize = 0;
+    if (@hasField(@typeInfo(@TypeOf(e)).pointer.child, "drafter")) {
+        if (e.drafter) |dr| {
+            try dr.restart(e.slot, s.pos);
+            if (draftEnabled(e) and s.draft.valid(s.pos)) {
+                const ring = dr.slots.items[e.slot].ring.?;
+                const lease_bytes = s.lease.ids.items.len * pages.page;
+                if (ring.ptr != 0 and ring.len == draft.ring_bytes and s.len <= lease_bytes and s.packed_len >= s.len and s.packed_len <= lease_bytes and draft.bytes(s.draft.count) == s.packed_len - s.len) {
+                    try draft.pack(&plan, ring, s.pos, s.draft.count);
+                    restored = s.draft.count;
+                }
+            }
+        }
+    }
     errdefer cuda.completion.drain(e.d, e.stream, "a failed GLM snapshot restore did not drain");
     try pool.move(e.stream, &s.lease, &plan, false);
     try e.cur.st.restoreHost(e.stream, s.pos, s.mtp_len, s.cur, s.bases);
     e.cur.in_head = 0;
     try e.stream.synchronize();
+    if (@hasField(@typeInfo(@TypeOf(e)).pointer.child, "drafter")) {
+        if (draftEnabled(e)) std.log.info("glm draft snapshot restore rank={d} slot={d} id={d} pos={d} rows={d}", .{ e.share.rank, e.slot, id, s.pos, restored });
+        if (restored != 0) {
+            const sl = &e.drafter.?.slots.items[e.slot];
+            sl.from = @intCast(s.pos - restored);
+            sl.prompt_history = .{ .lo = s.pos - restored, .end = s.pos };
+        }
+    }
 }
 
 /// The pages below `at` the shared prompt store holds (TF_KV_SHARE): a kept state's copy leaves them out.

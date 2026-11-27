@@ -36,6 +36,7 @@ pub const Settings = struct {
     l2pf: l2pf.Options = .{}, // TF_GLM_L2PF and its knobs: a decode window's next weights read into L2 beside it
     dflash_only: bool = false, // TF_GLM_DFLASH_ONLY=1: omit checkpoint MTP layer and its KV pages beside DFlash2
     dflash_q4_down: bool = false, // TF_GLM_DFLASH_Q4_DOWN=1: quantize DFlash2 MLP down projections to Q4 (fp32 partials)
+    dflash_snap_context: bool = false, // TF_GLM_DFLASH_SNAP_CONTEXT=1: keep up to 640 initialized DFlash2 KV rows in snapshots
     verify_tiles: @import("cuda_verify_tiles.zig").Options = .{},
     kv_live_half: bool = false, // TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone (cuda_snapshot_layout.zig)
     draft_split: bool = false, // TF_GLM_DRAFT_SPLIT=1: three ranks or more split the drafter MLP without TF_ROCE=1
@@ -205,7 +206,7 @@ pub const Settings = struct {
                 return error.BadSetting;
             };
         }
-        inline for (.{ .{ "TF_GLM_EXL3_DECODE", "exl3_decode" }, .{ "TF_GLM_EXL3_N_MAJOR", "exl3_nmajor" }, .{ "TF_GLM_PACKED_PROMPT_S2", "prompt_s2" } }) |flag| {
+        inline for (.{ .{ "TF_GLM_EXL3_DECODE", "exl3_decode" }, .{ "TF_GLM_EXL3_N_MAJOR", "exl3_nmajor" }, .{ "TF_GLM_PACKED_PROMPT_S2", "prompt_s2" }, .{ "TF_GLM_DFLASH_SNAP_CONTEXT", "dflash_snap_context" } }) |flag| {
             @field(s, flag[1]) = @import("sys").environment.value(bool, flag[0], get(flag[0]), false) catch {
                 problem.* = flag[0] ++ ": 0 or 1";
                 return error.BadSetting;
@@ -263,7 +264,7 @@ pub fn toolPieces(s: *Settings, comptime get: *const fn ([:0]const u8) ?[]const 
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 29, // 28, plus prompt_s2 bit in bits
+    layout: u32 = 30, // 29, plus dflash_snap_context bit in mtp
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -368,7 +369,7 @@ pub const Fingerprint = extern struct {
             .pair = @intFromBool(s.pair),
             .pair_experts = @as(u32, @intFromBool(s.pair_experts)) | (@as(u32, @intFromBool(s.exl3_decode)) << 1) | (@as(u32, @intFromBool(s.exl3_nmajor)) << 2),
             .layers = s.layers,
-            .mtp = @as(u32, @intFromBool(mtp)) | (@as(u32, @intFromBool(s.dflash_only)) << 2) | (@as(u32, @intFromBool(s.dflash_q4_down)) << 3),
+            .mtp = @as(u32, @intFromBool(mtp)) | (@as(u32, @intFromBool(s.dflash_only)) << 2) | (@as(u32, @intFromBool(s.dflash_q4_down)) << 3) | (@as(u32, @intFromBool(s.dflash_snap_context)) << 4),
             .roce_multi = @intFromBool(s.roce_multi),
             .roce_wide = @intFromBool(s.roce_wide and world >= 3), // two ranks ask by default, so a lone TF_ROCE=1 there is no difference
             .draft_split = @intFromBool(s.draft_split and world >= 3), // two ranks split whatever it says
@@ -540,7 +541,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .pair => "TF_GLM_PROMPT_PAIR",
         .pair_experts => "TF_GLM_PAIR_EXPERTS / TF_GLM_EXL3_DECODE / TF_GLM_EXL3_N_MAJOR",
         .layers => "TF_GLM_LAYERS",
-        .mtp => "--no-drafts, --drafter, TF_GLM_DFLASH_ONLY or TF_GLM_DFLASH_Q4_DOWN differs across ranks",
+        .mtp => "--no-drafts, --drafter, TF_GLM_DFLASH_ONLY, TF_GLM_DFLASH_Q4_DOWN or TF_GLM_DFLASH_SNAP_CONTEXT differs across ranks",
         .vision => "--vision (or its image tokens) given to some ranks and not others",
         .video_tokens => "--vision-video-tokens",
         .max_images => "the image count limit",

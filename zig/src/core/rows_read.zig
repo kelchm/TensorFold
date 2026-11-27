@@ -169,10 +169,13 @@ fn attempt(s: *pc.Store, prompt: []const u32, born: u32, starts: []const u32, sp
 fn ready(s: *const pc.Store, at: u32, bytes: u64) bool {
     if (s.held > s.budget or s.entries.items.len >= s.most) return false;
     const f = s.family.vtable;
-    // a pool without trim reads into spare storage that takes the state, as a keep would
-    if (f.trim == null) if (f.reuses) |reuses| if (reuses(s.family.ptr, at)) return true;
     const room = s.budget - s.held;
     const spare = s.spare();
+    // a pool without trim reads into spare storage; blank_bytes overrides RAM bytes when disk omits a tail
+    if (f.trim == null) if (f.reuses) |reuses| {
+        const fits = if (s.disk != null and s.disk.?.img.blank_bytes != null) spare >= bytes and bytes <= room else reuses(s.family.ptr, at);
+        if (fits) return true;
+    };
     return spare <= room and bytes <= room - spare;
 }
 

@@ -108,7 +108,7 @@ const engine = struct {
         taps_prefill: u64 = 0,
         tap_rows: usize = glm.dflash.MAX_CTX,
         states: [32]Slot = @splat(.{}),
-        const Slot = struct { ring: ?struct { ptr: u64 } = null };
+        const Slot = struct { ring: ?struct { ptr: u64 } = null, prompt_history: glm.dflash.snapshot.History = .{} };
         pub fn taps(dr: *Drafter, _: bool) fw.Taps {
             return .{ .out = dr.taps_prefill };
         }
@@ -290,4 +290,23 @@ test "GLM structured: prompt rows survive without an MTP head" {
     try pass(&e, &.{.{ .slot = 13, .ids = &.{ 81, 82 } }});
     try t.expectEqual(@as(u16, 32), held(&e, 4));
     try t.expectEqual(@as(u16, 63), held(&e, 9));
+}
+
+test "GLM prompt workflow: skipped, clipped and discontinuous prompt ingests expose only their initialized suffix" {
+    var b: Box = .{};
+    var e = b.make();
+    var taps: [8 * glm.dflash.TAP_ROW]u8 align(8) = @splat(0);
+    var context: [4096]u32 = @splat(0);
+    var dr: engine.Drafter = .{ .taps_prefill = @intFromPtr(&taps) };
+    const sl = &dr.states[1];
+    sl.ring = .{ .ptr = @intFromPtr(&context) };
+    sl.prompt_history = .{ .lo = 0, .end = 64 };
+    try dr.promptSegment(&e, 1, 64, 8, 4096, 0); // entire segment below the prompt's final window
+    try t.expectEqual(@as(usize, 0), sl.prompt_history.rows(64));
+    try dr.promptSegment(&e, 1, 2044, 8, 4096, 0); // clips the four rows before 2048
+    try t.expectEqual(@as(usize, 4), sl.prompt_history.rows(2052));
+    try dr.promptSegment(&e, 1, 2052, 8, 4096, 0);
+    try t.expectEqual(@as(usize, 12), sl.prompt_history.rows(2060));
+    try dr.promptSegment(&e, 1, 2070, 8, 4096, 0);
+    try t.expectEqual(@as(usize, 8), sl.prompt_history.rows(2078));
 }
