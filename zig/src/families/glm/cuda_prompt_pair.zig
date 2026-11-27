@@ -5,6 +5,7 @@ const fw = @import("cuda_forward.zig");
 const weights = @import("cuda_weights.zig");
 const snapshots = @import("cuda_snapshots.zig");
 const engine = @import("cuda_engine.zig");
+const prompt_cuts = @import("cuda_prompt_cuts.zig");
 const dflash = @import("dflash.zig");
 const Engine = engine.Engine;
 
@@ -46,10 +47,13 @@ pub fn takesTwo(start: usize, len: usize, world: usize, marks: []const u32) bool
     return std.mem.indexOfScalar(u32, marks, @intCast(next)) == null;
 }
 
-/// Whether a pair at `start` (b of `rb` rows) rebases the index rings where chunks one at a time do: at a, or not.
-pub fn ringsAgree(base: usize, ring: usize, start: usize, rb: usize) bool {
+/// Whether a pair at `start` (b of `rb` rows) rebases the index rings where chunks one at a time do and fits in `ring`.
+pub fn ringsAgree(base: usize, ring: usize, pool: usize, start: usize, rb: usize) bool {
     const ra = fw.prefill_rows;
-    return start + ra > base + ring or start + ra + rb <= base + ring;
+    if (start + ra + rb <= base + ring) return true;
+    if (start + ra <= base + ring or pool == 0) return false;
+    const nb = start / pool * pool;
+    return start + ra + rb <= nb + ring;
 }
 
 /// Where a paired step's chunks tap for DFlash2: only a chunk reaching the prompt's last window, as prefillChunk taps.
@@ -75,12 +79,14 @@ pub fn piecesOf(e: *const Engine, b: *const fw.Buffers) ?*const fw.Pieces {
 /// Rank 0's choice for the step at `start` (the others take the ids it sends); not with prompt rows or prof.
 pub fn pairedAt(e: *const Engine, start: usize, len: usize, from: ?engine.Resume, marks: ?engine.Marks) bool {
     if (e.pair == null or !e.settings.pair or (e.drafter != null and !e.settings.pair_dflash) or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
-    if (e.cur.cuts.items.len > 0) return false; // a paired step would step over a request start
     if (e.pieces.count == 1 and !e.settings.split) return false; // run takes such a chunk whole
     if (!takesTwo(start, len, e.share.world, if (marks) |m| m.at else &.{})) return false;
+    const ra: usize = fw.prefill_rows;
+    const rb: usize = @min(len - start - ra, fw.prefill_rows);
+    if (!prompt_cuts.clearOfCuts(e.cur.cuts.items, start, ra + rb)) return false;
     // a resumed step restores its kept state, and the rings' base, after this choice
     const base = if (from) |r| (e.snaps.get(r.id) orelse return false).bases[0] else e.cur.st.base;
-    return ringsAgree(base, e.cur.st.ring_rows, start, @min(len - start - fw.prefill_rows, fw.prefill_rows));
+    return ringsAgree(base, e.cur.st.ring_rows, e.cur.st.pool, start, rb);
 }
 
 /// Engine.prefillChunk of two chunks (`part`: both, then the next id): one pass, then each chunk's MTP rows and commit.
@@ -90,7 +96,8 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: 
     const rb: usize = @min(len - start - ra, fw.prefill_rows);
     const pair = if (e.pair) |*p| p else return error.BadChunk;
     if (rb < e.share.world or part.len != @min(len - start, ra + rb + 1) or (e.drafter != null and !e.settings.pair_dflash) or e.prompt_logprobs != null) return error.BadChunk;
-    if (!ringsAgree(e.cur.st.base, e.cur.st.ring_rows, start, rb)) return error.BadChunk; // pairedAt's rule, every rank
+    if (!prompt_cuts.clearOfCuts(e.cur.cuts.items, start, ra + rb)) return error.BadChunk;
+    if (!ringsAgree(e.cur.st.base, e.cur.st.ring_rows, e.cur.st.pool, start, rb)) return error.BadChunk; // pairedAt's rule, every rank
     if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
     e.gate(cancel) catch |err| {
         if (err == error.Cancelled) try snapshots.interrupted(e, marks, @intCast(start));
@@ -169,11 +176,15 @@ fn uploadIds(pair: *const Pair, e: anytype, ids_a: []const i32, ids_b: []const i
 
 test "a pair rebases the index rings where a chunk at a time would, so a ring based at chunk 0 pairs from chunk 2" {
     const C = fw.prefill_rows;
-    try std.testing.expect(ringsAgree(0, 2 * C, 0, C)); // neither rebases
-    try std.testing.expect(!ringsAgree(0, 2 * C, C, C)); // a chunk at a time rebases at b's start, a pair at a's
-    try std.testing.expect(!ringsAgree(0, 2 * C, C, 1));
-    try std.testing.expect(ringsAgree(0, 2 * C, 2 * C, C)); // both at a's start
-    try std.testing.expect(ringsAgree(C, 2 * C, C, C));
+    try std.testing.expect(ringsAgree(0, 2 * C, 4, 0, C)); // neither rebases
+    try std.testing.expect(!ringsAgree(0, 2 * C, 4, C, C)); // a chunk at a time rebases at b's start, a pair at a's
+    try std.testing.expect(!ringsAgree(0, 2 * C, 4, C, 1));
+    try std.testing.expect(ringsAgree(0, 2 * C, 4, 2 * C, C)); // both at a's start
+    try std.testing.expect(ringsAgree(C, 2 * C, 4, C, C));
+    // Off-pool rebase rounds base down by start % pool: a full 2*C pair overflows a 2*C ring, a shorter tail fits.
+    try std.testing.expect(!ringsAgree(0, 2 * C, 4, 3069, C));
+    try std.testing.expect(ringsAgree(0, 2 * C, 4, 3069, C - 1));
+    try std.testing.expect(ringsAgree(0, 2 * C, 4, 39640, C)); // 39640 % 4 == 0: nb == start, fits whole 2*C
 }
 
 test "only ranks that exchange make the twin: TP=1 has no exchanges to hide" {
@@ -236,6 +247,7 @@ test "TF_GLM_PAIR_DFLASH gates paired prompt steps beside DFlash2 while preservi
     seq.cuts = .empty;
     seq.st.base = 0;
     seq.st.ring_rows = 4 * C;
+    seq.st.pool = 4;
     var dr: dflash.Drafter = undefined;
     var e: Engine = undefined;
     e.pair = @as(Pair, undefined);
@@ -254,4 +266,45 @@ test "TF_GLM_PAIR_DFLASH gates paired prompt steps beside DFlash2 while preservi
     try std.testing.expectError(error.BadChunk, prefill(&e, &part, 0, 2 * C, null, null, false));
     e.settings.pair_dflash = true;
     try std.testing.expect(pairedAt(&e, 0, 2 * C, null, null));
+}
+
+test "TF_GLM_REQUEST_STARTS pairs prompt chunks clear of cuts and refuses cuts inside or off-pool ring overflows" {
+    const a = std.testing.allocator;
+    const C = fw.prefill_rows;
+    const Seq = @import("cuda_engine_types.zig").Seq;
+    var seq: Seq = undefined;
+    seq.cuts = .empty;
+    defer seq.cuts.deinit(a);
+    seq.st.base = 0;
+    seq.st.ring_rows = 2 * C;
+    seq.st.pool = 4;
+    var e: Engine = undefined;
+    e.pair = @as(Pair, undefined);
+    e.settings = .{};
+    e.drafter = null;
+    e.prompt_logprobs = null;
+    e.prompt_profs = @splat(null);
+    e.cur = &seq;
+    e.pieces = undefined;
+    e.pieces.count = 3;
+    e.share.world = 2;
+    // Cut strictly after the pair, or exactly at start + 2*C: pairs cleanly.
+    try prompt_cuts.set(a, &seq.cuts, &.{3 * C});
+    try std.testing.expect(pairedAt(&e, 0, 4 * C, null, null));
+    try prompt_cuts.set(a, &seq.cuts, &.{2 * C});
+    try std.testing.expect(pairedAt(&e, 0, 4 * C, null, null));
+    // Cuts inside (start, start+C), at start+C, or inside (start+C, start+2*C): refused by pairedAt and prefill.
+    var part: [2 * C + 1]u32 = @splat(1);
+    for ([_]u32{ 512, C, C + 512, 2 * C - 1 }) |cut| {
+        try prompt_cuts.set(a, &seq.cuts, &.{cut});
+        try std.testing.expect(!pairedAt(&e, 0, 4 * C, null, null));
+        try std.testing.expectError(error.BadChunk, prefill(&e, &part, 0, 4 * C, null, null, false));
+    }
+    // Cuts at or before start: 39640 pairs 2*C; 3069 (mod 4 == 1) refuses 2*C ring overflow but pairs C + (C - 1).
+    try prompt_cuts.set(a, &seq.cuts, &.{ 512, 2557, 3069, 39640 });
+    seq.st.base = 35544;
+    try std.testing.expect(pairedAt(&e, 39640, 50000, null, null));
+    seq.st.base = 0;
+    try std.testing.expect(!pairedAt(&e, 3069, 39640, null, null));
+    try std.testing.expect(pairedAt(&e, 3069, 3069 + 2 * C - 1, null, null));
 }
