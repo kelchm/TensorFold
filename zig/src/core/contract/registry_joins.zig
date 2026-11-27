@@ -181,4 +181,6 @@ test {
     _ = @import("inkling2_vision_metal_records.zig");
     _ = @import("zonos3_cuda_records.zig");
     _ = @import("hy4_ihc_hc_records.zig");
+    _ = @import("glm_kda_segs_records.zig");
+    _ = @import("glm_hc_split_records.zig");
 }

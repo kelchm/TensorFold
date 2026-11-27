@@ -14,7 +14,7 @@ import sys
 
 READ = re.compile(r"\b(LDG|LD|ULDG|TEX|TLD|TLD4|TXD|TMML|SULD)\b(?=[.\s])")
 ASYNC = re.compile(r"\b(LDGSTS|UBLKCP|UTMALDG|UBLKPF)\b")
-WEIGHT_FIRST = re.compile(r"qmmf_kernel|^glm_mm\d+_(\d+|rows)$")
+WEIGHT_FIRST = re.compile(r"qmmf_kernel|^glm_mm\d+_(\d+(?:s2)?|rows)$")
 ADDR = re.compile(r"/\*([0-9a-f]{4,})\*/")
 BRANCH = re.compile(r"\b(BRA|BRX|BRXU|JMP|JMX|JMXU|CALL)\b(\S*)\s+(.*?);")
 PLAIN = re.compile(r"qmmf_prompt_k32_kernel|^tf_qmmf_shared|^tf_qmmf_native_fp4_check$|^tf_q35_(embed8?|splice|sums|conv_commit|gdn_chain|attn_merge|attn_partial|attn_rows|attn_rows_join|attn_partial_whole|attn_rows_whole)$")  # launched plain only

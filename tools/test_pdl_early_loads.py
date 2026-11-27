@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Fixtures for pdl_early_loads.py: early reads and waits a path can skip fail; later reads and weight copies pass."""
 import os
+import shutil
 import sys
 import unittest
 
@@ -41,6 +42,8 @@ class Scan(unittest.TestCase):
     def test_weight_first_copies_pass(self):
         self.check(dump(121, "_ZN7tf_qmmf11qmmf_kernelILi2E", COPY, "ACQBULK"), 0)
         self.check(dump(121, "glm_mm16_rows", COPY, "ACQBULK"), 0)
+        for bits in (4, 6, 8):
+            self.check(dump(121, f"glm_mm{bits}_128s2", COPY, "ACQBULK"), 0)
 
     def test_copies_elsewhere_fail(self):
         self.check(dump(121, "glm_mm_reduce", COPY, "ACQBULK"), 1)
@@ -74,10 +77,10 @@ class Main(unittest.TestCase):
         self.assertEqual(p.main(["pdl_early_loads.py", "cuobjdump"]), 2)
 
     def test_failed_tool_fails(self):
-        self.assertEqual(p.main(["pdl_early_loads.py", "/bin/false", "x.fatbin"]), 1)
+        self.assertEqual(p.main(["pdl_early_loads.py", shutil.which("false"), "x.fatbin"]), 1)
 
     def test_empty_dump_fails(self):
-        self.assertEqual(p.main(["pdl_early_loads.py", "/bin/true", "x.fatbin"]), 1)
+        self.assertEqual(p.main(["pdl_early_loads.py", shutil.which("true"), "x.fatbin"]), 1)
 
 
 if __name__ == "__main__":

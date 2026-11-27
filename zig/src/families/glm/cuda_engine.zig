@@ -72,6 +72,7 @@ pub const Engine = struct {
     packs: mm_mod.Packed = .{}, // the linears packed at load and their bits (TF_GLM_DENSE_BITS, _HEAD_BITS)
     drafter: ?*dflash.Drafter = null, // --drafter: DFlash2 (every rank runs its passes; rank 0 selects the drafts)
     profs: [fw.window_rows]?*prof_mod.Prof = @splat(null), // TF_GLM_PROF=1: verify sections' GPU time, by rows
+    shared_prof: ?*prof_mod.Prof = null, // TF_GLM_PROF=1: shared verify sections' GPU time
     profiling_prompt: ?*prof_mod.Prof = null,
     prompt_profs: [4]?*prof_mod.Prof = @splat(null), // and prompt chunks': to 64, 256, 1024, 2048 rows
     checkpoint_digest: [32]u8,
@@ -500,10 +501,15 @@ pub const Engine = struct {
             rows += p.ids.len;
         }
         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .shared_kda_wide = e.settings.shared_kda_wide, .taps = if (e.drafter) |dr| dr.taps(false) else null, .l2pf = if (e.l2pf) |*p| p else null, .side = e.side };
+        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .shared_kda_wide = e.settings.shared_kda_wide, .taps = if (e.drafter) |dr| dr.taps(false) else null, .l2pf = if (e.l2pf) |*p| p else null, .side = e.side, .prof = e.shared_prof };
+        if (f.prof) |p| try p.begin(e.stream, "verify shared");
+        errdefer if (f.prof) |p| {
+            p.open = false;
+        };
         try f.run(@ptrCast(ids[0..rows]));
         if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
         try @import("cuda_engine_pick.zig").drawShared(e, b, parts, segs[0..parts.len], rows);
+        if (f.prof) |p| p.end();
     }
 
     /// DFlash2's round (every rank, the same `reqs`): each stream's kept rows into its context, then the block pass.

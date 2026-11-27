@@ -11,3 +11,17 @@ pub const records = [_]registry.CudaRecord{
     .{ .launch = .{ .name = "glm_kda tf_glm_kda_out_segs", .symbol = "tf_glm_kda_out_segs", .image = "glm_kda", .threads = 128, .min_sm = 80 }, .usage = registry.none, .later_pending = true },
     .{ .launch = .{ .name = "glm_kda tf_glm_kda_copy_segs", .symbol = "tf_glm_kda_copy_segs", .image = "glm_kda", .threads = 256, .min_sm = 80 }, .usage = registry.none, .later_pending = true },
 };
+
+test "GLM KDA step-width and segmented kernels: five-SM nvcc 13.3 receipts pass limits" {
+    const std = @import("std");
+    const limits = @import("limits.zig");
+    for (records) |r| {
+        const usage = registry.usageFor(r, .{ .major = 13, .minor = 3 });
+        for (limits.sms, usage) |sm, u| {
+            try std.testing.expect(u.regs > 0);
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(usize, 0), try limits.cuda(r.launch, u, sm, &out, std.testing.allocator));
+        }
+    }
+}
