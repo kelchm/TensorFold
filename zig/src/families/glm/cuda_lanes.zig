@@ -32,6 +32,7 @@ pub const Lanes = struct {
     x: follow.Leader,
     whole: bool = false, // prompt passes run whole (TF_GLM_PROMPT_STEPS=0): no other stream's round between chunks
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
+    long_copy_match: bool = false, // TF_GLM_COPY_8_16: 8 prompt / 16 reply match, up to 15 copy drafts
     mtp_confidence: ?f64 = null, // --mtp-confidence: the MTP head's chains stop where their chance falls under it
     copy_confidence: bool = false, // copy mode keeps head confidence in probabilities so target copies stay priced
     costs: ?lane_costs.Table = null, // MTP's window and draft prices, timed at load (cuda_lane_costs)
@@ -41,7 +42,6 @@ pub const Lanes = struct {
     next: u64 = 0,
     bits: ?cuda.HostBuffer = null, // structured output's grammar words (shared_rows rows), device-read, at first use
     bits_dev: u64 = 0,
-
     pub fn deinit(self: *Lanes) void {
         if (self.bits) |*b| b.free();
         var it = self.lanes.valueIterator();
@@ -126,7 +126,7 @@ pub const Lanes = struct {
     /// Root/context copies use the same verify/keep path and shared cost allocator as every target window.
     pub fn factsWithCopies(self: *Lanes, enabled: bool) lanes.Model {
         self.copy_confidence = enabled and (self.x.e.mtp or self.x.e.drafter != null);
-        return copy_policy.apply(self.facts(), enabled, self.x.e.drafter == null and self.costs != null);
+        return copy_policy.applyLong(self.facts(), enabled, self.x.e.drafter == null and self.costs != null, self.long_copy_match and self.x.e.drafter != null);
     }
 
     fn of(ptr: *anyopaque) *Lanes {

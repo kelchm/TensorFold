@@ -488,3 +488,29 @@ test "GLM window prices: MTP takes timed prices and DFlash2 keeps every consumed
         }
     }
 }
+
+test "CUDA lane copies: opt-in GLM DFlash preconditions and depth preserve forced windows" {
+    const f = @import("glm_cuda");
+    var target: f.engine.Engine = undefined;
+    target.mtp = false;
+    target.drafter = @ptrFromInt(0x1000);
+    var b: f.lanes.Lanes = .{ .x = .{ .e = &target, .link = undefined } };
+    const off = b.factsWithCopies(true);
+    b.long_copy_match = true;
+    try std.testing.expectEqualDeep(b.facts(), b.factsWithCopies(false));
+    const on = b.factsWithCopies(true);
+    try std.testing.expect(on.root_copies and on.own_copy_rates);
+    try std.testing.expectEqual(@as(i64, 8), on.copy_match);
+    try std.testing.expectEqual(@as(u32, 16), on.copy_reply_match);
+    for ([_]u32{ 32, 12, 2 }) |width| {
+        var c = try lanes.Config.init(a, on, width, width - 1);
+        defer c.deinit(a);
+        var previous = try lanes.Config.init(a, off, width, width - 1);
+        defer previous.deinit(a);
+        try std.testing.expectEqual(@min(width - 1, 15), c.first_copy);
+        try std.testing.expectEqual(c.first_copy, c.max_copy);
+        try std.testing.expectEqual(previous.base_width, c.base_width);
+    }
+    target.drafter = null;
+    try std.testing.expectEqual(@as(u32, 0), b.factsWithCopies(true).copy_reply_match);
+}

@@ -30,6 +30,17 @@ pub fn apply(base: lanes.Model, enabled: bool, measured: bool) lanes.Model {
     return m;
 }
 
+/// Optional TF_GLM_COPY_8_16 policy for DFlash2: 8 prompt tokens, 16 reply tokens, up to 15 drafts.
+pub fn applyLong(base: lanes.Model, enabled: bool, measured: bool, long_match: bool) lanes.Model {
+    var m = apply(base, enabled, measured);
+    if (long_match and enabled and base.mtp) {
+        m.fixed_copy_drafts = 15;
+        m.copy_match = 8;
+        m.copy_reply_match = 16;
+    }
+    return m;
+}
+
 /// The same shared confidence prefix, encoded as zero tail probabilities for the ordinary cost allocator.
 pub fn confidence(floor: ?f64, chances: []f64) void {
     if (floor == null) return;

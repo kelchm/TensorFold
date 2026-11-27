@@ -74,7 +74,14 @@ pub fn open(h: *LaneHost, job: *Job) bool {
     if (!memory_active and h.cache != null and !r.promptOnly() and r.prompt_logprobs == null and !r.untaught) reuse = kept(h, job);
     if (h.proposers) |ps| {
         job.custom = ps.make(ps.ctx, h.gpa, r.prompt, r.eos) catch return !h.drop(job, "the drafter could not start");
-    } else job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return !h.drop(job, "the drafter could not start");
+    } else {
+        const c = h.core.cfg;
+        const prompt_copy = c.copy_reply_match > 0;
+        job.proposer = lanes.SuffixLookup.init(h.gpa, .{
+            .min_match = if (prompt_copy) c.enter_match else h.min_match,
+            .prompt_copy = if (prompt_copy) .{ .prompt_len = effective_prompt.len, .reply_match = c.copy_reply_match } else null,
+        }) catch return !h.drop(job, "the drafter could not start");
+    }
     const recall = if (memory_active) null else recalls.reader(h, job);
     job.stream = lanes.Stream.init(h.gpa, .{
         .id = "request",

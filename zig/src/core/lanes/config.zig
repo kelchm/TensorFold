@@ -17,6 +17,8 @@ pub const Model = struct {
     allocate_shared_drafts: bool = false, // reserve useful shared head rows before a proposal pass
     limit_shared_drafts: bool = false, // retain the cost rule's depth cap before reserving shared rows
     root_copies: bool = false, // verified context copies precede head drafts and skip their proposal pass
+    copy_reply_match: u32 = 0, // optional longer match for a source inside the reply
+    fixed_copy_drafts: ?u32 = null, // optional fixed context-copy proposal width
     copy_drafts: bool = true, // global serving switch, independent of shared verification capacity
     own_copy_rates: bool = false, // a copy window is priced by its stream's own copies, not copy_rate's prior
 
@@ -114,6 +116,7 @@ pub const Config = struct {
     shared_mtp_cap: u32 = 0, // Model.shared_mtp_cap
     lone_cost_tile: u32 = 0, // Model.lone_cost_tile
     context_copies: bool = false, // Model.context_copies, within the existing verification width
+    copy_reply_match: u32 = 0, // see Model.copy_reply_match
     enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation)
     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation
     lone_copies: bool = true, // Model.lone_copies
@@ -124,7 +127,7 @@ pub const Config = struct {
         const width: u32 = @max(1, @min(@max(m.exact_width, 1), max_rows));
         if (m.draft_confidence) |floor| if (!(floor >= 0 and floor <= 1)) return error.InvalidDraftConfidence;
         if (m.head_trees and m.draft_confidence != null) return error.DraftConfidenceNeedsChain;
-        const max_copy = if (m.copy_drafts) width - 1 else 0;
+        const max_copy = if (m.copy_drafts) @min(width - 1, m.fixed_copy_drafts orelse width - 1) else 0;
         const first_rows: i64 = if (m.first_copy_rows != 0) m.first_copy_rows else width;
         const first_copy: u32 = @intCast(@max(1, @min(@as(i64, max_copy), first_rows - 1)));
         const prior = if (m.draft_prior.len > 0) m.draft_prior else &default_prior;
@@ -157,12 +160,13 @@ pub const Config = struct {
             .root_copies = m.root_copies and m.copy_drafts,
             .context_copies = m.context_copies and m.copy_drafts,
             .enter_match = @max(1, m.copy_match),
+            .copy_reply_match = m.copy_reply_match,
             .lone_copies = m.lone_copies,
             .lone_cost_tile = m.lone_cost_tile,
             .family_width = width,
             .max_copy = max_copy,
             .own_copy_rates = m.own_copy_rates,
-            .first_copy = first_copy,
+            .first_copy = if (m.fixed_copy_drafts != null) max_copy else first_copy,
             .base_width = @min(width, first_copy + 1),
             .family_mtp = m.mtp and width >= 2 and m.speculate,
             .speculate_early = m.speculate_early and !(m.root_copies and m.copy_drafts),
@@ -240,5 +244,18 @@ test "shared cost consumer: lone measured windows stay out of shared MTP prices"
         var explicit = try Config.init(a, .{ .exact_width = 32, .mtp = true, .speculate = true, .window_costs = &own, .window_costs_lone = lone, .shared_costs = &shared }, 32, 15);
         defer explicit.deinit(a);
         for (shared) |cost| try std.testing.expectEqual(@as(?f64, cost.ms), explicit.shared_costs.get(cost.width));
+    }
+}
+
+test "bounded copy depth stays below the family's exact target window" {
+    const a = std.testing.allocator;
+    const m: Model = .{ .exact_width = 32, .first_copy_rows = 4, .copy_reply_match = 16, .copy_match = 8, .fixed_copy_drafts = 15 };
+    for ([_]u32{ 32, 12, 2 }) |maximum| {
+        var c = try Config.init(a, m, maximum, maximum - 1);
+        defer c.deinit(a);
+        try std.testing.expectEqual(@min(maximum - 1, 15), c.max_copy);
+        try std.testing.expectEqual(c.max_copy, c.first_copy);
+        try std.testing.expectEqual(@min(maximum, 4), c.base_width);
+        try std.testing.expectEqual(@as(u32, 16), c.copy_reply_match);
     }
 }
