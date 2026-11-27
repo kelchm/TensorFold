@@ -46,6 +46,7 @@ pub const Modules = struct {
     exl3: exl3.Kernels, // an EXL3 checkpoint's routed experts
     mm: mm_mod.Kernels, // glm_mm: the bf16 linears on tiled weights
     index: ?index_mod.Kernels, // TF_GLM_INDEX_CUDA: a prompt chunk's indexer scores and pools (glm_index)
+    priced_windows: bool = false, // TF_GLM_PRICED_WINDOWS: DFlash2 publishes target prices and raw block chances
     dsel: bool, // TF_GLM_DSEL (default on): a decode window's DSA select on many CTAs (cuda_sparse.decodeSelect)
     dscore: ?index_mod.Kernels, // TF_GLM_DSCORES (default on): a decode window's index scores on glm_index_scores
     moe_direct: bool, // TF_GLM_MOE_DIRECT (default off): a decode window's EXL3 MoE without row copies (cuda_moe.direct)
@@ -105,6 +106,7 @@ pub const Modules = struct {
             std.log.warn("glm: the indexer kernels are not used ({t}); prompt chunks use tf_glm_scores, as with TF_GLM_INDEX_CUDA=0", .{err});
             break :blk null;
         };
+        m.priced_windows = try @import("cuda_lane_costs.zig").pricedWindows();
         m.dsel = try @import("sys").environment.read(bool, "TF_GLM_DSEL", true);
         if (!m.dsel) std.log.warn("TF_GLM_DSEL=0: a decode window's DSA select keeps one 1,024-thread CTA a row", .{});
         m.dscore = null;
@@ -209,14 +211,12 @@ pub const Forward = struct {
     pub fn resolve(f: *const Forward, rows: usize, epilogue: ?ResolvePost) !bool {
         return @import("cuda_boundary.zig").resolve(f, rows, epilogue);
     }
-
     fn wholePost(f: *const Forward) ?ResolvePost {
         const c = &f.ranks[0].w.config;
         const b = f.ranks[0].b;
         if (c.dsa) return .{ .residual_add = .{ .x = b.x, .xout = b.x } };
         return if (c.hc == 4) .{ .hc_post = .{ .x = b.x, .xout = b.x, .post = b.post, .comb = b.comb } } else null;
     }
-
     fn slot(r: Rank, rows: usize) u64 {
         return r.b.gathered + r.w.share.rank * rows * r.w.config.hidden * 4;
     }
