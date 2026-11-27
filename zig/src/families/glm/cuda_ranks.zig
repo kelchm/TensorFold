@@ -21,6 +21,7 @@ pub const Settings = struct {
     solo: bool = false, // TF_GLM_CHUNK_SOLO: 4096 (prompt buffers for two chunks a pass, while no stream decodes) or 2048
     keep_seqs: bool = false, // TF_GLM_KEEP_SEQS: 1 (a released slot keeps its sequence for its next request)
     pair: bool = true, // TF_GLM_PROMPT_PAIR: 1 (while no stream decodes, a prompt step takes two chunks, each one's exchanges under the other's sites) or 0
+    pair_dflash: bool = false, // TF_GLM_PAIR_DFLASH=1: opt into paired prompt steps beside DFlash2
     exl3_decode: bool = false, // TF_GLM_EXL3_DECODE=1: specialized uniform 4-bit TP2 routed experts for short verify windows
     exl3_nmajor: bool = false, // TF_GLM_EXL3_N_MAJOR=1: output-major CTA traversal at 4, 8 and 16 rows
     pair_experts: bool = false, // TF_GLM_PAIR_EXPERTS=1: paired chunks share 128-pair NVFP4 routed-expert items (0: two 64-pair passes)
@@ -206,7 +207,7 @@ pub const Settings = struct {
                 return error.BadSetting;
             };
         }
-        inline for (.{ .{ "TF_GLM_EXL3_DECODE", "exl3_decode" }, .{ "TF_GLM_EXL3_N_MAJOR", "exl3_nmajor" }, .{ "TF_GLM_PACKED_PROMPT_S2", "prompt_s2" }, .{ "TF_GLM_DFLASH_SNAP_CONTEXT", "dflash_snap_context" } }) |flag| {
+        inline for (.{ .{ "TF_GLM_EXL3_DECODE", "exl3_decode" }, .{ "TF_GLM_EXL3_N_MAJOR", "exl3_nmajor" }, .{ "TF_GLM_PACKED_PROMPT_S2", "prompt_s2" }, .{ "TF_GLM_DFLASH_SNAP_CONTEXT", "dflash_snap_context" }, .{ "TF_GLM_PAIR_DFLASH", "pair_dflash" } }) |flag| {
             @field(s, flag[1]) = @import("sys").environment.value(bool, flag[0], get(flag[0]), false) catch {
                 problem.* = flag[0] ++ ": 0 or 1";
                 return error.BadSetting;
@@ -264,7 +265,7 @@ pub fn toolPieces(s: *Settings, comptime get: *const fn ([:0]const u8) ?[]const 
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 30, // 29, plus dflash_snap_context bit in mtp
+    layout: u32 = 31, // 30, plus drafter_bits, drafter_checkpoint, and pair_dflash bit in pair
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -366,7 +367,7 @@ pub const Fingerprint = extern struct {
             .kda_pad = @intFromBool(s.kda_pad),
             .kv_live_half = @intFromBool(s.kv_live_half),
             .pieces = s.pieces,
-            .pair = @intFromBool(s.pair),
+            .pair = @as(u32, @intFromBool(s.pair)) | (@as(u32, @intFromBool(s.pair_dflash)) << 1),
             .pair_experts = @as(u32, @intFromBool(s.pair_experts)) | (@as(u32, @intFromBool(s.exl3_decode)) << 1) | (@as(u32, @intFromBool(s.exl3_nmajor)) << 2),
             .layers = s.layers,
             .mtp = @as(u32, @intFromBool(mtp)) | (@as(u32, @intFromBool(s.dflash_only)) << 2) | (@as(u32, @intFromBool(s.dflash_q4_down)) << 3) | (@as(u32, @intFromBool(s.dflash_snap_context)) << 4),
@@ -538,7 +539,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .kda_pad => "TF_GLM_KDA_PAD",
         .kv_live_half => "TF_GLM_KV_LIVE_HALF",
         .pieces => "TF_GLM_OVERLAP_PIECES",
-        .pair => "TF_GLM_PROMPT_PAIR",
+        .pair => "TF_GLM_PROMPT_PAIR or TF_GLM_PAIR_DFLASH",
         .pair_experts => "TF_GLM_PAIR_EXPERTS / TF_GLM_EXL3_DECODE / TF_GLM_EXL3_N_MAJOR",
         .layers => "TF_GLM_LAYERS",
         .mtp => "--no-drafts, --drafter, TF_GLM_DFLASH_ONLY, TF_GLM_DFLASH_Q4_DOWN or TF_GLM_DFLASH_SNAP_CONTEXT differs across ranks",

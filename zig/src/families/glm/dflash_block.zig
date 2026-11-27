@@ -49,7 +49,7 @@ pub fn copy(e: anytype, dst: u64, src: u64, bytes: usize) !void {
 
 pub fn upload(dr: *const Drafter, e: anytype, dst: u64, bytes: []const u8) !void {
     _ = dr;
-    try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(dst, bytes.ptr, bytes.len, e.stream.handle), "cuMemcpyHtoDAsync");
+    try cuda.copy_source.enqueue(e.d, dst, bytes, e.stream);
 }
 
 /// After the pass: the stream idle, a failed RoCE gather's error raised, `src` read into `dst`.

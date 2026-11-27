@@ -248,6 +248,14 @@ pub const Drafter = struct {
     /// The same ordinary context ingest, with this prompt's rows at row0 in the batched tap buffer.
     pub const promptSegment = ingestPrompt;
 
+    /// A paired step's second chunk whose tap rows already sit in the context input from row `row0` on (pairTaps).
+    pub const promptIn = ingestPromptIn;
+
+    /// A paired step's second chunk's taps past the first's `first_rows` rows: the context input, idle in the pass.
+    pub fn pairTaps(dr: *const Drafter, first_rows: usize) taps_mod.Taps {
+        return .{ .f = dr.k.tap, .out = dr.cin + first_rows * TAP_ROW };
+    }
+
     /// The runs' rows through fc, the hidden norm and each layer's k, v into their rings.
     pub fn ingest(dr: *Drafter, e: anytype, runs: []const Run) !void {
         var N: usize = 0;
@@ -256,7 +264,7 @@ pub const Drafter = struct {
         if (N > MAX_CTX) return error.DrafterContextTooWide;
         var row: usize = 0;
         for (runs) |r| {
-            try block.copy(e, dr.cin + row * TAP_ROW, r.taps, r.n * TAP_ROW);
+            if (r.taps != dr.cin + row * TAP_ROW) try block.copy(e, dr.cin + row * TAP_ROW, r.taps, r.n * TAP_ROW); // promptIn's in place
             for (0..r.n) |j| {
                 dr.h_cpos[row + j] = r.pos0 + @as(i64, @intCast(j));
                 dr.h_crings[row + j] = r.ring;
@@ -355,16 +363,33 @@ pub fn ingestPrompt(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, 
     s.prompt_history.append(@intCast(run.pos0), run.n);
 }
 
+/// ingestPrompt of a chunk tapped into the context input from row `row0` (pairTaps), its rows all in the last window.
+pub fn ingestPromptIn(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize, row0: usize) !void {
+    if (start < len -| @as(usize, @intCast(WIN))) return error.BadPromptContext; // a copy would skip its first rows
+    if (row0 > MAX_CTX) return error.DrafterContextTooWide;
+    const s = try dr.slot(i);
+    const cin = dr.cin;
+    defer dr.cin = cin;
+    dr.cin = cin + row0 * TAP_ROW; // the ingest's input starts at the chunk's rows
+    const run = (try promptRun(s.ring.?.ptr, dr.cin, start, rows, len, 0, MAX_CTX - row0)) orelse {
+        s.prompt_history = .{};
+        return;
+    };
+    errdefer s.prompt_history = .{};
+    try dr.ingest(e, &.{run});
+    s.prompt_history.append(@intCast(run.pos0), run.n);
+}
+
 test "GLM embedding: DFlash generated IDs are checked before their upload" {
     const Fake = struct {
         var calls: usize = 0;
-        fn copy(_: u64, _: ?*const anyopaque, _: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+        fn hostAlloc(_: *?*anyopaque, _: usize, _: c_uint) callconv(.c) cuda.abi.Result {
             calls += 1;
             return cuda.abi.error_not_ready;
         }
     };
     var d: cuda.Driver = .{ .lib = undefined, .api = undefined };
-    d.api.cuMemcpyHtoDAsync_v2 = Fake.copy;
+    d.api.cuMemHostAlloc = Fake.hostAlloc;
     var dr: Drafter = undefined;
     dr.ids = 0;
     const stream: cuda.Stream = .{ .d = &d, .handle = null };
@@ -375,4 +400,119 @@ test "GLM embedding: DFlash generated IDs are checked before their upload" {
     }
     try std.testing.expectError(error.NotReady, uploadIds(&dr, &e, &.{ 127, MASK }));
     try std.testing.expect(Fake.calls > 0);
+}
+
+test "DFlash2 paired ingest uses distinct owned pinned copy sources for back-to-back h_cpos and h_crings uploads" {
+    const Fake = struct {
+        const Upload = struct { dst: u64, ptr: [*]const u8, len: usize };
+        const SlotBuf = struct { ptr: ?[*]align(16) u8 = null, len: usize = 0 };
+        var bufs: [8]SlotBuf = @splat(.{});
+        var uploads: [8]Upload = undefined;
+        var count: usize = 0;
+        var live: usize = 0;
+        fn hostAlloc(out: *?*anyopaque, len: usize, _: c_uint) callconv(.c) cuda.abi.Result {
+            const m = std.testing.allocator.alignedAlloc(u8, .@"16", len) catch return cuda.abi.error_not_ready;
+            for (&bufs) |*b| if (b.ptr == null) {
+                b.* = .{ .ptr = m.ptr, .len = len };
+                out.* = m.ptr;
+                live += 1;
+                return 0;
+            };
+            std.testing.allocator.free(m);
+            return cuda.abi.error_not_ready;
+        }
+        fn hostFree(p: ?*anyopaque) callconv(.c) cuda.abi.Result {
+            for (&bufs) |*b| if (b.ptr != null and @intFromPtr(b.ptr.?) == @intFromPtr(p.?)) {
+                std.testing.allocator.free(b.ptr.?[0..b.len]);
+                b.* = .{};
+                live -= 1;
+                return 0;
+            };
+            return 1;
+        }
+        fn htodAsync(dst: u64, src: ?*const anyopaque, len: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            uploads[count] = .{ .dst = dst, .ptr = @ptrCast(src.?), .len = len };
+            count += 1;
+            return 0;
+        }
+        fn dtodAsync(_: u64, _: u64, _: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            return 0;
+        }
+        fn eventCreate(out: *cuda.abi.Event, _: c_uint) callconv(.c) cuda.abi.Result {
+            out.* = @ptrFromInt(1);
+            return 0;
+        }
+        fn eventRecord(_: cuda.abi.Event, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            return 0;
+        }
+        fn eventQuery(_: cuda.abi.Event) callconv(.c) cuda.abi.Result {
+            return cuda.abi.error_not_ready;
+        }
+        fn eventDestroy(_: cuda.abi.Event) callconv(.c) cuda.abi.Result {
+            return 0;
+        }
+        fn streamSync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            return 0;
+        }
+        fn launch(_: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+            return 0;
+        }
+    };
+    Fake.bufs = @splat(.{});
+    Fake.count = 0;
+    Fake.live = 0;
+    var d: cuda.Driver = .{ .lib = undefined, .api = undefined };
+    d.api.cuMemHostAlloc = Fake.hostAlloc;
+    d.api.cuMemFreeHost = Fake.hostFree;
+    d.api.cuMemcpyHtoDAsync_v2 = Fake.htodAsync;
+    d.api.cuMemcpyDtoDAsync_v2 = Fake.dtodAsync;
+    d.api.cuEventCreate = Fake.eventCreate;
+    d.api.cuEventRecord = Fake.eventRecord;
+    d.api.cuEventQuery = Fake.eventQuery;
+    d.api.cuEventDestroy_v2 = Fake.eventDestroy;
+    d.api.cuStreamSynchronize = Fake.streamSync;
+    d.api.cuLaunchKernel = Fake.launch;
+    d.api.cuLaunchKernelEx = @import("cuda_pdl.zig").forwardEx(Fake.launch);
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    defer stream.synchronize() catch {};
+    var h_cpos = [_]i64{ 0, 0, 0, 0 };
+    var h_crings = [_]u64{ 0, 0, 0, 0 };
+    const fn_stub: cuda.Function = .{ .d = &d, .handle = @ptrFromInt(1) };
+    var dr: Drafter = undefined;
+    dr.cin = 64;
+    dr.c1 = 64;
+    dr.ctx = 64;
+    dr.ckv = 64;
+    dr.part = 64;
+    dr.hnorm = 64;
+    dr.cpos = 0x1000;
+    dr.crings = 0x2000;
+    dr.h_cpos = &h_cpos;
+    dr.h_crings = &h_crings;
+    dr.fc = .{ .bf16 = .{ .w = 64, .n = 64, .k = 64 } };
+    dr.k.ctx_kv = fn_stub;
+    for (&dr.layers) |*l| l.* = .{ .in_norm = 0, .post_norm = 0, .qn = 0, .kn = 64, .a_base = 0, .m_base = 0, .qkv = undefined, .kv = .{ .bf16 = .{ .w = 64, .n = 64, .k = 64 } }, .o = undefined, .gu = undefined, .down = undefined, .a_proj = undefined, .m_proj = undefined };
+    var m: struct { mm: mm.Kernels, glue: @import("cuda_glue.zig").Kernels, q4: q4.Kernels } = undefined;
+    m.mm.by_rows[0] = fn_stub;
+    m.mm.pdl = false;
+    m.glue.rmsnorm_4096 = fn_stub;
+    const e = .{ .d = &d, .stream = stream, .m = &m };
+    try dr.ingest(&e, &.{.{ .ring = 0xAAA0, .taps = 64, .n = 2, .pos0 = 100 }});
+    try dr.ingest(&e, &.{.{ .ring = 0xBBB0, .taps = 64, .n = 2, .pos0 = 500 }});
+    try std.testing.expectEqual(@as(usize, 4), Fake.count);
+    for (0..4) |i| {
+        try std.testing.expect(@intFromPtr(Fake.uploads[i].ptr) != @intFromPtr(&h_cpos));
+        try std.testing.expect(@intFromPtr(Fake.uploads[i].ptr) != @intFromPtr(&h_crings));
+        for (i + 1..4) |j| try std.testing.expect(Fake.uploads[i].ptr != Fake.uploads[j].ptr);
+    }
+    const want_pos0 = [_]i64{ 100, 101 };
+    const want_ring0 = [_]u64{ 0xAAA0, 0xAAA0 };
+    const want_pos1 = [_]i64{ 500, 501 };
+    const want_ring1 = [_]u64{ 0xBBB0, 0xBBB0 };
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&want_pos0), Fake.uploads[0].ptr[0..Fake.uploads[0].len]);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&want_ring0), Fake.uploads[1].ptr[0..Fake.uploads[1].len]);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&want_pos1), Fake.uploads[2].ptr[0..Fake.uploads[2].len]);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&want_ring1), Fake.uploads[3].ptr[0..Fake.uploads[3].len]);
+    try stream.synchronize();
+    try std.testing.expectEqual(@as(usize, 0), Fake.live);
 }
