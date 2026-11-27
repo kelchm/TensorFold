@@ -166,7 +166,10 @@ fn recording(d: *cuda.Driver, ks: anytype) void {
     d.api.cuLaunchKernelEx = @import("cuda_pdl.zig").forwardEx(Rec.run);
     d.func_name = null;
     d.api.cuModuleGetFunction = Ops.function;
-    inline for (@typeInfo(@TypeOf(ks.*)).@"struct".field_names, 0..) |name, i| @field(ks, name) = .{ .d = d, .handle = @ptrFromInt(16 + i) };
+    inline for (@typeInfo(@TypeOf(ks.*)).@"struct".field_names, 0..) |name, i| {
+        const T = @FieldType(@TypeOf(ks.*), name);
+        if (T == cuda.Function or T == ?cuda.Function) @field(ks, name) = .{ .d = d, .handle = @ptrFromInt(16 + i) } else if (T == bool) @field(ks, name) = true;
+    }
     Rec.n = 0;
     Rec.arity = @splat(0);
 }
@@ -377,7 +380,10 @@ test "GLM FP8 KV: actual DSA dense and sparse passes retain the sequence-owned s
     d.func_name = null;
     d.api.cuModuleGetFunction = Ops.function;
     var ks: glue.Kernels = undefined;
-    inline for (@typeInfo(glue.Kernels).@"struct".field_names) |name| @field(ks, name) = .{ .d = &d, .handle = @ptrFromInt(10) };
+    inline for (@typeInfo(glue.Kernels).@"struct".field_names) |name| {
+        const T = @FieldType(glue.Kernels, name);
+        if (T == cuda.Function or T == ?cuda.Function) @field(ks, name) = .{ .d = &d, .handle = @ptrFromInt(10) } else if (T == bool) @field(ks, name) = true;
+    }
     ks.lat_write_fp8.handle = @ptrFromInt(2);
     ks.chunks_16_fp8.handle = @ptrFromInt(4);
     ks.merge.handle = @ptrFromInt(7);
@@ -426,7 +432,10 @@ test "GLM KV host: a prompt MTP chunk's pooled keys take their own page stride, 
     d.func_name = null;
     d.api.cuModuleGetFunction = Ops.function;
     var ks: glue.Kernels = undefined;
-    inline for (@typeInfo(glue.Kernels).@"struct".field_names) |name| @field(ks, name) = .{ .d = &d, .handle = @ptrFromInt(10) };
+    inline for (@typeInfo(glue.Kernels).@"struct".field_names) |name| {
+        const T = @FieldType(glue.Kernels, name);
+        if (T == cuda.Function or T == ?cuda.Function) @field(ks, name) = .{ .d = &d, .handle = @ptrFromInt(10) } else if (T == bool) @field(ks, name) = true;
+    }
     ks.lat_write.handle = @ptrFromInt(1);
     ks.pool_keys.handle = @ptrFromInt(8);
     ks.scores.handle = @ptrFromInt(9);

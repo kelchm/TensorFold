@@ -36,4 +36,6 @@ pub const rules = [_]Rule{
     .{ .name = "TF_DSV41_SESSION_STAGING_MIB", .scope = .dsv41, .kind = .u32, .blank_default = false, .forms = "a whole session staging MiB count from 0 to 4294967295 (unset: 128)" },
     .{ .name = "TF_INKLING2_EXL3_DIR", .scope = .cuda, .kind = .path, .forms = "a directory path without control characters holding real Inkling 2 Small EXL3 pack headers (unset or blank: skip the opt-in host test)" },
     .{ .name = "TF_GLM_KDA_STEP_WARPS", .scope = .glm, .kind = .word, .trim = " \t", .words = &.{ "auto", "8", "4", "2" }, .forms = "auto, 8, 4 or 2" },
+    .{ .name = "TF_GLM_HC_SPLIT", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_GLM_HC_PART", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
 };

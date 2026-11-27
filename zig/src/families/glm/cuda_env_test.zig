@@ -36,6 +36,8 @@ const switches = [_]Name{
     .{ .name = "TF_GLM_MOE_DIRECT" },
     .{ .name = "TF_GLM_WIDE_EXPERT_TILE" },
     .{ .name = "TF_GLM_PRICED_WINDOWS" },
+    .{ .name = "TF_GLM_HC_SPLIT", .default = true },
+    .{ .name = "TF_GLM_HC_PART", .default = true },
 };
 const counts = [_][:0]const u8{"TF_GLM_DFLASH2_LOG"};
 const reals = [_][:0]const u8{ "TF_GLM_DRAFT_CONFIDENCE", "TF_GLM_SHARED_DRAFT_CONFIDENCE" };

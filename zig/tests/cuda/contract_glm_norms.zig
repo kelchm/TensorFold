@@ -12,8 +12,9 @@ pub const Set = struct {
     f32ws: [std.enums.values(f32w_k.Which).len]F32w = undefined,
     bf16s: [f32w_k.bf16_entries.len]F32w = undefined,
     wides: [f32w_k.wide_entries.len]F32w = undefined,
+    splits: f32w_k.Splits = undefined,
     control: F32w = undefined,
-    n: [4]usize = @splat(0), // how many of f32ws, bf16s, wides and control hold a kernel
+    n: [5]usize = @splat(0), // how many of f32ws, bf16s, wides, splits and control hold a kernel
 
     /// Every registration onto `kernels`, from the glm_glue image and the contract controls' frozen entrypoints.
     pub fn add(self: *Set, gpu: check.Gpu, s: cuda.Stream, glue: cuda.Module, controls: cuda.Module, kernels: *std.ArrayList(g.Kernel)) !void {
@@ -39,12 +40,15 @@ pub const Set = struct {
             x.bf16_w = true;
             x.row0 = e.row0;
         }
-        self.control = .init(.{ .gpu = gpu, .s = s }, .norm_y, try glue.function("tf_glm_rmsnorm_4096_f32w"));
+        self.splits = try f32w_k.Splits.init(.{ .gpu = gpu, .s = s }, glue);
         self.n[3] = 1;
+        self.control = .init(.{ .gpu = gpu, .s = s }, .norm_y, try glue.function("tf_glm_rmsnorm_4096_f32w"));
+        self.n[4] = 1;
         self.control.bf16_gamma = true;
         for (&self.f32ws) |*x| try kernels.append(a, x.kernel());
         for (&self.bf16s) |*x| try kernels.append(a, x.kernel());
         for (&self.wides) |*x| try kernels.append(a, x.kernel());
+        try self.splits.append(a, kernels);
         try kernels.append(a, self.control.kernel());
     }
 
@@ -52,6 +56,7 @@ pub const Set = struct {
         for (self.f32ws[0..self.n[0]]) |*x| x.deinit();
         for (self.bf16s[0..self.n[1]]) |*x| x.deinit();
         for (self.wides[0..self.n[2]]) |*x| x.deinit();
-        if (self.n[3] == 1) self.control.deinit();
+        if (self.n[3] == 1) self.splits.deinit();
+        if (self.n[4] == 1) self.control.deinit();
     }
 };

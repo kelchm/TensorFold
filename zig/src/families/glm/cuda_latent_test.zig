@@ -120,7 +120,10 @@ const Fakes = struct {
         f.d.api.cuLaunchKernel = Launch.run;
         f.d.api.cuLaunchKernelEx = @import("cuda_pdl.zig").forwardEx(Launch.run);
         f.d.api.cuModuleGetFunction = Ops.function;
-        inline for (@typeInfo(glue.Kernels).@"struct".field_names, 1..) |name, i| @field(f.ks, name) = .{ .d = &f.d, .handle = @ptrFromInt(i) };
+        inline for (@typeInfo(glue.Kernels).@"struct".field_names, 1..) |name, i| {
+            const T = @FieldType(glue.Kernels, name);
+            if (T == cuda.Function or T == ?cuda.Function) @field(f.ks, name) = .{ .d = &f.d, .handle = @ptrFromInt(i) } else if (T == bool) @field(f.ks, name) = true;
+        }
         f.m = undefined;
         inline for (mla_fields, 201..) |name, i| @field(f.m, name) = .{ .d = &f.d, .handle = @ptrFromInt(i) };
         Launch.n = 0;

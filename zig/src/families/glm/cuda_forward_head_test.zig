@@ -57,7 +57,10 @@ fn check(prefill: bool, head: bool, rows: usize) !void {
     d.api.cuLaunchKernel = Launch.run;
     d.api.cuLaunchKernelEx = @import("cuda_pdl.zig").forwardEx(Launch.run);
     var kernels: glue.Kernels = undefined;
-    inline for (@typeInfo(glue.Kernels).@"struct".field_names, 1..) |name, i| @field(kernels, name) = .{ .d = &d, .handle = @ptrFromInt(i) };
+    inline for (@typeInfo(glue.Kernels).@"struct".field_names, 1..) |name, i| {
+        const T = @FieldType(glue.Kernels, name);
+        if (T == cuda.Function or T == ?cuda.Function) @field(kernels, name) = .{ .d = &d, .handle = @ptrFromInt(i) } else if (T == bool) @field(kernels, name) = true;
+    }
     Launch.n = 0;
 
     const c: cfg.Config = .{};

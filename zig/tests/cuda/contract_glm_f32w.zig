@@ -89,7 +89,8 @@ pub const F32w = struct {
     baseline_ptrs: [9]u64 = @splat(0),
     baseline_output: u64 = 0,
     bf16_gamma: bool = false, // gate 3's control: the weight uploaded as bf16 values, as a bf16-weight kernel reads it
-    bf16_w: bool = false, // a bf16-weight kernel (the BF16 replacements and full GLM-5.3's widths): gamma uploaded as bf16
+    bf16_w: bool = false, // a bf16-weight kernel (the BF16 replacements, splits and full GLM-5.3's widths)
+    split: bool = false, // tf_glm_hc_finish(_f32w)_split against the one-warp kernel it replaces
     row0: bool = false, // gate 3's control: every row launched with stride 0, so each reads row 0's x
 
     pub fn init(rig: rig_.Rig, which: Which, f: cuda.Function) F32w {
@@ -104,7 +105,10 @@ pub const F32w = struct {
 
     pub fn kernel(self: *F32w) g.Kernel {
         var declared = specWidth(self.which, self.width);
-        if (self.baseline != null) {
+        if (self.split) {
+            declared.name = splitName(self.which, self.bf16_w);
+            declared.replaces = if (self.bf16_w) "tf_glm_hc_finish" else "tf_glm_hc_finish_f32w";
+        } else if (self.baseline != null) {
             declared.name = bf16Name(self.which, self.width);
             declared.replaces = "main 958efa3bf GLM BF16 norm, frozen in the contract controls";
         }
@@ -240,6 +244,41 @@ pub const F32w = struct {
         return self.outputs(.{ .acc = acc, .order = order }, out, mag);
     }
 };
+
+/// The split finishes (bf16 and float32 weights), each output against the one-warp kernel's bytes on the same inputs.
+pub const Splits = struct {
+    items: [8]F32w,
+
+    pub fn init(rig: rig_.Rig, m: cuda.Module) !Splits {
+        var out: Splits = undefined;
+        for (0..2) |w| for ([_]Which{ .hc_y, .hc_sums, .hc_post, .hc_comb }, 0..) |which, i| {
+            const bf16 = w == 0;
+            var x: F32w = .init(rig, which, try m.function(if (bf16) "tf_glm_hc_finish_split" else "tf_glm_hc_finish_f32w_split"));
+            x.baseline = try m.function(if (bf16) "tf_glm_hc_finish" else "tf_glm_hc_finish_f32w");
+            x.bf16_w = bf16;
+            x.split = true;
+            out.items[w * 4 + i] = x;
+        };
+        return out;
+    }
+
+    pub fn append(self: *Splits, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel)) !void {
+        for (&self.items) |*x| try list.append(a, x.kernel());
+    }
+
+    pub fn deinit(self: *Splits) void {
+        for (&self.items) |*x| x.deinit();
+    }
+};
+
+fn splitName(w: Which, bf16: bool) []const u8 {
+    return switch (w) {
+        .hc_y => if (bf16) "cuda glm hc_finish_split normed rows" else "cuda glm hc_finish_f32w_split normed rows",
+        .hc_sums => if (bf16) "cuda glm hc_finish_split 64-sums" else "cuda glm hc_finish_f32w_split 64-sums",
+        .hc_post => if (bf16) "cuda glm hc_finish_split post" else "cuda glm hc_finish_f32w_split post",
+        else => if (bf16) "cuda glm hc_finish_split comb" else "cuda glm hc_finish_f32w_split comb",
+    };
+}
 
 /// BF16 kernels changed only by the template refactor: each output is compared with the frozen old entrypoint.
 pub const Bf16Entry = struct { which: Which, width: usize, symbol: [:0]const u8, old: [:0]const u8 };
