@@ -47,7 +47,10 @@ fn currentBelow(e: anytype, at: usize) u64 {
     const C = @TypeOf(e.cur);
     const S = if (@typeInfo(C) == .pointer) @typeInfo(C).pointer.child else C;
     if (!@hasField(S, "cuts")) return 0;
-    return @import("cuda_prompt_cuts.zig").below(e.cur.cuts.items, @intCast(at));
+    const cuts = @import("cuda_prompt_cuts.zig");
+    if (@hasField(S, "track_executed") and e.cur.track_executed)
+        return cuts.belowExecuted(e.cur.resumed_starts.items, e.cur.resumed_at, e.cur.cuts.items, @intCast(at));
+    return cuts.below(e.cur.cuts.items, @intCast(at));
 }
 
 fn targetLen(e: anytype, at: usize) ?usize {

@@ -2,7 +2,6 @@
 const std = @import("std");
 const api = @import("engine_api");
 const glm = @import("glm_cuda");
-const lanes = @import("lanes");
 const glm_disk = @import("cuda_glm_disk.zig");
 const img = glm.disk_image;
 const rows = api.prompt_cache.rows;
@@ -344,10 +343,24 @@ test "CUDA disk open: back-to-back extending saves deduplicate blocks and indepe
     try t.expectEqual(@as(u64, 0), r2.counts.skipped);
     try t.expectEqual(@as(u64, 0), r2.counts.failed);
 
-    // 3) Tight RAM budget where bytes(12K) <= budget < coldCharge(12K): open() raises staging_bytes so 12K writes!
+    // 3) Tight RAM budget (floor < bytes(12K) < charge(12K)): plain attach hits StagingFull; openWithFloor succeeds.
     const ram_12k = AsyncFixture.bytes(&fx, 12_288);
+    const low_floor: u64 = 64 * 1024;
+    try t.expect(low_floor < ram_12k);
+    {
+        var store_old = api.prompt_cache.Store.init(gpa, .{ .ptr = &fx, .vtable = &AsyncFixture.snap_vt }, .{ .lookahead = 1 }, ram_12k);
+        const r_old = try rows.attach(gpa, &store_old, .{ .root = root, .identity = 203, .cap = 1 << 30, .floor = 0, .daily = 1 << 30, .lookahead = 1, .staging_bytes = low_floor, .longest = longest });
+        defer r_old.deinit();
+        defer store_old.deinit();
+        try t.expectEqual(ram_12k, r_old.staging_bytes); // clamped to per-rank RAM budget
+        rows.write.queued(r_old, &eb, &.{});
+        try t.expectEqual(@as(usize, 0), rows.write.drain(r_old, rows.write.nowNs() + 10 * std.time.ns_per_s));
+        try t.expectEqual(@as(u64, 0), r_old.counts.writes);
+        try t.expectEqual(@as(u64, 1), r_old.counts.skipped);
+        try t.expectEqual(error.StagingFull, r_old.failures.records[0].?.err);
+    }
     var store3 = api.prompt_cache.Store.init(gpa, .{ .ptr = &fx, .vtable = &AsyncFixture.snap_vt }, .{ .lookahead = 1 }, ram_12k);
-    const r3 = try glm_disk.open(&store3, .{ .dir = "d", .model_type = "glm5_next", .learn = root, .learn_conversations = true, .learn_gib = 1, .learn_min_free_gib = 0, .learn_daily_gib = 1 }, root, 203, longest);
+    const r3 = try glm_disk.openWithFloor(&store3, .{ .dir = "d", .model_type = "glm5_next", .learn = root, .learn_conversations = true, .learn_gib = 1, .learn_min_free_gib = 0, .learn_daily_gib = 1 }, root, 204, longest, low_floor, false);
     defer r3.deinit();
     defer store3.deinit();
     try t.expect(try rows.write.coldCharge(r3, 12_288) > ram_12k);
@@ -356,53 +369,4 @@ test "CUDA disk open: back-to-back extending saves deduplicate blocks and indepe
     try t.expectEqual(@as(usize, 0), rows.write.drain(r3, rows.write.nowNs() + 10 * std.time.ns_per_s));
     try t.expectEqual(@as(u64, 1), r3.counts.writes);
     try t.expectEqual(@as(u64, 0), r3.counts.skipped);
-}
-
-test "CUDA disk open: TF_GLM_REQUEST_STARTS=marks off-grid state persists, recalls after restart, and resumes" {
-    const gpa = t.allocator;
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(t.io, ".", gpa);
-    defer gpa.free(root);
-    var fx: AsyncFixture = .{ .gpa = gpa, .tmp = tmp, .root = root };
-
-    const prompt = try makePrompt(gpa, 1600, 42);
-    defer gpa.free(prompt);
-    const at: u32 = 1027;
-    const chunks = [_]u32{ 300, 650, at, 1500 };
-
-    // Turn 1 save (marks mode saved state at 1027 with engine below = 0 while server chunks have 300, 650, 1027).
-    {
-        const s = try fx.makeSnap(at, 9);
-        defer AsyncFixture.drop(&fx, @ptrCast(s));
-        const r = try rows.Rows.open(gpa, .{ .ptr = &fx, .vtable = &AsyncFixture.snap_vt }, .{ .root = root, .identity = 303, .cap = 1 << 26, .floor = 0, .daily = 1 << 26, .lookahead = 1, .planned = true, .grid = 2048, .sync_writes = true });
-        defer r.deinit();
-        var entry: api.prompt_cache.Entry = .{ .tokens = prompt[0 .. at + 1], .at = at, .saved = @ptrCast(s), .bytes = 1, .born = 1600, .used = 1, .last = prompt };
-        rows.write.queued(r, &entry, &chunks);
-        while (rows.write.pending(r)) _ = rows.write.step(r);
-        try t.expectEqual(@as(usize, 1), r.states.items.len);
-    }
-    // Simulated restart: reopen store from disk, recall for Turn 2, and check Lanes.resumeFrom in marks vs all mode.
-    const r = try rows.Rows.open(gpa, .{ .ptr = &fx, .vtable = &AsyncFixture.snap_vt }, .{ .root = root, .identity = 303, .cap = 1 << 26, .floor = 0, .daily = 1 << 26, .lookahead = 1, .planned = true, .grid = 2048, .sync_writes = true });
-    defer r.deinit();
-    const idx = r.best(prompt, &chunks, &.{}, 0) orelse return error.DiskStateMissing;
-    const restored_saved = try rows.read.read(r, idx);
-    defer AsyncFixture.drop(&fx, restored_saved);
-    var e: glm.engine.Engine = undefined;
-    e.gpa = gpa;
-    e.snaps = .empty;
-    defer e.snaps.deinit(gpa);
-    try e.snaps.put(gpa, 19, undefined);
-    var k: glm.engine.Kept = .{ .id = 19, .at = at, .below = 0 };
-    var s = try lanes.Stream.init(gpa, .{ .id = "reload", .prompt = prompt, .max_new = 16, .drafts = false, .chunks = &chunks, .reuse = .{ .saved = &k, .at = at } });
-    defer s.deinit(gpa);
-    var l_all: glm.lanes.Lanes = .{ .x = .{ .e = &e, .link = undefined }, .request_starts = .all };
-    try t.expectEqual(@as(?glm.engine.Resume, null), l_all.resumeFrom(&s, prompt.len));
-    try t.expectEqual(@as(?anyerror, error.SnapshotOutOfStep), s.reuse_error);
-    s.reuse_failed = false;
-    s.reuse_error = null;
-    var l_marks: glm.lanes.Lanes = .{ .x = .{ .e = &e, .link = undefined }, .request_starts = .marks };
-    const resumed = l_marks.resumeFrom(&s, prompt.len) orelse return error.ExpectedMarksResume;
-    try t.expectEqual(@as(usize, at), resumed.at);
-    try t.expectEqual(at, s.cached);
 }

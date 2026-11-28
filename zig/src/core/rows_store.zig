@@ -34,6 +34,10 @@ pub const Image = struct {
     transient: ?*const fn (ptr: *anyopaque, saved: pc.Saved) bool = null,
     /// Whether `saved`'s image can still be read whole (null: always).
     whole: ?*const fn (ptr: *anyopaque, saved: pc.Saved) bool = null,
+    /// Executed chunk starts strictly below the saved state (null: use request starts / grid).
+    starts: ?*const fn (ptr: *anyopaque, saved: pc.Saved) ?[]const u32 = null,
+    /// Restore persisted chunk starts into a newly read state handle (null: unused).
+    set_starts: ?*const fn (ptr: *anyopaque, saved: pc.Saved, starts: []const u32) anyerror!void = null,
 };
 
 /// A state on disk: its name and position, what it read, its file's bytes and its blocks' (each counted whole).
@@ -73,6 +77,7 @@ pub const Options = struct {
     staging_bytes: u64 = 1 << 30,
     longest: u32 = 0, // the longest state the host keeps: the permit takes one whole, within the RAM store's budget
     slots: ?usize = null, // --checkpoint-slots: the RAM store's states at most, beside this one (null: the family's)
+    mark_starts: bool = false, // match planned disk states by usable position while keying blocks on executed starts
 };
 
 /// The store under `o`, the RAM store's disk: `o.slots` bounds what it keeps in RAM.
@@ -98,6 +103,7 @@ pub const Rows = struct {
     dir: [:0]u8,
     keying: chain.Keying,
     grid: u32 = 0,
+    mark_starts: bool = false,
     cap: u64,
     daily: u64,
     admission: Admission = .{},
@@ -152,7 +158,7 @@ pub const Rows = struct {
         const root = try gpa.dupe(u8, o.root);
         errdefer gpa.free(root);
         const dir = try std.fmt.allocPrintSentinel(gpa, "{s}/{x:0>16}", .{ o.root, id }, 0);
-        r.* = .{ .gpa = gpa, .family = family, .img = img, .root = root, .dir = dir, .keying = .{ .identity = id, .block = block_tokens, .lookahead = o.lookahead, .planned = o.planned }, .grid = o.grid, .cap = o.cap, .daily = o.daily, .admission = .{ .floor = o.floor }, .spill = o.spill };
+        r.* = .{ .gpa = gpa, .family = family, .img = img, .root = root, .dir = dir, .keying = .{ .identity = id, .block = block_tokens, .lookahead = o.lookahead, .planned = o.planned }, .grid = o.grid, .mark_starts = o.mark_starts, .cap = o.cap, .daily = o.daily, .admission = .{ .floor = o.floor }, .spill = o.spill };
         return r;
     }
 
@@ -301,8 +307,9 @@ pub const Rows = struct {
         if (s.tokens.len > prompt.len or s.at >= prompt.len) return false;
         if (!std.mem.eql(u32, prompt[0..s.tokens.len], s.tokens) or !modes.equal(s.spans, spans, s.at)) return false;
         if (!images.matches(s.images, s.image_frame, s.tokens.len, query, frame)) return false;
-        if (r.keying.planned and starts.len == 0 and r.grid > 0) return s.at % r.grid == 0 and onGrid(s.starts, s.at, r.grid);
-        return !r.keying.planned or sameBelow(starts, s.starts, s.at);
+        if (r.mark_starts) return chain.marksMatch(starts, s.at, r.grid);
+        if (r.keying.planned and starts.len == 0 and r.grid > 0) return s.at % r.grid == 0 and chain.onGrid(s.starts, s.at, r.grid);
+        return !r.keying.planned or chain.sameBelow(starts, s.starts, s.at);
     }
 
     /// State `i` was used now: the newest for eviction.
@@ -511,11 +518,11 @@ pub const Rows = struct {
     }
 };
 
-/// Whether a prompt's chunk starts below `at` are the state's, and `at` is one of them.
-fn sameBelow(starts: []const u32, kept: []const u32, at: u32) bool {
-    var n: usize = 0;
-    while (n < starts.len and starts[n] < at) n += 1;
-    return std.mem.eql(u32, starts[0..n], kept) and std.mem.indexOfScalar(u32, starts, at) != null;
+/// Chunk starts persisted for `saved`: family-reported executed starts when present, else `startsBelow`.
+pub fn startsFor(r: *const Rows, a: Allocator, saved: pc.Saved, starts: []const u32, at: u32) ![]u32 {
+    if (!r.keying.planned) return a.alloc(u32, 0);
+    if (r.mark_starts) if (r.img.starts) |f| if (f(r.family.ptr, saved)) |actual| return chain.belowSlice(a, actual, at);
+    return startsBelow(r, a, starts, at);
 }
 
 /// A planned request's chunk starts below `at`: its own, else its family's grid's (from `grid`) when it names none.
@@ -529,13 +536,6 @@ pub fn startsBelow(r: *const Rows, a: Allocator, starts: []const u32, at: u32) !
     var n: usize = 0;
     while (n < starts.len and starts[n] < at) n += 1;
     return a.dupe(u32, starts[0..n]);
-}
-
-/// Whether `kept` are the grid's starts below `at`.
-fn onGrid(kept: []const u32, at: u32, grid: u32) bool {
-    if (kept.len != (at -| 1) / grid) return false;
-    for (kept, 1..) |k, i| if (k != i * grid) return false;
-    return true;
 }
 
 pub const withAt = chain.withAt;

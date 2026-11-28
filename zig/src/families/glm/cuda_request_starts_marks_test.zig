@@ -128,7 +128,7 @@ test "glm request starts: marks mode sends only from+marks over Kind.cuts, runs 
     seq.st.mtp_pos_dev = 0;
     seq.st.capacity = 300_000;
     seq.cuts = .empty;
-    defer seq.cuts.deinit(a);
+    defer seq.deinitMeta(a);
 
     var e: engine.Engine = undefined;
     e.gpa = a;
@@ -309,4 +309,86 @@ test "glm request starts: cancelled prefill in marks mode skips unusable mid-chu
     interrupted(marks.ctx, 4096);
     interrupted(marks.ctx, 16_500);
     try t.expectEqualSlices(u32, &.{ 4096, 16_500 }, hook.saved.items);
+}
+
+test "glm request starts: executedBelow accumulates multi-hop cut history, matches belowExecuted, and rejects bad below" {
+    const a = t.allocator;
+    // Cold Turn 1 at 1,027 (< 2048): executedBelow is empty, below is 0.
+    const ex_short = try prompt_cuts.executedBelow(a, &.{}, 0, &.{1027}, 1027);
+    defer a.free(ex_short);
+    try t.expectEqualSlices(u32, &.{}, ex_short);
+    try t.expectEqual(@as(u64, 0), prompt_cuts.below(ex_short, 1027));
+    try t.expectEqual(prompt_cuts.below(ex_short, 1027), prompt_cuts.belowExecuted(&.{}, 0, &.{1027}, 1027));
+
+    // Cold Turn 1 at 4,100 -> Turn 2 at 4,650 -> Turn 3 at 4,900 -> Turn 4 long suffix at 9,000.
+    const ex1 = try prompt_cuts.executedBelow(a, &.{}, 0, &.{4100}, 4100);
+    defer a.free(ex1);
+    try t.expectEqualSlices(u32, &.{ 2048, 4096 }, ex1);
+    const b1 = prompt_cuts.below(ex1, 4100);
+    try t.expectEqual(@as(u64, 0), b1);
+    try t.expectEqual(b1, prompt_cuts.belowExecuted(&.{}, 0, &.{4100}, 4100));
+
+    const ex2 = try prompt_cuts.executedBelow(a, ex1, 4100, &.{ 4100, 4650 }, 4650);
+    defer a.free(ex2);
+    try t.expectEqualSlices(u32, &.{ 2048, 4096, 4100 }, ex2);
+    const b2 = prompt_cuts.below(ex2, 4650);
+    try t.expect(b2 != 0);
+    try t.expectEqual(b2, prompt_cuts.belowExecuted(ex1, 4100, &.{ 4100, 4650 }, 4650));
+
+    const ex3 = try prompt_cuts.executedBelow(a, ex2, 4650, &.{ 4650, 4900 }, 4900);
+    defer a.free(ex3);
+    try t.expectEqualSlices(u32, &.{ 2048, 4096, 4100, 4650 }, ex3);
+    const b3 = prompt_cuts.below(ex3, 4900);
+    try t.expect(b3 != 0 and b3 != b2);
+    try t.expectEqual(b3, prompt_cuts.belowExecuted(ex2, 4650, &.{ 4650, 4900 }, 4900));
+
+    const ex4 = try prompt_cuts.executedBelow(a, ex3, 4900, &.{ 4900, 9000 }, 9000);
+    defer a.free(ex4);
+    try t.expectEqualSlices(u32, &.{ 2048, 4096, 4100, 4650, 4900, 6948, 8996 }, ex4);
+    try t.expectEqual(prompt_cuts.below(ex4, 9000), prompt_cuts.belowExecuted(ex3, 4900, &.{ 4900, 9000 }, 9000));
+
+    // Re-saving right at at == resumed_at preserves inherited cuts in (0, at) without dropping or duplicating at.
+    const ex_same = try prompt_cuts.executedBelow(a, &.{300}, 1027, &.{ 1027, 2500 }, 1027);
+    defer a.free(ex_same);
+    try t.expectEqualSlices(u32, &.{300}, ex_same);
+    const b_same = prompt_cuts.below(&.{300}, 1027);
+    try t.expect(b_same != 0);
+    try t.expectEqual(b_same, prompt_cuts.below(ex_same, 1027));
+    try t.expectEqual(b_same, prompt_cuts.belowExecuted(&.{300}, 1027, &.{ 1027, 2500 }, 1027));
+    const ex_same2 = try prompt_cuts.executedBelow(a, ex2, 4650, &.{ 4650, 4900 }, 4650);
+    defer a.free(ex_same2);
+    try t.expectEqualSlices(u32, ex2, ex_same2);
+    try t.expectEqual(b2, prompt_cuts.belowExecuted(ex2, 4650, &.{ 4650, 4900 }, 4650));
+    var seq: Seq = .{ .st = undefined };
+    defer seq.deinitMeta(a);
+    const k_same: engine.Kept = .{ .id = 1, .at = 1027, .below = b_same, .executed = @constCast(&[_]u32{300}), .has_executed = true };
+    try seq.setExecuted(a, &k_same);
+    try seq.cuts.appendSlice(a, &.{ 1027, 2500 });
+    const ex_seq = try prompt_cuts.executedBelow(a, seq.resumed_starts.items, seq.resumed_at, seq.cuts.items, 1027);
+    defer a.free(ex_seq);
+    try t.expectEqualSlices(u32, &.{300}, ex_seq);
+    try t.expectEqual(b_same, prompt_cuts.belowExecuted(seq.resumed_starts.items, seq.resumed_at, seq.cuts.items, 1027));
+
+    // resumeFrom in marks mode accepts matching below and rejects corrupted below when has_executed is true.
+    var e: engine.Engine = undefined;
+    e.gpa = a;
+    e.snaps = .empty;
+    defer e.snaps.deinit(a);
+    try e.snaps.put(a, 77, undefined);
+    var self: glm_lanes.Lanes = .{ .x = .{ .e = &e, .link = undefined }, .request_starts = .marks };
+    var k: engine.Kept = .{ .id = 77, .at = 4900, .below = b3, .executed = ex3, .has_executed = true };
+    const prompt = try a.alloc(u32, 5000);
+    defer a.free(prompt);
+    @memset(prompt, 3);
+    var s = try lanes.Stream.init(a, .{ .id = "hop", .prompt = prompt, .max_new = 16, .drafts = false, .chunks = &.{ 300, 4100, 4650, 4900 }, .reuse = .{ .saved = &k, .at = 4900 } });
+    defer s.deinit(a);
+    const ok = self.resumeFrom(&s, prompt.len) orelse return error.ExpectedResume;
+    try t.expectEqual(@as(usize, 4900), ok.at);
+
+    k.below = b3 ^ 2; // corrupted cut digest must be rejected
+    s.reuse_failed = false;
+    s.reuse_error = null;
+    s.cached = 0;
+    try t.expectEqual(@as(?engine.Resume, null), self.resumeFrom(&s, prompt.len));
+    try t.expectEqual(@as(?anyerror, error.SnapshotOutOfStep), s.reuse_error);
 }

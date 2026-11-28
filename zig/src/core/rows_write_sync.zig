@@ -41,9 +41,9 @@ pub const Job = struct {
     began: i128 = 0,
 };
 
-/// A newly kept entry joins the queue (the RAM store calls this on every new keep), with the request's chunk starts.
+/// A newly kept entry joins the queue (the RAM store calls this on every new keep), with its persisted chunk starts.
 pub fn queued(r: *Rows, e: *pc.Entry, starts: []const u32) void {
-    const own = rows_store.startsBelow(r, r.gpa, starts, e.at) catch |err| return refusedQueue(r, e.at, err);
+    const own = rows_store.startsFor(r, r.gpa, e.saved, starts, e.at) catch |err| return refusedQueue(r, e.at, err);
     r.queue.append(r.gpa, .{ .entry = e, .starts = own }) catch |err| {
         r.gpa.free(own);
         refusedQueue(r, e.at, err);

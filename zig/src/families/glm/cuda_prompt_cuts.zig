@@ -83,6 +83,45 @@ pub fn usableCut(chunks: []const u32, at: u32) bool {
     return std.mem.indexOfScalar(u32, chunks, at) != null;
 }
 
+/// Actual executed chunk starts in `(0, at)` for marks mode: resumed history, `resumed_at`, then `nextCut` steps.
+pub fn executedBelow(gpa: std.mem.Allocator, resumed_starts: []const u32, resumed_at: u32, cuts: []const u32, at: u32) ![]u32 {
+    var out: std.ArrayList(u32) = .empty;
+    errdefer out.deinit(gpa);
+    var p: usize = 0;
+    if (resumed_at > 0 and resumed_at <= at) {
+        while (p < resumed_at) {
+            const next = nextCut(resumed_at, resumed_starts, p);
+            if (next < at) try out.append(gpa, @intCast(next));
+            p = next;
+        }
+    }
+    while (p < at) {
+        const next = nextCut(at, cuts, p);
+        if (next >= at) break;
+        try out.append(gpa, @intCast(next));
+        p = next;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Zero-alloc cut digest matching `below(executedBelow(resumed_starts, resumed_at, cuts, at), at)`.
+pub fn belowExecuted(resumed_starts: []const u32, resumed_at: u32, cuts: []const u32, at: u32) u64 {
+    var h = std.hash.Wyhash.init(0);
+    var grid = true;
+    var p: u32 = 0;
+    if (resumed_at > 0 and resumed_at <= at) {
+        while (p < resumed_at) : (p = @intCast(nextCut(resumed_at, resumed_starts, p))) {
+            grid = grid and p % prefill_rows == 0;
+            h.update(std.mem.asBytes(&p));
+        }
+    }
+    while (p < at) : (p = @intCast(nextCut(at, cuts, p))) {
+        grid = grid and p % prefill_rows == 0;
+        h.update(std.mem.asBytes(&p));
+    }
+    return if (grid) 0 else h.final() | 1;
+}
+
 /// A prompt step's rows from `start` with `part_len` ids: to the next cut, or a wide step when `part_len` holds more.
 pub fn stepRows(len: usize, cuts: []const u32, start: usize, part_len: usize, wide_rows: usize) !usize {
     if (start >= len or !coldCut(len, cuts, start)) return error.BadChunk;

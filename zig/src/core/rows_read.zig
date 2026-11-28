@@ -26,6 +26,7 @@ pub fn read(r: *Rows, i: usize) !pc.Saved {
     for (plan.pieces) |p| {
         if (ahead) |a| try scatter(r, p.name, prefetch.ext(p.kind), saved, plan.rangesOf(p), a.payload(p)) else bytes += try one(r, p.name, p.kind, prefetch.ext(p.kind), p.at, plan.rangesOf(p), saved);
     }
+    if (r.mark_starts) if (r.img.set_starts) |set_starts| try set_starts(r.family.ptr, saved, s.starts);
     if (ahead) |a| bytes = a.disk;
     const ns = if (ahead) |a| a.ns else write.nowNs() - t0;
     if (ns > 0 and bytes > 64 << 20) r.read_rate = 0.5 * r.read_rate + 0.5 * @as(f64, @floatFromInt(bytes)) / (@as(f64, @floatFromInt(ns)) / 1e9);

@@ -432,7 +432,11 @@ pub fn snap_save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaq
     if (e.pos() != at) return error.NotAtMark;
     const k = try e.gpa.create(engine.Kept);
     errdefer e.gpa.destroy(k);
-    k.* = .{ .id = try e.keepState(), .at = at, .below = @import("cuda_prompt_cuts.zig").below(e.cur.cuts.items, at) };
+    const cuts = @import("cuda_prompt_cuts.zig");
+    const executed: []u32 = if (e.cur.track_executed) try cuts.executedBelow(e.gpa, e.cur.resumed_starts.items, e.cur.resumed_at, e.cur.cuts.items, at) else &.{};
+    errdefer e.gpa.free(executed);
+    const below = if (e.cur.track_executed) cuts.below(executed, at) else cuts.below(e.cur.cuts.items, at);
+    k.* = .{ .id = try e.keepState(), .at = at, .below = below, .executed = executed, .has_executed = e.cur.track_executed };
     return k;
 }
 
@@ -464,6 +468,7 @@ pub fn snap_drop(ptr: *anyopaque, saved: *anyopaque) void {
     const e: *engine.Engine = @ptrCast(@alignCast(ptr));
     const k: *engine.Kept = @ptrCast(@alignCast(saved));
     e.dropState(k.id);
+    e.gpa.free(k.executed);
     e.gpa.destroy(k);
 }
 

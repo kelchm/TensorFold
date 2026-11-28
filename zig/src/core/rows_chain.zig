@@ -227,3 +227,36 @@ pub fn withAt(a: std.mem.Allocator, starts: []const u32, at: u32, planned: bool)
     out[starts.len] = at;
     return out;
 }
+
+/// Whether a prompt's chunk starts below `at` are the state's, and `at` is one of them.
+pub fn sameBelow(starts: []const u32, kept: []const u32, at: u32) bool {
+    var n: usize = 0;
+    while (n < starts.len and starts[n] < at) n += 1;
+    return std.mem.eql(u32, starts[0..n], kept) and std.mem.indexOfScalar(u32, starts, at) != null;
+}
+
+/// Whether `kept` are the grid's starts below `at`.
+pub fn onGrid(kept: []const u32, at: u32, grid: u32) bool {
+    if (kept.len != (at -| 1) / grid) return false;
+    for (kept, 1..) |k, i| if (k != i * grid) return false;
+    return true;
+}
+
+/// Whether `at` is usable under `starts` (marks mode): on `grid` when `starts` is empty, else in `starts`.
+pub fn marksMatch(starts: []const u32, at: u32, grid: u32) bool {
+    if (starts.len == 0) return grid > 0 and at % grid == 0;
+    return std.mem.indexOfScalar(u32, starts, at) != null;
+}
+
+/// Copy `starts` strictly below `at` without grid expansion (used for family-reported executed starts).
+pub fn belowSlice(a: std.mem.Allocator, starts: []const u32, at: u32) ![]u32 {
+    var n: usize = 0;
+    for (starts) |c| n += @intFromBool(c < at);
+    const out = try a.alloc(u32, n);
+    var i: usize = 0;
+    for (starts) |c| if (c < at) {
+        out[i] = c;
+        i += 1;
+    };
+    return out;
+}

@@ -48,4 +48,5 @@ pub const rules = [_]Rule{
     .{ .name = "TF_EXL3_PROMPT_GU", .scope = .glm, .kind = .word, .trim = " \t", .words = &.{ "0", "pc" }, .forms = "0 or pc" },
     .{ .name = "TF_GLM_ABSORB_MMA", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_EXL3_BF16_SLOTS", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_GLM_REQUEST_STARTS", .scope = .glm, .kind = .word, .words = &.{ "0", "1", "marks" }, .forms = "0, 1, or marks (unset or blank: off)" },
 };

@@ -54,7 +54,7 @@ const reals = [_][:0]const u8{ "TF_GLM_DRAFT_CONFIDENCE", "TF_GLM_SHARED_DRAFT_C
 const ranks = [_][:0]const u8{ "TF_GLM_RANK", "TF_GLM_WORLD" };
 /// The window GLM may serve past config.json's: GLM's raisedCeiling reads it at the open, after these rows' check.
 const windows = [_][:0]const u8{"TF_GLM_CONTEXT_CEILING"};
-const words = [_][:0]const u8{ "TF_GLM_EXPERT_FORM", "TF_GLM_KDA_STEP_WARPS", "TF_EXL3_PROMPT_GU" };
+const words = [_][:0]const u8{ "TF_GLM_EXPERT_FORM", "TF_GLM_KDA_STEP_WARPS", "TF_EXL3_PROMPT_GU", "TF_GLM_REQUEST_STARTS" };
 const added = [_][:0]const u8{ "TF_GLM_INDEX_CUDA", "TF_GLM_INDEX_SPLIT", "TF_GLM_KV_HOST_GIB" };
 
 /// The row by name without `rule`, so a missing row fails an assertion instead of panicking.
@@ -156,6 +156,21 @@ test "GLM strict env: KDA step warps accept auto, 8, 4 or 2 and refuse other wor
         try check(name, c[0], true);
     }
     for ([_][]const u8{ "AUTO", "0", "1", "3", "16", "bad" }) |raw| try check(name, raw, false);
+}
+
+test "GLM strict env: TF_GLM_REQUEST_STARTS accepts 0, 1, or marks and refuses other words" {
+    const name = "TF_GLM_REQUEST_STARTS";
+    const glm_env = @import("cuda_env.zig");
+    try t.expectEqualSlices([]const u8, &.{ "0", "1", "marks" }, (try row(name)).words);
+    for ([_]?[]const u8{ null, "", " ", " \t\r\n", "0" }) |raw| {
+        try t.expectEqual(glm_env.RequestStarts.off, glm_env.requestStartsOf(raw));
+        if (raw) |v| try check(name, v, true);
+    }
+    try t.expectEqual(glm_env.RequestStarts.all, glm_env.requestStartsOf("1"));
+    try check(name, "1", true);
+    try t.expectEqual(glm_env.RequestStarts.marks, glm_env.requestStartsOf("marks"));
+    try check(name, "marks", true);
+    for ([_][]const u8{ "MARKS", "on", "off", "true", "2", " marks", "marks ", " 1" }) |raw| try check(name, raw, false);
 }
 
 test "GLM strict env: switches keep unset, blank, 0 and 1, and refuse words and padded digits by name" {

@@ -25,10 +25,14 @@ pub const Seen = struct {
     }
 
     pub fn ofImages(s: *const pc.Store, tokens: []const u32, spans: []const [2]u32, starts: []const u32, imgs: []const @import("cache_images.zig").Identity, frame: u32, at: u32) Seen {
+        return ofSaved(s, null, tokens, spans, starts, imgs, frame, at);
+    }
+
+    pub fn ofSaved(s: *const pc.Store, saved: ?pc.Saved, tokens: []const u32, spans: []const [2]u32, starts: []const u32, imgs: []const @import("cache_images.zig").Identity, frame: u32, at: u32) Seen {
         var out = now();
         if (!named.load(.monotonic)) return out;
         out.id = chain.stem(if (s.disk) |r| named: {
-            const below = pc.rows.startsBelow(r, s.gpa, starts, at) catch break :named chain.stateImages(r.keying, tokens, spans, &.{}, imgs, frame, at);
+            const below = (if (saved) |sv| pc.rows.startsFor(r, s.gpa, sv, starts, at) else pc.rows.startsBelow(r, s.gpa, starts, at)) catch break :named chain.stateImages(r.keying, tokens, spans, &.{}, imgs, frame, at);
             defer s.gpa.free(below);
             break :named chain.stateImages(r.keying, tokens, spans, below, imgs, frame, at);
         } else chain.stateImages(.{ .identity = 0, .block = 0 }, tokens, spans, &.{}, imgs, frame, at));

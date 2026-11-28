@@ -26,7 +26,9 @@ pub fn requestStarts() RequestStarts {
 
 /// TF_GLM_REQUEST_STARTS=1 or marks cuts off the rows TF_KV_SHARE keeps on: refused with shared KV.
 pub fn requestStartsAlone() !void {
-    if (requestStarts() != .off and try kp.sharing() > 0) return error.GlmRequestStartsWithSharedKv;
+    const raw = @import("core").profile.get(.TF_GLM_REQUEST_STARTS);
+    try environment.check("TF_GLM_REQUEST_STARTS", raw);
+    if (requestStartsOf(raw) != .off and try kp.sharing() > 0) return error.GlmRequestStartsWithSharedKv;
 }
 
 /// The draft tail is private to the external DFlash2 model and to copied snapshots.

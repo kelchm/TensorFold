@@ -336,7 +336,7 @@ pub const Engine = struct {
         cuda.completion.drain(e.d, e.stream, "GLM sequence release did not drain");
         q.st.deinit();
         held_shares.freeStates(e.gpa, q.more);
-        q.cuts.deinit(e.gpa);
+        q.deinitMeta(e.gpa);
         e.gpa.destroy(q);
         e.seqs.items[slot] = null;
     }
@@ -361,7 +361,7 @@ pub const Engine = struct {
     pub fn begin(e: *Engine, sampling: ?sampler.Sampling) !void {
         e.cur.sampling = sampler.check(sampling);
         e.cur.in_head = 0;
-        e.cur.cuts.clearRetainingCapacity(); // a request without starts cuts on the grid alone
+        e.cur.resetMeta(); // a request without starts cuts on the grid alone
         try held_shares.reset(e);
         if (e.drafter) |dr| try dr.restart(e.slot, 0);
     }

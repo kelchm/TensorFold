@@ -335,6 +335,7 @@ pub const Lanes = struct {
     /// Cuts sent to every rank before the first prompt step: all starts (`=1`), or `from` + marks (`=marks`).
     fn sendCuts(self: *Lanes, s: *const lanes.Stream, from: ?engine.Resume, len: usize) !void {
         if (self.request_starts == .marks) {
+            try self.x.e.cur.setExecuted(self.x.e.gpa, if (from != null) @ptrCast(@alignCast(s.reuse.saved.?)) else null);
             const cuts = try engine.prompt_cuts.markCuts(self.x.e.gpa, if (from) |r| r.at else 0, s.reuse.marks, len);
             defer self.x.e.gpa.free(cuts);
             if (cuts.len > 0) try self.x.cuts(cuts);
@@ -402,7 +403,7 @@ pub const Lanes = struct {
     pub fn resumeFrom(self: *Lanes, s: *lanes.Stream, len: usize) ?engine.Resume {
         const saved = s.reuse.saved orelse return null;
         const k: *const engine.Kept = @ptrCast(@alignCast(saved));
-        const step_ok = if (self.request_starts == .marks) engine.prompt_cuts.usableCut(s.chunks, k.at) else engine.prompt_cuts.resumes(len, s.chunks, k.at, k.below);
+        const step_ok = if (self.request_starts == .marks) engine.prompt_cuts.usableCut(s.chunks, k.at) and (!k.has_executed or k.below == engine.prompt_cuts.below(k.executed, k.at)) else engine.prompt_cuts.resumes(len, s.chunks, k.at, k.below);
         if (k.at != s.reuse.at or k.at == 0 or k.at >= len or !step_ok or !self.x.e.holds(k.id)) {
             s.reuse_failed = true;
             s.reuse_error = if (k.at == 0 or k.at >= len) error.SnapshotNotPrefix else if (k.at != s.reuse.at or !step_ok) error.SnapshotOutOfStep else error.SnapshotStale;

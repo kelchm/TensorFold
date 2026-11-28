@@ -12,7 +12,7 @@ const Engine = glm.engine.Engine;
 const Kept = glm.engine.Kept;
 const Allocator = std.mem.Allocator;
 
-pub const image: rows.Image = .{ .parts = parts, .gather = gather, .blank = blank, .blank_bytes = blankBytes, .scatter = scatter, .whole = whole };
+pub const image: rows.Image = .{ .parts = parts, .gather = gather, .blank = blank, .blank_bytes = blankBytes, .scatter = scatter, .whole = whole, .starts = startsOf, .set_starts = setStarts };
 
 /// Every rank's prefix bytes, read at attach (the process serves one model; rank 0 alone serves).
 var prefix_buf: [8]u64 = undefined;
@@ -127,6 +127,20 @@ fn whole(ptr: *anyopaque, saved: api.prompt_cache.Saved) bool {
     return s.len != 0;
 }
 
+fn startsOf(_: *anyopaque, saved: api.prompt_cache.Saved) ?[]const u32 {
+    const k: *const Kept = @ptrCast(@alignCast(saved));
+    return if (k.has_executed) k.executed else null;
+}
+
+fn setStarts(ptr: *anyopaque, saved: api.prompt_cache.Saved, executed: []const u32) anyerror!void {
+    const e = engineOf(ptr);
+    const k: *Kept = @ptrCast(@alignCast(saved));
+    const dup = try e.gpa.dupe(u32, executed);
+    e.gpa.free(k.executed);
+    k.executed = dup;
+    k.has_executed = true;
+}
+
 /// A fixed prompt's store image hashed, other ranks' shared bytes checked equal: both but the bytes it never writes.
 fn probe(a: Allocator, io: std.Io, backend: lanes.backend.Backend, e: *Engine) !struct { hash: u64, rate: f64 } {
     const mark: u32 = glm.native.prompt_rows;
@@ -205,13 +219,18 @@ pub fn attach(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, r
 
 /// The store for `id` through the shared attach, whose staging floor covers the longest RAM-fitting state whole.
 pub fn open(store: *api.prompt_cache.Store, o: api.Open, root: []const u8, id: u64, longest: u32) !*rows.Rows {
+    return openWithFloor(store, o, root, id, longest, 1 << 30, glm.env.requestStarts() == .marks);
+}
+
+/// Internal open allowing tests to bound the base staging floor and `mark_starts` without mutating process env.
+pub fn openWithFloor(store: *api.prompt_cache.Store, o: api.Open, root: []const u8, id: u64, longest: u32, staging_floor: u64, mark_starts: bool) !*rows.Rows {
     const gibs = struct {
         fn bytes(g: f64) u64 {
             return @intFromFloat(g * (1 << 30));
         }
     }.bytes;
     // spill stays off: an eviction would gather on rank 0 mid-pass while the other ranks wait in the gate's all-reduce
-    const r = try rows.attach(store.gpa, store, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid, .longest = longest });
+    const r = try rows.attach(store.gpa, store, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid, .staging_bytes = staging_floor, .longest = longest, .mark_starts = mark_starts });
     const fit = maxFittingTokens(store, longest);
     if (fit > 0) r.staging_bytes = @max(r.staging_bytes, rows.write.coldCharge(r, fit) catch 0);
     return r;
@@ -561,5 +580,6 @@ test "CUDA disk open: off-grid TF_GLM_REQUEST_STARTS state round-trips via rows 
 
 test {
     _ = @import("cuda_glm_disk_test.zig");
+    _ = @import("cuda_glm_disk_marks_test.zig");
     std.testing.refAllDecls(@This());
 }

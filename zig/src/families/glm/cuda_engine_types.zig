@@ -11,7 +11,13 @@ pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) boo
 pub const Part = struct { slot: u32, ids: []const u32, out: []u32, bits: u64 = 0 };
 
 /// A kept prompt state as the prompt cache holds it: the id every rank keeps it under, its position, its chunks below.
-pub const Kept = struct { id: u64, at: u32, below: u64 = 0 }; // below: cuda_prompt_cuts.below of the pass that kept it
+pub const Kept = struct {
+    id: u64,
+    at: u32,
+    below: u64 = 0, // cuda_prompt_cuts.below of the pass that kept it
+    executed: []u32 = &.{}, // marks mode: exact executed chunk starts strictly below `at` (owned by e.gpa)
+    has_executed: bool = false, // distinguishes empty executed (&.{}) from untracked non-marks states
+};
 
 /// A stream's own sequence: state, sampling rule, MTP drafts; buffers are shared, one stream's round at a time.
 pub const Seq = struct {
@@ -21,6 +27,30 @@ pub const Seq = struct {
     in_head: usize = 0, // drafted rows the MTP caches hold past the kept ones (st.mtp_drafted)
     rows_at: u64 = 0, // its last verify's final-norm rows (bf16 [rows][hidden]), which the next draft reads
     cuts: std.ArrayList(u32) = .empty, // the request's chunk starts after 0 (TF_GLM_REQUEST_STARTS), every rank's copy
+    resumed_starts: std.ArrayList(u32) = .empty, // marks mode: actual executed starts below resumed_at
+    resumed_at: u32 = 0, // marks mode: position this pass resumed from (0: cold)
+    track_executed: bool = false, // marks mode: record executed starts in Kept and Snap.below
+
+    pub fn resetMeta(q: *Seq) void {
+        q.cuts.clearRetainingCapacity();
+        q.resumed_starts.clearRetainingCapacity();
+        q.resumed_at = 0;
+        q.track_executed = false;
+    }
+
+    pub fn deinitMeta(q: *Seq, gpa: std.mem.Allocator) void {
+        q.cuts.deinit(gpa);
+        q.resumed_starts.deinit(gpa);
+    }
+
+    pub fn setExecuted(q: *Seq, gpa: std.mem.Allocator, resumed: ?*const Kept) !void {
+        q.resumed_starts.clearRetainingCapacity();
+        if (resumed) |k| {
+            try q.resumed_starts.appendSlice(gpa, k.executed);
+            q.resumed_at = k.at;
+        } else q.resumed_at = 0;
+        q.track_executed = true;
+    }
 };
 
 /// One rank's copy of a kept prompt state: the state arena's bytes and the host fields beside them.
