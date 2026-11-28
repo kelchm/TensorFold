@@ -291,6 +291,15 @@ test "disk identity: DeepSeek values hash their exact bytes and leave every othe
     }
 }
 
+test "disk identity: TF_GLM_REQUEST_STARTS partitions glm5_next across default, 1, and marks" {
+    const row = api.profile.entry(.TF_GLM_REQUEST_STARTS);
+    const unset = profileHash(&.{row}, "glm5_next", "cuda", &.{});
+    const all = profileHash(&.{row}, "glm5_next", "cuda", &.{.{ row.id, "1" }});
+    const marks = profileHash(&.{row}, "glm5_next", "cuda", &.{.{ row.id, "marks" }});
+    try t.expect(unset != all and unset != marks and all != marks);
+    try t.expectEqual(profileHash(&.{row}, "qwen3_5", "cuda", &.{}), profileHash(&.{row}, "qwen3_5", "cuda", &.{.{ row.id, "marks" }}));
+}
+
 test {
     _ = @import("cuda_disk_policy_test.zig");
 }

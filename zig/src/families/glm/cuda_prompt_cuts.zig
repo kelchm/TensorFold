@@ -60,6 +60,29 @@ pub fn set(gpa: std.mem.Allocator, list: *std.ArrayList(u32), cuts: []const u32)
     try list.appendSlice(gpa, cuts);
 }
 
+/// Engine cuts for TF_GLM_REQUEST_STARTS=marks: `from` (when resumed) plus ascending marks in (from, len).
+pub fn markCuts(gpa: std.mem.Allocator, from: usize, marks: []const u32, len: usize) ![]u32 {
+    var out: std.ArrayList(u32) = .empty;
+    errdefer out.deinit(gpa);
+    if (from > 0 and from < len) try out.append(gpa, @intCast(from));
+    for (marks) |m| if (m > from and m < len) try out.append(gpa, m);
+    std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
+    var n: usize = 0;
+    for (out.items) |c| if (n == 0 or out.items[n - 1] != c) {
+        out.items[n] = c;
+        n += 1;
+    };
+    out.shrinkRetainingCapacity(n);
+    return out.toOwnedSlice(gpa);
+}
+
+/// Whether `at` is resumable under `chunks`: on the chunk grid when `chunks` is empty, else listed in `chunks`.
+pub fn usableCut(chunks: []const u32, at: u32) bool {
+    if (at == 0) return false;
+    if (chunks.len == 0) return at % prefill_rows == 0;
+    return std.mem.indexOfScalar(u32, chunks, at) != null;
+}
+
 /// A prompt step's rows from `start` with `part_len` ids: to the next cut, or a wide step when `part_len` holds more.
 pub fn stepRows(len: usize, cuts: []const u32, start: usize, part_len: usize, wide_rows: usize) !usize {
     if (start >= len or !coldCut(len, cuts, start)) return error.BadChunk;

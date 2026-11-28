@@ -57,22 +57,26 @@ test "glm request starts: --learn-conversations is allowed at startup alongside 
     try glm_env.requestStartsAlone();
 }
 
-test "glm request starts: only exact 1 with a shared store above 0 refuses; other values keep today's startup" {
+test "glm request starts: only exact 1 or marks with a shared store above 0 refuses; other values keep today's startup" {
     var saved = try Saved.take();
     defer saved.restore();
     try put("TF_KV_SHARE", "32");
-    for ([_]?[:0]const u8{ null, "", "0", "off", "on", "true", "2" }) |v| {
+    for ([_]?[:0]const u8{ null, "", "0", "off", "on", "true", "2", "MARKS", " marks " }) |v| {
         try put("TF_GLM_REQUEST_STARTS", v);
+        try t.expectEqual(glm_env.RequestStarts.off, glm_env.requestStarts());
         try glm_env.requestStartsAlone();
     }
-    try put("TF_GLM_REQUEST_STARTS", "1");
-    for ([_]?[:0]const u8{ null, "0", "00" }) |v| {
-        try put("TF_KV_SHARE", v);
-        try glm_env.requestStartsAlone();
-    }
-    for ([_][:0]const u8{ "1", "32", "00032" }) |v| {
-        try put("TF_KV_SHARE", v);
-        try t.expectError(error.GlmRequestStartsWithSharedKv, glm_env.requestStartsAlone());
+    for ([_][:0]const u8{ "1", "marks" }) |mode| {
+        try put("TF_GLM_REQUEST_STARTS", mode);
+        try t.expectEqual(if (std.mem.eql(u8, mode, "1")) glm_env.RequestStarts.all else glm_env.RequestStarts.marks, glm_env.requestStarts());
+        for ([_]?[:0]const u8{ null, "0", "00" }) |v| {
+            try put("TF_KV_SHARE", v);
+            try glm_env.requestStartsAlone();
+        }
+        for ([_][:0]const u8{ "1", "32", "00032" }) |v| {
+            try put("TF_KV_SHARE", v);
+            try t.expectError(error.GlmRequestStartsWithSharedKv, glm_env.requestStartsAlone());
+        }
     }
     try put("TF_KV_SHARE", "bad");
     try t.expectError(error.BadKvShare, glm_env.requestStartsAlone());

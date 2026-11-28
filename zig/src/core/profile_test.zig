@@ -276,3 +276,13 @@ test "stable profile: the EXL3 prompt gate/up kernel registers as identical, onl
     for ([_][]const u8{ "0", "" }) |raw| try t.expect(!e.differs(raw));
     try t.expectEqual(p.Switch.TF_EXL3_PROMPT_GU, p.registered("TF_EXL3_PROMPT_GU").?);
 }
+
+test "stable profile: GLM request starts reports exact 1 and marks as arithmetic opt-ins" {
+    const e = p.entry(.TF_GLM_REQUEST_STARTS);
+    try t.expectEqual(p.Class.arithmetic, e.class);
+    try t.expect(e.applies("glm5_next", "cuda") and !e.applies("qwen3_5", "cuda") and !e.applies("glm5_next", "metal"));
+    try t.expect(p.resolve(.stable, .TF_GLM_REQUEST_STARTS, null) == null);
+    try t.expect(e.report_values != null and e.report_values.?.len == 2);
+    try t.expect(e.differs("1") and e.differs("marks"));
+    for ([_][]const u8{ "", "0", "2", "off", "on", "true", "MARKS", " marks " }) |raw| try t.expect(!e.differs(raw));
+}

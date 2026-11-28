@@ -33,6 +33,8 @@ pub const request_starts = true;
 pub const request_starts_switch = "TF_GLM_REQUEST_STARTS";
 /// Starts closer than 256 tokens merge, as in the measured pair receipts (#2404); a 1-row minimum needs its own run.
 pub const request_min_chunk: u32 = 256;
+/// TF_GLM_REQUEST_STARTS=marks keeps server starts at 1-token spacing while engine cuts follow snapshot marks.
+pub const request_starts_marks = true;
 /// TF_GLM_PROMPT_TAIL=1: a prompt that names no history keeps its last chunk start, as the KV pages' store does.
 pub const snap_tail = "TF_GLM_PROMPT_TAIL";
 /// `explain` words this family's open refusals too (where to set the rank and the id).
@@ -356,7 +358,7 @@ fn finishRank(a: OpenArgs) !Loaded {
     const long_copy_match = try @import("sys").environment.value(bool, "TF_GLM_COPY_8_16", ranks.environment("TF_GLM_COPY_8_16"), false);
     own.link.lead(cuda.tp_watch.open(), p.world); // the other ranks begin asleep (follow): the first step wakes them
     if (own.e.local.len > 0 and o.mtp_confidence != null) return error.SharesOneRankEach; // chances need every share's
-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = !steps, .multi_prefill = multi_prefill and own.e.local.len == 0, .alone = !shared or own.e.local.len > 0, .long_copy_match = long_copy_match, .mtp_confidence = o.mtp_confidence };
+    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = !steps, .multi_prefill = multi_prefill and own.e.local.len == 0, .alone = !shared or own.e.local.len > 0, .long_copy_match = long_copy_match, .mtp_confidence = o.mtp_confidence, .request_starts = @import("cuda_env.zig").requestStarts() };
     if (long_copy_match and own.copies and own.e.drafter != null) std.log.info("verified copies: prompt match 8, reply match 16, up to 15 drafts", .{});
     const extra: u64 = (if (o.drafter != null) dflash.ring_bytes else 0) + if (own.e.images) |v| v.streamBytes() else @as(usize, 0);
     own.layout = if (set.pages) try pages_mod.layout(gpa, own.e, extra) else null;
@@ -509,7 +511,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.PoolTooSmall => "this request's prompt and max_tokens need more KV pages than the whole pool holds, even with every other stream done: shorten the prompt or lower max_tokens",
         error.BadKvShare => "TF_KV_SHARE: give how many states the prompt store over the KV pages keeps, or 0 or unset for off",
         error.GlmKvShareMoved => "TF_GLM_KV_SHARE is now TF_KV_SHARE, the prompt store every family on the KV pool shares: set that instead",
-        error.GlmRequestStartsWithSharedKv => "TF_GLM_REQUEST_STARTS=1 cannot be used with TF_KV_SHARE above 0: unset request starts or disable shared KV",
+        error.GlmRequestStartsWithSharedKv => "TF_GLM_REQUEST_STARTS=1 or marks cannot be used with TF_KV_SHARE above 0: unset request starts or disable shared KV",
         error.GlmDraftSnapshotWithSharedKv => "TF_GLM_DFLASH_SNAP_CONTEXT=1 requires copied snapshots: set TF_KV_SHARE=0",
         error.GlmDraftSnapshotWithoutDrafter => "TF_GLM_DFLASH_SNAP_CONTEXT=1 requires enabled drafts and --drafter",
         error.GlmShareNeedsPages => "TF_KV_SHARE keeps prompts as KV pool pages: set TF_KV_PAGES=on as well",

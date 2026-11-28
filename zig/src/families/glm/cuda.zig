@@ -52,6 +52,7 @@ pub const kv_host = @import("cuda_kv_host.zig");
 pub const pdl = @import("cuda_pdl.zig");
 pub const disk_image = @import("cuda_disk_image.zig");
 pub const disk_ranks = @import("cuda_disk_ranks.zig");
+pub const env = @import("cuda_env.zig");
 
 test {
     _ = lane_costs;
@@ -90,6 +91,7 @@ test {
     _ = @import("cuda_engine_pick.zig");
     _ = @import("cuda_prompt_cuts.zig");
     _ = @import("cuda_request_starts_test.zig");
+    _ = @import("cuda_request_starts_marks_test.zig");
     _ = @import("dflash_load.zig");
     _ = @import("dflash.zig");
     _ = prompt_solo;

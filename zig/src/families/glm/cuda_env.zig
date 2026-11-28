@@ -8,10 +8,25 @@ pub fn startup() !void {
     try environment.checkScope(.glm, environment.Process{});
 }
 
-/// TF_GLM_REQUEST_STARTS=1 cuts off the rows TF_KV_SHARE keeps on: refused with shared KV.
+/// How rank 0 cuts prompts on message starts (TF_GLM_REQUEST_STARTS): off, every start ("1"), or marks ("marks").
+pub const RequestStarts = enum { off, all, marks };
+
+/// Parse TF_GLM_REQUEST_STARTS: only exact "1" or "marks" turns request starts on.
+pub fn requestStartsOf(raw: ?[]const u8) RequestStarts {
+    const v = raw orelse return .off;
+    if (std.mem.eql(u8, v, "1")) return .all;
+    if (std.mem.eql(u8, v, "marks")) return .marks;
+    return .off;
+}
+
+/// Live process value of TF_GLM_REQUEST_STARTS.
+pub fn requestStarts() RequestStarts {
+    return requestStartsOf(@import("core").profile.get(.TF_GLM_REQUEST_STARTS));
+}
+
+/// TF_GLM_REQUEST_STARTS=1 or marks cuts off the rows TF_KV_SHARE keeps on: refused with shared KV.
 pub fn requestStartsAlone() !void {
-    const on = if (@import("core").profile.get(.TF_GLM_REQUEST_STARTS)) |v| std.mem.eql(u8, v, "1") else false;
-    if (on and try kp.sharing() > 0) return error.GlmRequestStartsWithSharedKv;
+    if (requestStarts() != .off and try kp.sharing() > 0) return error.GlmRequestStartsWithSharedKv;
 }
 
 /// The draft tail is private to the external DFlash2 model and to copied snapshots.

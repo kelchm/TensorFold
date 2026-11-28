@@ -33,6 +33,7 @@ pub const Lanes = struct {
     whole: bool = false, // prompt passes run whole (TF_GLM_PROMPT_STEPS=0): no other stream's round between chunks
     multi_prefill: bool = false, // TF_GLM_MULTI_PREFILL=1: batch short fresh text prompts beside stepped fills
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
+    request_starts: @import("cuda_env.zig").RequestStarts = .off, // TF_GLM_REQUEST_STARTS: off, all, or marks
     long_copy_match: bool = false, // TF_GLM_COPY_8_16: 8 prompt / 16 reply match, up to 15 copy drafts
     mtp_confidence: ?f64 = null, // --mtp-confidence: the MTP head's chains stop where their chance falls under it
     copy_confidence: bool = false, // copy mode keeps head confidence in probabilities so target copies stay priced
@@ -292,7 +293,7 @@ pub const Lanes = struct {
     }
 
     /// A prompt pass begins: the stream's slot bound and its sequence fresh; where the pass resumes (a kept state).
-    fn opening(self: *Lanes, s: *lanes.Stream) !?engine.Resume {
+    pub fn opening(self: *Lanes, s: *lanes.Stream) !?engine.Resume {
         const ids = s.prompt();
         if (ids.len + s.max_new + max_rows >= self.x.e.capacity) return error.PromptTooLong;
         const gpa = self.x.e.gpa;
@@ -314,7 +315,6 @@ pub const Lanes = struct {
         if (self.x.e.images) |v| v.clear(); // no earlier request's rows splice into this one
         try self.x.beginOn(s.sampling, pages, adopt.items.len);
         announced = true;
-        if (s.chunks.len > 0) try self.x.cuts(s.chunks); // TF_GLM_REQUEST_STARTS: every rank cuts the pass there too
         s.cached = 0;
         s.prompt_rows.clearRetainingCapacity();
         const l = self.lanes.getPtr(s).?;
@@ -326,7 +326,19 @@ pub const Lanes = struct {
             s.cached = k.at;
             return .{ .id = k.id, .at = k.at };
         }
-        return if (s.prompt_logprobs != null) null else self.resumeFrom(s, ids.len); // prompt rows need every row
+        const from = if (s.prompt_logprobs != null) null else self.resumeFrom(s, ids.len); // prompt rows need every row
+        errdefer s.cached = 0;
+        try self.sendCuts(s, from, ids.len);
+        return from;
+    }
+
+    /// Cuts sent to every rank before the first prompt step: all starts (`=1`), or `from` + marks (`=marks`).
+    fn sendCuts(self: *Lanes, s: *const lanes.Stream, from: ?engine.Resume, len: usize) !void {
+        if (self.request_starts == .marks) {
+            const cuts = try engine.prompt_cuts.markCuts(self.x.e.gpa, if (from) |r| r.at else 0, s.reuse.marks, len);
+            defer self.x.e.gpa.free(cuts);
+            if (cuts.len > 0) try self.x.cuts(cuts);
+        } else if (s.chunks.len > 0) try self.x.cuts(s.chunks);
     }
 
     /// Whether the shared prompt store keeps this content-keyed pass, with no prompt logprob rows asked.
@@ -378,26 +390,22 @@ pub const Lanes = struct {
     }
     const Sink = @import("cuda_prompt_sink.zig").Sink;
 
-    fn marksOf(self: *Lanes, s: *lanes.Stream, keeps: *share_mod.Keeps) ?engine.Marks {
+    pub fn marksOf(self: *Lanes, s: *lanes.Stream, keeps: *share_mod.Keeps) ?engine.Marks {
         if (self.cached(s)) {
             const l = self.lanes.getPtr(s) orelse return null;
             return share_mod.marks(self.x.e, l.slot, s, l.marks, keeps);
         }
-        return if (s.reuse.hook == null) null else .{
-            .at = s.reuse.marks,
-            .ctx = s,
-            .call = keptAt,
-            .interrupted = keptInterrupted,
-        };
+        return if (s.reuse.hook == null) null else .{ .at = s.reuse.marks, .ctx = s, .call = keptAt, .interrupted = if (self.request_starts == .marks) keptInterruptedMarks else keptInterrupted };
     }
 
     /// The stream's kept state where its pass starts (null: none, not at a cold cut over the same chunks, or not held).
     pub fn resumeFrom(self: *Lanes, s: *lanes.Stream, len: usize) ?engine.Resume {
         const saved = s.reuse.saved orelse return null;
         const k: *const engine.Kept = @ptrCast(@alignCast(saved));
-        if (k.at != s.reuse.at or k.at == 0 or k.at >= len or !engine.prompt_cuts.resumes(len, s.chunks, k.at, k.below) or !self.x.e.holds(k.id)) {
+        const step_ok = if (self.request_starts == .marks) engine.prompt_cuts.usableCut(s.chunks, k.at) else engine.prompt_cuts.resumes(len, s.chunks, k.at, k.below);
+        if (k.at != s.reuse.at or k.at == 0 or k.at >= len or !step_ok or !self.x.e.holds(k.id)) {
             s.reuse_failed = true;
-            s.reuse_error = if (k.at == 0 or k.at >= len) error.SnapshotNotPrefix else if (k.at != s.reuse.at or !engine.prompt_cuts.resumes(len, s.chunks, k.at, k.below)) error.SnapshotOutOfStep else error.SnapshotStale;
+            s.reuse_error = if (k.at == 0 or k.at >= len) error.SnapshotNotPrefix else if (k.at != s.reuse.at or !step_ok) error.SnapshotOutOfStep else error.SnapshotStale;
             return null;
         }
         s.cached = k.at;
@@ -413,6 +421,11 @@ pub const Lanes = struct {
     fn keptInterrupted(ctx: *anyopaque, at: u32) void {
         const s: *lanes.Stream = @ptrCast(@alignCast(ctx));
         s.keepInterruptedPrefill(at);
+    }
+
+    fn keptInterruptedMarks(ctx: *anyopaque, at: u32) void {
+        const s: *lanes.Stream = @ptrCast(@alignCast(ctx));
+        if (engine.prompt_cuts.usableCut(s.chunks, at)) s.keepInterruptedPrefill(at);
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {

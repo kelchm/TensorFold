@@ -50,17 +50,25 @@ pub fn requestStep(comptime F: type) u32 {
     return requestStepFor(F, @import("profile").lookup(F.request_starts_switch));
 }
 
-/// An invariant family keeps every message start (1); an opted-in family keeps each or its `request_min_chunk` apart.
+/// An invariant family keeps every start (1); opt-in "marks" keeps every start too, else `request_min_chunk`.
 pub fn requestMinimum(comptime F: type) u32 {
     if (snapInvariant(F)) return 1;
-    if (requestStep(F) == 0) return 256;
+    if (!@hasDecl(F, "request_starts_switch")) return 256;
+    return requestMinimumFor(F, @import("profile").lookup(F.request_starts_switch));
+}
+
+/// Minimum chunk spacing for `value`: 1 under "marks", else the family's `request_min_chunk` (or 1) when active.
+pub fn requestMinimumFor(comptime F: type, value: ?[]const u8) u32 {
+    if (requestStepFor(F, value) == 0) return 256;
+    if (value) |v| if (@hasDecl(F, "request_starts_marks") and F.request_starts_marks and std.mem.eql(u8, v, "marks")) return 1;
     return if (@hasDecl(F, "request_min_chunk")) F.request_min_chunk else 1;
 }
 
-/// Only exact 1 turns message starts on; the family's `request_starts_default_on` cannot.
+/// Only exact "1" (or "marks" when the family declares `request_starts_marks`) turns message starts on.
 pub fn requestStepFor(comptime F: type, value: ?[]const u8) u32 {
     if (value) |v| {
-        if (!std.mem.eql(u8, v, "1")) return 0;
+        const marks = @hasDecl(F, "request_starts_marks") and F.request_starts_marks;
+        if (!std.mem.eql(u8, v, "1") and !(marks and std.mem.eql(u8, v, "marks"))) return 0;
     } else if (!@hasDecl(F, "request_starts_default_on") or !F.request_starts_default_on) return 0;
     return if (@hasDecl(F, "request_starts") and F.request_starts) F.snap_grid else 0;
 }
@@ -313,4 +321,43 @@ test "request starts: opt in is explicit, eligible and independent of cache rule
     _ = requestStepFor(Qwen, "1");
     try std.testing.expectEqualDeep(before, cacheRules(Qwen));
     try std.testing.expectEqual(@import("profile").Class.arithmetic, @import("profile").entry(.TF_QWEN_REQUEST_STARTS).class);
+}
+
+test "request starts: marks mode enables 1-token spacing only on families declaring request_starts_marks" {
+    const sys = @import("sys");
+    const Glm = struct {
+        pub const snap_grid: u32 = 2048;
+        pub const request_starts = true;
+        pub const request_starts_marks = true;
+        pub const request_min_chunk: u32 = 256;
+    };
+    const Qwen = struct {
+        pub const snap_grid: u32 = 4096;
+        pub const request_starts = true;
+        pub const request_starts_default_on = true;
+    };
+    try std.testing.expectEqual(@as(u32, 2048), requestStepFor(Glm, "marks"));
+    try std.testing.expectEqual(@as(u32, 1), requestMinimumFor(Glm, "marks"));
+    try std.testing.expectEqual(@as(u32, 2048), requestStepFor(Glm, "1"));
+    try std.testing.expectEqual(@as(u32, 256), requestMinimumFor(Glm, "1"));
+    for ([_]?[]const u8{ null, "", "0", "2", "MARKS", " marks " }) |v| {
+        try std.testing.expectEqual(@as(u32, 0), requestStepFor(Glm, v));
+        try std.testing.expectEqual(@as(u32, 256), requestMinimumFor(Glm, v));
+    }
+    try std.testing.expectEqual(@as(u32, 0), requestStepFor(Qwen, "marks"));
+    try std.testing.expectEqual(@as(u32, 256), requestMinimumFor(Qwen, "marks"));
+    const prev = if (sys.getenv("TF_GLM_REQUEST_STARTS")) |v| try std.testing.allocator.dupeSentinel(u8, v, 0) else null;
+    defer if (prev) |old| {
+        _ = sys.env.setenv("TF_GLM_REQUEST_STARTS", old, 1);
+        std.testing.allocator.free(old);
+    } else {
+        _ = sys.env.unsetenv("TF_GLM_REQUEST_STARTS");
+    };
+    try std.testing.expectEqual(@as(c_int, 0), sys.env.setenv("TF_GLM_REQUEST_STARTS", "marks", 1));
+    inline for (@import("cuda.zig").registry) |F| {
+        if (@hasDecl(F, "request_starts_switch") and std.mem.eql(u8, F.request_starts_switch, "TF_GLM_REQUEST_STARTS")) {
+            try std.testing.expectEqual(@as(u32, 2048), requestStep(F));
+            try std.testing.expectEqual(@as(u32, 1), requestMinimum(F));
+        }
+    }
 }

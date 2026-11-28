@@ -105,11 +105,19 @@ drafted at one stream, and about 1,430 prompt tokens a second from 2,048 to 65,5
   `--prompt-cache-gib` that holds all n where one does.
 - `TF_GLM_CHUNK_SOLO=4096` or `8192` on every rank (opt-in) lets a prompt pass take that many rows while no other stream decodes.
   Unset or `2048`, every pass takes 2,048 rows and nothing extra is held. See [Prompt chunk size](#prompt-chunk-size).
-- `TF_GLM_REQUEST_STARTS=1` on rank 0 (opt-in, off by default) cuts each prompt pass at the request's message starts
-  too, and every 2,048 rows from the last cut, so a chat's next turn resumes where its previous turn's history ends
-  instead of at the last 2,048-row point. Rank 0 sends the cuts to the other ranks. A pass with starts takes no solo
-  or batched pass. GLM refuses the switch at startup with `TF_KV_SHARE` above 0; with `--learn-conversations`, each kept
-  state's cut digest is stored in its disk header so off-grid cuts restore cleanly (#2404, part of #2396).
+- `TF_GLM_REQUEST_STARTS=1` or `marks` on rank 0 (opt-in, off by default) enables message-start prompt caching so a
+  chat's next turn resumes where its previous turn's history ends instead of at the last 2,048-row grid boundary.
+  - With `=1`, the server emits message starts at least 256 tokens apart (plus 2,048-row grid fills) and rank 0 sends
+    every cut to all ranks. Wide solo (`TF_GLM_CHUNK_SOLO=4096`/`8192`) and paired solo (`TF_GLM_PROMPT_PAIR=solo`) run
+    across grid-aligned stretches clear of off-grid cuts and snapshot marks while preserving `below()` digests and rank
+    agreement; a pass with starts takes no batched pass (`TF_GLM_MULTI_PREFILL`).
+  - With `=marks`, the server plans message starts at 1-token spacing (so rapid short turns under 256 tokens also get
+    exact snapshot marks and cache hits), while rank 0 sends only the active resume point and snapshot marks over
+    `Kind.cuts`. A cold multi-turn prompt with hundreds of historical messages therefore runs full wide/paired solo
+    straight to its snapshot marks instead of shattering at unmarked message boundaries.
+  - Both modes are refused at startup with `TF_KV_SHARE` above 0; with `--learn-conversations`, each kept state's cut
+    digest is stored in its disk header and `1` vs `marks` vs unset are partitioned into separate disk identities
+    (#2404, part of #2396).
 - `TF_GLM_DENSE_BITS=4` (EXL3 at TP=2, off by default) repacks the BF16 dense layers to 4 bits at load. Decode is
   faster (24.8 to 35.0 tok/s in one user's run), but replies differ from the default, so it is lossy and stays opt-in
   (#1761).
