@@ -203,15 +203,33 @@ pub fn attach(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, r
     std.log.info("glm: conversation states on disk in {s} ({d} states, {d} MiB of {d} MiB; {d} ranks' parts; a save stages up to {d} MiB)", .{ r.dir, r.states.items.len, r.held() >> 20, r.cap >> 20, prefixes.len, r.staging_bytes >> 20 });
 }
 
-/// The store for `id` through the shared attach, whose staging floor takes a `longest`-token state whole (rows.attach).
-fn open(store: *api.prompt_cache.Store, o: api.Open, root: []const u8, id: u64, longest: u32) !*rows.Rows {
+/// The store for `id` through the shared attach, whose staging floor covers the longest RAM-fitting state whole.
+pub fn open(store: *api.prompt_cache.Store, o: api.Open, root: []const u8, id: u64, longest: u32) !*rows.Rows {
     const gibs = struct {
         fn bytes(g: f64) u64 {
             return @intFromFloat(g * (1 << 30));
         }
     }.bytes;
     // spill stays off: an eviction would gather on rank 0 mid-pass while the other ranks wait in the gate's all-reduce
-    return rows.attach(store.gpa, store, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid, .longest = longest });
+    const r = try rows.attach(store.gpa, store, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid, .longest = longest });
+    const fit = maxFittingTokens(store, longest);
+    if (fit > 0) r.staging_bytes = @max(r.staging_bytes, rows.write.coldCharge(r, fit) catch 0);
+    return r;
+}
+
+/// The longest prefix <= `longest` whose per-rank RAM snapshot fits `store.budget` (0 if unpriced or none fits).
+fn maxFittingTokens(store: *const api.prompt_cache.Store, longest: u32) u32 {
+    if (longest == 0 or store.budget == 0) return 0;
+    const max_bytes = store.family.vtable.bytes(store.family.ptr, longest);
+    if (max_bytes == 0) return 0;
+    if (max_bytes <= store.budget) return longest;
+    var lo: u32 = 0;
+    var hi: u32 = longest;
+    while (lo + 1 < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (store.family.vtable.bytes(store.family.ptr, mid) <= store.budget) lo = mid else hi = mid;
+    }
+    return lo;
 }
 
 test "GLM disk attach: TF_KV_SHARE and more ranks than the prefixes hold are refused by name" {
@@ -225,51 +243,6 @@ test "GLM disk attach: TF_KV_SHARE and more ranks than the prefixes hold are ref
     e.share.world = 2;
     e.share_pages = true;
     try std.testing.expectError(error.KvShareWithLearnConversations, refusal(e));
-}
-
-test "CUDA disk open: GLM's store takes the shared attach's staging floor, so a 125K-token state is staged, not StagingFull" {
-    const gpa = std.testing.allocator;
-    const T = struct {
-        const token = 18_944; // about 18.5 KiB a token, as a served state's files measure (683 MiB at 36,864 tokens)
-        fn parts(_: *anyopaque, at: u32, out: *std.ArrayList(rows.image.Part), a: Allocator) anyerror!void {
-            try out.append(a, .{ .bytes = @as(u64, at) * token, .row = token });
-        }
-        fn bytes(_: *anyopaque, _: u32) u64 {
-            return 0;
-        }
-        fn save(_: *anyopaque, _: ?*anyopaque, _: u32) anyerror!api.prompt_cache.Saved {
-            return error.Unused;
-        }
-        fn restore(_: *anyopaque, _: ?*anyopaque, _: api.prompt_cache.Saved) anyerror!void {}
-        fn drop(_: *anyopaque, _: api.prompt_cache.Saved) void {}
-    };
-    const sized: rows.Image = .{ .parts = T.parts, .gather = gather, .blank = blank, .scatter = scatter, .whole = whole };
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
-    defer gpa.free(root);
-    var family: u8 = 0;
-    const vt: api.prompt_cache.Snapshots.VTable = .{ .bytes = T.bytes, .save = T.save, .restore = T.restore, .drop = T.drop, .rows = &sized };
-    const default = (rows.Options{ .root = "", .identity = 0, .cap = 0, .floor = 0, .daily = 0 }).staging_bytes;
-    const window = 131_072;
-    // a RAM store that keeps the state, and one too small for it: the floor is the state's charge within that budget
-    for ([_]u64{ 8 << 30, 1 << 29 }) |budget| {
-        var store = api.prompt_cache.Store.init(gpa, .{ .ptr = &family, .vtable = &vt }, .{ .lookahead = 1 }, budget);
-        const r = open(&store, .{ .dir = "d", .model_type = "glm", .learn = root, .learn_conversations = true }, root, 7, window) catch |e| {
-            store.deinit();
-            return e;
-        };
-        defer r.deinit();
-        defer store.deinit(); // the store before its disk, as the rows fixtures close them
-        try std.testing.expectEqual(r, store.disk.?);
-        try std.testing.expectEqual(rows.Spill.off, r.spill);
-        const long = try rows.write.coldCharge(r, 124_928); // the conversation the default skipped (StagingFull)
-        try std.testing.expect(long > default);
-        if (budget > long) {
-            try std.testing.expect(r.staging_bytes >= long); // the permit a save's stage step asks `fits` of
-            try std.testing.expectEqual(try rows.write.coldCharge(r, window), r.staging_bytes); // the longest, whole
-        } else try std.testing.expectEqual(default, r.staging_bytes);
-    }
 }
 
 test "CUDA disk open: GLM gather zeros unwritten pooled-key tail and scratch spans for BF16 and paged FP8" {
@@ -587,5 +560,6 @@ test "CUDA disk open: off-grid TF_GLM_REQUEST_STARTS state round-trips via rows 
 }
 
 test {
+    _ = @import("cuda_glm_disk_test.zig");
     std.testing.refAllDecls(@This());
 }
