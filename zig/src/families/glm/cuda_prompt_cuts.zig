@@ -41,10 +41,10 @@ pub fn resumes(len: usize, cuts: []const u32, at: u32, kept_below: u64) bool {
     return coldCut(len, cuts, at) and kept_below == below(cuts, at);
 }
 
-/// Whether a wide step of `rows` rows from `start` crosses no request start (a cut at `start + rows` ends it cleanly).
+/// Whether a wide step of `rows` rows from `start` crosses no off-grid cut (grid multiples match `nextCut`).
 pub fn clearOfCuts(cuts: []const u32, start: usize, rows: usize) bool {
     const end = start +| rows;
-    for (cuts) |c| if (c > start and c < end) return false;
+    for (cuts) |c| if (c > start and c < end and (c - start) % prefill_rows != 0) return false;
     return true;
 }
 
@@ -245,10 +245,44 @@ test "glm request starts: clearOfCuts and stepRows allow wide steps clear of cut
     // Cut exactly at start + 2*C: ends the wide step cleanly without being stepped over.
     try std.testing.expect(clearOfCuts(&.{2 * m}, 0, 2 * m));
     try std.testing.expectEqual(@as(usize, 2 * m), try stepRows(len, &.{2 * m}, 0, 2 * m + 1, 2 * m));
-    // Cuts inside (start, start+C), at start+C, or inside (start+C, start+2*C) all block the wide step.
-    for ([_]u32{ 500, m, m + 500, 2 * m - 1 }) |c| {
+    // Grid-aligned cuts strictly inside (start, start+2*C) match nextCut from start, so clearOfCuts accepts them.
+    try std.testing.expect(clearOfCuts(&.{m}, 0, 2 * m));
+    try std.testing.expectEqual(@as(usize, 2 * m), try stepRows(len, &.{m}, 0, 2 * m + 1, 2 * m));
+    // Off-grid cuts inside (start, start+2*C) all block the wide step.
+    for ([_]u32{ 500, m - 1, m + 1, m + 500, 2 * m - 1 }) |c| {
         try std.testing.expect(!clearOfCuts(&.{c}, 0, 2 * m));
         try std.testing.expectError(error.BadChunk, stepRows(len, &.{c}, 0, 2 * m + 1, 2 * m));
+    }
+    // Cuts relative to an off-grid cold start: grid multiples from start pass, non-multiples block.
+    const off_grid = [_]u32{ 512, 512 + m, 512 + 2 * m, 512 + 3 * m };
+    try std.testing.expect(clearOfCuts(&off_grid, 512, 2 * m));
+    try std.testing.expect(clearOfCuts(&off_grid, 512, 4 * m));
+    try std.testing.expectEqual(@as(usize, 2 * m), try stepRows(len, &off_grid, 512, 2 * m + 1, 2 * m));
+    try std.testing.expect(!clearOfCuts(&.{ 512, m, 2 * m }, 512, 2 * m));
+    try std.testing.expectError(error.BadChunk, stepRows(len, &.{ 512, m, 2 * m }, 512, 2 * m + 1, 2 * m));
+    // 112K grid-filler cuts [2048, ..., 110592, 111949]: 4096+4096 runs to 110592, then cuts at 111949.
+    const len_112k: usize = 112_000;
+    var cuts_112k: [55]u32 = undefined;
+    for (0..54) |k| cuts_112k[k] = @intCast((k + 1) * m);
+    cuts_112k[54] = 111_949;
+    try std.testing.expectEqual(@as(u64, 0), below(&cuts_112k, 110_592));
+    try std.testing.expectEqual(below(&.{}, 110_592), below(&cuts_112k, 110_592));
+    try std.testing.expectEqual(below(&.{111_949}, 111_949), below(&cuts_112k, 111_949));
+    for ([_]usize{ 2 * m, 4 * m }) |width| {
+        var pos: usize = 0;
+        var wide_steps: usize = 0;
+        while (pos < len_112k) {
+            const left = len_112k - pos;
+            const take = @min(left, width);
+            const can_wide = left > m + 1 and clearOfCuts(&cuts_112k, pos, take);
+            const n = leaderRows(len_112k, &cuts_112k, pos, if (can_wide) width else 0);
+            const got = try stepRows(len_112k, &cuts_112k, pos, @min(left, n + 1), width);
+            try std.testing.expectEqual(@min(left, n), got);
+            if (can_wide) wide_steps += 1;
+            pos += got;
+            if (pos < len_112k) try std.testing.expect(coldCut(len_112k, &cuts_112k, pos));
+        }
+        try std.testing.expectEqual(@as(usize, if (width == 4 * m) 13 else 27), wide_steps);
     }
     // Cuts at or before start do not block a wide step starting at start.
     const cuts = [_]u32{ 512, 2557, 3069, 39640 };

@@ -2,6 +2,7 @@
 const std = @import("std");
 const fw = @import("cuda_forward.zig");
 const engine = @import("cuda_engine.zig");
+const prompt_cuts = @import("cuda_prompt_cuts.zig");
 const Engine = engine.Engine;
 
 /// Whether a stream besides `s` is past its prompt pass (a lane with no fill): a solo pass would hold up its rounds.
@@ -14,22 +15,22 @@ pub fn takesTwo(start: usize, len: usize, marks: []const u32) bool {
     return takesChunks(start, len, 2 * fw.prefill_rows, marks);
 }
 
-/// Every grid boundary inside a solo pass must be unmarked; the last row may end the prompt off the grid.
+/// Every interior position inside a solo pass must be unmarked; the last row may end the prompt off the grid.
 pub fn takesChunks(start: usize, len: usize, width: usize, marks: []const u32) bool {
-    if (start >= len or start % fw.prefill_rows != 0 or width <= fw.prefill_rows) return false;
+    if (start >= len or width <= fw.prefill_rows) return false;
     if (len - start <= fw.prefill_rows + 1) return false; // one row: a chunk's part as sent
     const end = start + rowsAt(start, len, width);
-    var next = start + fw.prefill_rows;
-    while (next < end) : (next += fw.prefill_rows) {
-        if (std.mem.indexOfScalar(u32, marks, @intCast(next)) != null) return false;
-    }
+    for (marks) |m| if (m > start and m < end) return false;
     return true;
 }
 
-/// Whether a pass at `start` to `rows` rebases the index rings where chunks one at a time do: at its start, or not.
-pub fn ringsAgree(base: usize, ring: usize, start: usize, rows: usize) bool {
+/// Whether a pass at `start` to `rows` rebases the index rings where chunks one at a time do and fits in `ring`.
+pub fn ringsAgree(base: usize, ring: usize, pool: usize, start: usize, rows: usize) bool {
     if (start < base or rows > ring) return false;
-    return start + fw.prefill_rows > base + ring or start + rows <= base + ring;
+    if (start + rows <= base + ring) return true;
+    if (start + fw.prefill_rows <= base + ring or pool == 0) return false;
+    const nb = start / pool * pool;
+    return start + rows <= nb + ring;
 }
 
 /// The rows a solo pass takes at `start` of a `len`-id prompt.
@@ -37,20 +38,26 @@ pub fn rowsAt(start: usize, len: usize, width: usize) usize {
     return @min(len - start, width);
 }
 
-/// Rank 0's choice for the step at `start`; not beside what reads a chunk's rows, nor with request starts (cut there).
+/// Rank 0's choice for the step at `start`; not beside what reads a chunk's rows, nor over an off-grid cut or mark.
 pub fn at(e: *const Engine, start: usize, len: usize, from: ?engine.Resume, marks: ?engine.Marks) bool {
-    if (e.bp.rows <= fw.prefill_rows or e.prompt_logprobs != null or e.prompt_profs[3] != null or e.cur.cuts.items.len > 0) return false;
+    if (e.bp.rows <= fw.prefill_rows or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
     if (e.images) |v| if (v.rowCount() > 0) return false;
+    if (!prompt_cuts.coldCut(len, e.cur.cuts.items, start)) return false;
     if (!takesChunks(start, len, e.bp.rows, if (marks) |m| m.at else &.{})) return false;
+    const rows = rowsAt(start, len, e.bp.rows);
+    if (!prompt_cuts.clearOfCuts(e.cur.cuts.items, start, rows)) return false;
     // a resumed step restores its kept state, and the rings' base, after this choice
     const base = if (from) |r| (e.snaps.get(r.id) orelse return false).bases[0] else e.cur.st.base;
-    return ringsAgree(base, e.cur.st.ring_rows, start, rowsAt(start, len, e.bp.rows));
+    return ringsAgree(base, e.cur.st.ring_rows, e.cur.st.pool, start, rows);
 }
 
 /// Whether a pass of `rows` past a chunk may run: `at`'s rule on every rank, its kept state restored.
-pub fn allowed(e: *const Engine, start: usize, rows: usize) bool {
-    if (e.bp.rows < rows or rows <= fw.prefill_rows or start % fw.prefill_rows != 0 or e.prompt_logprobs != null or e.cur.cuts.items.len > 0) return false;
-    return ringsAgree(e.cur.st.base, e.cur.st.ring_rows, start, rows);
+pub fn allowed(e: *const Engine, start: usize, len: usize, rows: usize) bool {
+    if (e.bp.rows < rows or rows <= fw.prefill_rows or e.prompt_logprobs != null) return false;
+    if (e.images) |v| if (v.rowCount() > 0) return false;
+    if (!prompt_cuts.coldCut(len, e.cur.cuts.items, start)) return false;
+    if (!prompt_cuts.clearOfCuts(e.cur.cuts.items, start, rows)) return false;
+    return ringsAgree(e.cur.st.base, e.cur.st.ring_rows, e.cur.st.pool, start, rows);
 }
 
 /// decode._absorb_rows of a step, a chunk's rows at a time: the head's ring holds a window more than a pass.
@@ -85,11 +92,15 @@ test "a solo pass: rows past the next grid point, and no mark at it" {
 
 test "a solo pass rebases the rings where chunks one at a time do" {
     const C = fw.prefill_rows;
-    try std.testing.expect(ringsAgree(0, 2 * C, 0, 2 * C)); // neither rebases
-    try std.testing.expect(!ringsAgree(0, 2 * C, C, 2 * C)); // chunks rebase at the second, a pass at its first
-    try std.testing.expect(!ringsAgree(0, 2 * C, C, C + 1));
-    try std.testing.expect(ringsAgree(0, 2 * C, 2 * C, 2 * C)); // both at the pass's start
-    try std.testing.expect(ringsAgree(C, 2 * C, C, 2 * C));
+    try std.testing.expect(ringsAgree(0, 2 * C, 4, 0, 2 * C)); // neither rebases
+    try std.testing.expect(!ringsAgree(0, 2 * C, 4, C, 2 * C)); // chunks rebase at the second, a pass at its first
+    try std.testing.expect(!ringsAgree(0, 2 * C, 4, C, C + 1));
+    try std.testing.expect(ringsAgree(0, 2 * C, 4, 2 * C, 2 * C)); // both at the pass's start
+    try std.testing.expect(ringsAgree(C, 2 * C, 4, C, 2 * C));
+    // Off-pool rebase rounds base down by start % pool: a full 2*C solo overflows a 2*C ring, a shorter tail fits.
+    try std.testing.expect(!ringsAgree(0, 2 * C, 4, 3069, 2 * C));
+    try std.testing.expect(ringsAgree(0, 2 * C, 4, 3069, 2 * C - 1));
+    try std.testing.expect(ringsAgree(0, 2 * C, 4, 39640, 2 * C));
 }
 
 test "a solo pass fits a whole ring once it rebases, and its buffers only when asked" {

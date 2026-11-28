@@ -47,24 +47,18 @@ pub fn wanted(on: bool, solo: bool, with_solo: bool, world: usize) bool {
     return on and (!solo or with_solo) and world > 1;
 }
 
-/// Whether a step at `start` takes a second chunk past a first of `rows`: enough rows, no mark at a grid point inside.
+/// Whether a step at `start` takes a second chunk past a first of `rows`: enough rows, and no mark strictly inside.
 pub fn takesTwo(start: usize, len: usize, world: usize, marks: []const u32, rows: usize) bool {
     const next = start + rows;
     if (next >= len or len - next < @max(minRows(rows), world)) return false;
-    var at = start + fw.prefill_rows; // a kept state starts a step at any grid point, inside a solo-sized chunk too
-    while (at < @min(len, next + rows)) : (at += fw.prefill_rows) {
-        if (std.mem.indexOfScalar(u32, marks, @intCast(at)) != null) return false;
-    }
+    const end = @min(len, next + rows);
+    for (marks) |m| if (m > start and m < end) return false;
     return true;
 }
 
 /// Whether a pair of `ra` and `rb` rows rebases the index rings where grid chunks one at a time do and fits in `ring`.
 pub fn ringsAgree(base: usize, ring: usize, pool: usize, start: usize, ra: usize, rb: usize) bool {
-    if (start < base or ra + rb > ring) return false;
-    if (start + ra + rb <= base + ring) return true;
-    if (start + fw.prefill_rows <= base + ring or pool == 0) return false;
-    const nb = start / pool * pool;
-    return start + ra + rb <= nb + ring;
+    return prompt_solo.ringsAgree(base, ring, pool, start, ra + rb);
 }
 
 /// Where a paired step's chunks tap for DFlash2: only a chunk reaching the prompt's last window, as prefillChunk taps.
@@ -92,10 +86,8 @@ pub fn pairedAt(e: *const Engine, start: usize, len: usize, from: ?engine.Resume
     const ra = if (e.pair) |p| p.rows else return false;
     if (!e.settings.pair or (e.drafter != null and !e.settings.pair_dflash) or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
     if (e.pieces.count == 1 and !e.settings.split) return false; // run takes such a chunk whole
-    if (ra > fw.prefill_rows) {
-        if (e.cur.cuts.items.len > 0 or start % fw.prefill_rows != 0) return false; // as prompt_solo.at
-        if (e.images) |v| if (v.rowCount() > 0) return false;
-    }
+    if (ra > fw.prefill_rows) if (e.images) |v| if (v.rowCount() > 0) return false;
+    if (!prompt_cuts.coldCut(len, e.cur.cuts.items, start)) return false;
     if (!takesTwo(start, len, e.share.world, if (marks) |m| m.at else &.{}, ra)) return false;
     const rb: usize = @min(len - start - ra, ra);
     if (!prompt_cuts.clearOfCuts(e.cur.cuts.items, start, ra + rb)) return false;
@@ -111,7 +103,8 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: 
     if (len <= start + ra) return error.BadChunk;
     const rb: usize = @min(len - start - ra, ra);
     if (rb < e.share.world or part.len != @min(len - start, ra + rb + 1) or (e.drafter != null and !e.settings.pair_dflash) or e.prompt_logprobs != null) return error.BadChunk;
-    if (ra > fw.prefill_rows and (e.cur.cuts.items.len > 0 or start % fw.prefill_rows != 0)) return error.BadChunk;
+    if (ra > fw.prefill_rows) if (e.images) |v| if (v.rowCount() > 0) return error.BadChunk;
+    if (!prompt_cuts.coldCut(len, e.cur.cuts.items, start)) return error.BadChunk;
     if (!prompt_cuts.clearOfCuts(e.cur.cuts.items, start, ra + rb)) return error.BadChunk;
     if (!ringsAgree(e.cur.st.base, e.cur.st.ring_rows, e.cur.st.pool, start, ra, rb)) return error.BadChunk; // pairedAt's rule, every rank
     if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
@@ -339,9 +332,19 @@ test "TF_GLM_REQUEST_STARTS pairs prompt chunks clear of cuts and refuses cuts i
     try std.testing.expect(pairedAt(&e, 0, 4 * C, null, null));
     try prompt_cuts.set(a, &seq.cuts, &.{2 * C});
     try std.testing.expect(pairedAt(&e, 0, 4 * C, null, null));
-    // Cuts inside (start, start+C), at start+C, or inside (start+C, start+2*C): refused by pairedAt and prefill.
+    // Grid-aligned cut at start + C: matches nextCut, so pairedAt accepts it (marks at C still block via takesTwo).
+    try prompt_cuts.set(a, &seq.cuts, &.{C});
+    try std.testing.expect(pairedAt(&e, 0, 4 * C, null, null));
+    const Mark = struct {
+        fn call(_: *anyopaque, _: u32) void {}
+    };
+    var ctx: u8 = 0;
+    try std.testing.expect(!pairedAt(&e, 0, 4 * C, null, .{ .at = &.{C}, .ctx = &ctx, .call = Mark.call }));
+    try std.testing.expect(!pairedAt(&e, 0, 4 * C, null, .{ .at = &.{C + 17}, .ctx = &ctx, .call = Mark.call }));
+    try std.testing.expect(pairedAt(&e, 0, 4 * C, null, .{ .at = &.{2 * C}, .ctx = &ctx, .call = Mark.call }));
+    // Off-grid cuts inside (start, start+2*C): refused by pairedAt and prefill.
     var part: [2 * C + 1]u32 = @splat(1);
-    for ([_]u32{ 512, C, C + 512, 2 * C - 1 }) |cut| {
+    for ([_]u32{ 512, C - 1, C + 1, C + 512, 2 * C - 1 }) |cut| {
         try prompt_cuts.set(a, &seq.cuts, &.{cut});
         try std.testing.expect(!pairedAt(&e, 0, 4 * C, null, null));
         try std.testing.expectError(error.BadChunk, prefill(&e, &part, 0, 4 * C, null, null, false));
@@ -353,4 +356,40 @@ test "TF_GLM_REQUEST_STARTS pairs prompt chunks clear of cuts and refuses cuts i
     seq.st.base = 0;
     try std.testing.expect(!pairedAt(&e, 3069, 39640, null, null));
     try std.testing.expect(pairedAt(&e, 3069, 3069 + 2 * C - 1, null, null));
+    // Paired solo (TF_GLM_PROMPT_PAIR=solo, ra=4096) with 112K grid-filler cuts [2048, 4096, ..., 110592, 111949].
+    e.pair.?.rows = 2 * C;
+    seq.st.ring_rows = 4 * C;
+    var cuts_112k: [55]u32 = undefined;
+    for (0..54) |k| cuts_112k[k] = @intCast((k + 1) * C);
+    cuts_112k[54] = 111_949;
+    try prompt_cuts.set(a, &seq.cuts, &cuts_112k);
+    seq.st.base = 0;
+    var at: usize = 0;
+    var paired_solo: usize = 0;
+    var single_solo: usize = 0;
+    while (at < 112_000) {
+        const left = 112_000 - at;
+        const paired = pairedAt(&e, at, 112_000, null, .{ .at = &.{111_949}, .ctx = &ctx, .call = Mark.call });
+        const solo_step = !paired and prompt_solo.takesChunks(at, 112_000, 2 * C, &.{111_949}) and prompt_cuts.clearOfCuts(seq.cuts.items, at, prompt_solo.rowsAt(at, 112_000, 2 * C)) and prompt_solo.ringsAgree(seq.st.base, seq.st.ring_rows, seq.st.pool, at, prompt_solo.rowsAt(at, 112_000, 2 * C));
+        const wide: usize = if (paired) 4 * C else if (solo_step) 2 * C else 0;
+        const n = prompt_cuts.leaderRows(112_000, seq.cuts.items, at, wide);
+        const got = try prompt_cuts.stepRows(112_000, seq.cuts.items, at, @min(left, n + 1), if (paired) 4 * C else 2 * C);
+        try std.testing.expectEqual(@min(left, n), got);
+        if (at + got > seq.st.base + seq.st.ring_rows) seq.st.base = at / seq.st.pool * seq.st.pool;
+        if (paired) paired_solo += 1 else if (solo_step) single_solo += 1;
+        at += got;
+        if (at < 112_000) try std.testing.expect(prompt_cuts.coldCut(112_000, seq.cuts.items, at));
+    }
+    try std.testing.expectEqual(@as(usize, 13), paired_solo); // 13 * 8192 = 106496
+    try std.testing.expectEqual(@as(usize, 1), single_solo); // 106496..110592 (4096) before cut at 111949
+    // Off-grid cold start 512 with paired solo: refuses non-cold 600 and off-grid cut 4096, accepts 512 + k*C.
+    try prompt_cuts.set(a, &seq.cuts, &.{ 512, 512 + C, 512 + 2 * C, 512 + 3 * C });
+    seq.st.base = 512;
+    try std.testing.expect(pairedAt(&e, 512, 512 + 4 * C, null, null));
+    try std.testing.expect(!pairedAt(&e, 600, 512 + 4 * C, null, null));
+    var big_part: [4 * C]u32 = @splat(1);
+    try std.testing.expectError(error.BadChunk, prefill(&e, &big_part, 600, 600 + 4 * C, null, null, false));
+    try prompt_cuts.set(a, &seq.cuts, &.{ 512, 2 * C });
+    try std.testing.expect(!pairedAt(&e, 512, 512 + 4 * C, null, null));
+    try std.testing.expectError(error.BadChunk, prefill(&e, &big_part, 512, 512 + 4 * C, null, null, false));
 }

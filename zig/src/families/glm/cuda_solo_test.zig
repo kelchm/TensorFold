@@ -47,17 +47,19 @@ test "GLM buffers: a paired chunk keeps its own token lists, which its shared in
 
 test "a solo pass: four chunks preserve every interior keep mark and the final tail" {
     try t.expect(solo.takesChunks(0, 6 * C, 4 * C, &.{}));
-    for ([_]u32{ C, 2 * C, 3 * C }) |mark| try t.expect(!solo.takesChunks(0, 6 * C, 4 * C, &.{mark}));
+    for ([_]u32{ 500, C, 2 * C, 2 * C + 17, 3 * C, 4 * C - 1 }) |mark| try t.expect(!solo.takesChunks(0, 6 * C, 4 * C, &.{mark}));
     try t.expect(solo.takesChunks(0, 6 * C, 4 * C, &.{ 4 * C, 5 * C }));
     try t.expect(solo.takesChunks(C, 6 * C, 4 * C, &.{C}));
-    try t.expect(!solo.takesChunks(C + 1, 6 * C, 4 * C, &.{}));
+    try t.expect(solo.takesChunks(C + 1, 6 * C, 4 * C, &.{})); // off-grid cold start allowed here; coldCut gates at/allowed
+    try t.expect(!solo.takesChunks(C + 1, 6 * C, 4 * C, &.{C + 500}));
     try t.expect(!solo.takesChunks(0, C + 1, 4 * C, &.{}));
     try t.expect(solo.takesChunks(0, C + 2, 4 * C, &.{}));
     try t.expectEqual(@as(usize, 4 * C), solo.rowsAt(C, 8 * C, 4 * C));
     try t.expectEqual(@as(usize, 3 * C + 1), solo.rowsAt(C, 4 * C + 1, 4 * C));
     try t.expectEqual(@as(usize, 4 * C), try cuts.stepRows(8 * C, &.{}, C, 4 * C + 1, 4 * C));
     try t.expectEqual(@as(usize, 2 * C), try cuts.stepRows(8 * C, &.{}, C, 2 * C + 1, 2 * C));
-    try t.expectError(error.BadChunk, cuts.stepRows(8 * C, &.{2 * C}, 0, 4 * C + 1, 4 * C));
+    try t.expectEqual(@as(usize, 4 * C), try cuts.stepRows(8 * C, &.{2 * C}, 0, 4 * C + 1, 4 * C));
+    try t.expectError(error.BadChunk, cuts.stepRows(8 * C, &.{2 * C + 1}, 0, 4 * C + 1, 4 * C));
 }
 
 test "a solo pass: four chunks rebase at the same point as a chunk at a time" {
@@ -70,43 +72,60 @@ test "a solo pass: four chunks rebase at the same point as a chunk at a time" {
                 if (at + @min(C, start + rows - at) > base + ring) base = at;
             }
             const wide_base = if (start + rows > ring) start else 0;
-            try t.expectEqual(rows <= ring and base == wide_base, solo.ringsAgree(0, ring, start, rows));
+            try t.expectEqual(rows <= ring and base == wide_base, solo.ringsAgree(0, ring, 4, start, rows));
         }
     };
-    try t.expect(solo.ringsAgree(0, 4 * C, 4 * C, 4 * C));
-    try t.expect(!solo.ringsAgree(0, 4 * C, C, 4 * C));
-    try t.expect(!solo.ringsAgree(C, 4 * C, 0, 4 * C));
+    try t.expect(solo.ringsAgree(0, 4 * C, 4, 4 * C, 4 * C));
+    try t.expect(!solo.ringsAgree(0, 4 * C, 4, C, 4 * C));
+    try t.expect(!solo.ringsAgree(C, 4 * C, 4, 0, 4 * C));
+    // Off-pool start: rebase rounds down by start % pool, so full ring width overflows on rebase.
+    try t.expect(!solo.ringsAgree(0, 2 * C, 4, 3069, 2 * C));
+    try t.expect(solo.ringsAgree(0, 2 * C, 4, 3069, 2 * C - 1));
+    try t.expect(solo.ringsAgree(0, 4 * C, 4, 3069, 2 * C));
 }
 
-test "a solo pass: followers refuse wide rows beyond buffers, rings or a request cut" {
+test "a solo pass: followers refuse wide rows beyond buffers, rings, non-cold starts or off-grid cuts" {
     var seq: @import("cuda_engine_types.zig").Seq = undefined;
     seq.st.base = 0;
     seq.st.ring_rows = 4 * C;
+    seq.st.pool = 4;
     seq.cuts = .empty;
+    defer seq.cuts.deinit(t.allocator);
     var e: engine.Engine = undefined;
     e.cur = &seq;
     e.bp.rows = 4 * C;
     e.prompt_logprobs = null;
-    try t.expect(solo.allowed(&e, 0, 4 * C));
-    try t.expect(!solo.allowed(&e, C, 4 * C));
-    try t.expect(!solo.allowed(&e, 1, 4 * C));
-    try t.expect(!solo.allowed(&e, 0, 4 * C + 1));
+    e.images = null;
+    try t.expect(solo.allowed(&e, 0, 8 * C, 4 * C));
+    try t.expect(!solo.allowed(&e, C, 8 * C, 4 * C));
+    try t.expect(!solo.allowed(&e, 1, 8 * C, 4 * C));
+    try t.expect(!solo.allowed(&e, 0, 8 * C, 4 * C + 1));
     e.bp.rows = 2 * C;
-    try t.expect(!solo.allowed(&e, 0, 4 * C));
+    try t.expect(!solo.allowed(&e, 0, 8 * C, 4 * C));
     e.bp.rows = 4 * C;
     seq.st.ring_rows = 2 * C;
-    try t.expect(!solo.allowed(&e, 0, 4 * C));
+    try t.expect(!solo.allowed(&e, 0, 8 * C, 4 * C));
     seq.st.ring_rows = 4 * C;
+    // Grid-aligned filler cut at 2*C is allowed; off-grid cut at 2*C + 1 is refused.
     try seq.cuts.append(t.allocator, 2 * C);
-    defer seq.cuts.deinit(t.allocator);
-    try t.expect(!solo.allowed(&e, 0, 4 * C));
+    try t.expect(solo.allowed(&e, 0, 8 * C, 4 * C));
+    try seq.cuts.append(t.allocator, 2 * C + 1);
+    try t.expect(!solo.allowed(&e, 0, 8 * C, 4 * C));
+    // Off-grid cold start 512 with grid-aligned continuation: allowed at 512, refused at non-cold 516.
+    seq.cuts.clearRetainingCapacity();
+    try seq.cuts.appendSlice(t.allocator, &.{ 512, 512 + C, 512 + 2 * C });
+    seq.st.base = 512;
+    try t.expect(solo.allowed(&e, 512, 8 * C, 4 * C));
+    try t.expect(!solo.allowed(&e, 516, 8 * C, 4 * C));
 }
 
-test "a solo pass: the leader uses the restored ring base and keeps marks inside four chunks" {
+test "a solo pass: the leader uses the restored ring base, allows grid-filler cuts, and keeps interior marks" {
     var seq: @import("cuda_engine_types.zig").Seq = undefined;
     seq.st.base = 0;
     seq.st.ring_rows = 4 * C;
+    seq.st.pool = 4;
     seq.cuts = .empty;
+    defer seq.cuts.deinit(t.allocator);
     var e: engine.Engine = undefined;
     e.gpa = t.allocator;
     e.cur = &seq;
@@ -125,9 +144,19 @@ test "a solo pass: the leader uses the restored ring base and keeps marks inside
         fn call(_: *anyopaque, _: u32) void {}
     };
     var ctx: u8 = 0;
-    for ([_]u32{ 3 * C, 4 * C, 5 * C }) |mark| {
+    for ([_]u32{ 2 * C + 50, 3 * C, 4 * C, 5 * C }) |mark| {
         try t.expect(!solo.at(&e, 2 * C, 8 * C, from, .{ .at = &.{mark}, .ctx = &ctx, .call = Mark.call }));
     }
+    // Grid-filler cuts [2048, 4096, ..., 110592, 111949] allow 8192 solo from 0 and refuse crossing 111949.
+    var cuts_112k: [55]u32 = undefined;
+    for (0..54) |k| cuts_112k[k] = @intCast((k + 1) * C);
+    cuts_112k[54] = 111_949;
+    try seq.cuts.appendSlice(t.allocator, &cuts_112k);
+    try t.expect(solo.at(&e, 0, 112_000, null, .{ .at = &.{111_949}, .ctx = &ctx, .call = Mark.call }));
+    seq.st.base = 106_496;
+    try t.expect(!solo.at(&e, 106_496, 112_000, null, .{ .at = &.{111_949}, .ctx = &ctx, .call = Mark.call }));
+    e.bp.rows = 2 * C;
+    try t.expect(solo.at(&e, 106_496, 112_000, null, .{ .at = &.{111_949}, .ctx = &ctx, .call = Mark.call }));
 }
 
 fn syntheticExl3Weights(layers: []weights.Layer) !weights.Weights {

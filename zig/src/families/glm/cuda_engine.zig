@@ -397,7 +397,7 @@ pub const Engine = struct {
         const rows = if (capped == 0) try prompt_cuts.stepRows(len, e.cur.cuts.items, start, part.len, if (paired) 2 * e.pair.?.rows else e.bp.rows) else if (e.c.dsa) try prompt_cuts.cappedRows(len, e.cur.cuts.items, start, capped) else return error.BadChunk;
         if (paired) return prompt_pair.prefill(e, part, start, len, cancel, marks, split);
         if (part.len != @min(len - start, rows + 1)) return error.BadChunk;
-        if (rows > fw.prefill_rows and !prompt_solo.allowed(e, start, rows)) return error.BadChunk;
+        if (rows > fw.prefill_rows and !prompt_solo.allowed(e, start, len, rows)) return error.BadChunk;
         var one: [1]fw.Rank = undefined;
         var f = e.view(&e.bp, &one);
         f.index_split = split;

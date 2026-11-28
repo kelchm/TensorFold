@@ -94,7 +94,7 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
         const solo = glm.prompt_solo;
         while (at < len) {
             const two = glm.prompt_pair.takesTwo(at, len, e.share.world, case.marks, P) and glm.prompt_pair.ringsAgree(base, st.ring_rows, st.pool, at, P, @min(len - at - P, P));
-            const one = !two and e.bp.rows > C and solo.takesChunks(at, len, e.bp.rows, case.marks) and solo.ringsAgree(base, st.ring_rows, at, solo.rowsAt(at, len, e.bp.rows));
+            const one = !two and e.bp.rows > C and solo.takesChunks(at, len, e.bp.rows, case.marks) and solo.ringsAgree(base, st.ring_rows, st.pool, at, solo.rowsAt(at, len, e.bp.rows));
             const rows = @min(len - at, if (two) 2 * P else if (one) e.bp.rows else C);
             if (at + rows > base + st.ring_rows) base = at; // State.ready rebases at the step's start, a whole pool
             want += @intFromBool(two);

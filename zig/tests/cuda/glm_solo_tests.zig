@@ -100,7 +100,7 @@ pub fn soloCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
         var at: usize = 0;
         while (at < len) {
             const reach = @min(len - at, @as(usize, set.solo));
-            const two = glm.prompt_solo.takesChunks(at, len, set.solo, case.marks) and glm.prompt_solo.ringsAgree(base, st.ring_rows, at, reach);
+            const two = glm.prompt_solo.takesChunks(at, len, set.solo, case.marks) and glm.prompt_solo.ringsAgree(base, st.ring_rows, st.pool, at, reach);
             const rows = @min(len - at, @as(usize, if (two) set.solo else C));
             if (at + rows > base + st.ring_rows) base = at; // State.ready rebases at the step's start, a whole pool
             want += @intFromBool(two);
