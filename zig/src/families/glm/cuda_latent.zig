@@ -64,9 +64,9 @@ pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, out: u64, ro
     try rowBlocks(set.glue.absorb_q, stream, q, wk, out, rows, heads, lw / 32);
 }
 
-/// TF_GLM_ABSORB_MMA=1 on a prompt's aligned rows; decode windows retain the SIMT kernels.
+/// TF_GLM_ABSORB_MMA=1 on an unroped prompt's aligned rows; decode windows and roped MLA retain the SIMT kernels.
 fn mmaRows(set: glue.Set, rows: usize, ptrs: [3]u64) bool {
-    if (!set.prompt or !set.absorb_mma or rows < prompt_rows) return false;
+    if (!set.prompt or !set.absorb_mma or set.mla != null or rows < prompt_rows) return false;
     for (ptrs) |p| if (p % 16 != 0) return false;
     return true;
 }

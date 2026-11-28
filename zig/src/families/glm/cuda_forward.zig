@@ -211,7 +211,7 @@ pub const Forward = struct {
     }
 
     pub fn set(f: *const Forward) glue.Set {
-        return .{ .verify_tiles = f.verify_tiles, .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .dsel = f.m.dsel, .dscore = if (f.m.dscore) |*x| x else null, .mla = if (f.m.mla) |*x| x else null, .tfq3 = if (f.m.tfq3) |*x| x else null, .absorb_mma = f.numerics.absorb_mma and f.ranks[0].b.prefill };
+        return .{ .verify_tiles = f.verify_tiles, .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .dsel = f.m.dsel, .dscore = if (f.m.dscore) |*x| x else null, .mla = if (f.m.mla) |*x| x else null, .tfq3 = if (f.m.tfq3) |*x| x else null, .absorb_mma = f.numerics.absorb_mma and f.ranks[0].b.prefill and f.ranks[0].w.config.rope == 0 };
     }
 
     /// The layer sums' boundary; true means its optional post already ran in the gather kernel.

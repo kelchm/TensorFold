@@ -5,6 +5,8 @@ const glue = @import("cuda_glue.zig");
 const latent = @import("cuda_latent.zig");
 const pdl = @import("cuda_pdl.zig");
 const ranks = @import("cuda_ranks.zig");
+const forward = @import("cuda_forward.zig");
+const weights = @import("cuda_weights.zig");
 const t = std.testing;
 const Record = struct {
     id: usize,
@@ -96,4 +98,47 @@ test "GLM MLA: strict opt-in parsing, arithmetic metadata and rank agreement" {
     const entry = @import("profile").entry(.TF_GLM_ABSORB_MMA);
     try t.expectEqual(@import("profile").Class.arithmetic, entry.class);
     try t.expect(entry.stable == null and entry.differs("1") and !entry.differs("0"));
+}
+
+test "GLM MLA: TF_GLM_ABSORB_MMA stays off on roped GLM and keeps SIMT expandV" {
+    var d: cuda.Driver = undefined;
+    d.api.cuLaunchKernel = Record.launch;
+    d.api.cuLaunchKernelEx = pdl.forwardEx(Record.launch);
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    var mods: forward.Modules = undefined;
+    mods.index = null;
+    mods.dscore = null;
+    mods.mla = null;
+    mods.tfq3 = null;
+    mods.tiled = false;
+    mods.packs = null;
+    mods.dsel = false;
+    mods.copy_rows = .{ .d = &d, .handle = null };
+    mods.glue.absorb_q = .{ .d = &d, .handle = @ptrFromInt(1) };
+    mods.glue.expand_v = .{ .d = &d, .handle = @ptrFromInt(2) };
+    mods.glue.latent_mma_kn = .{ .d = &d, .handle = @ptrFromInt(3) };
+    mods.glue.latent_mma_nk = .{ .d = &d, .handle = @ptrFromInt(4) };
+    var w: weights.Weights = undefined;
+    w.config.rope = 0;
+    var st: forward.State = undefined;
+    var b: forward.Buffers = undefined;
+    b.prefill = true;
+    const rank = [_]forward.Rank{.{ .w = &w, .st = &st, .b = &b }};
+    const fw: forward.Forward = .{ .d = &d, .m = &mods, .stream = stream, .ranks = &rank, .exchange = .local, .numerics = .{ .absorb_mma = true } };
+    try t.expect(fw.set().absorb_mma);
+    try latent.expandV(fw.set(), stream, 16, 32, 48, 64, 32, 256, 512);
+    try t.expectEqual(@as(usize, 4), Record.last.id);
+    w.config.rope = cuda.mla.rope_width;
+    try t.expect(!fw.set().absorb_mma);
+    try latent.expandV(fw.set(), stream, 16, 32, 48, 64, 32, 256, 512);
+    try t.expectEqual(@as(usize, 2), Record.last.id);
+    w.config.rope = 0;
+    b.prefill = false;
+    try t.expect(!fw.set().absorb_mma);
+    try latent.expandV(fw.set(), stream, 16, 32, 48, 64, 32, 256, 512);
+    try t.expectEqual(@as(usize, 2), Record.last.id);
+    var mla_mod: cuda.mla.Mla = undefined;
+    const direct_roped: glue.Set = .{ .glue = &mods.glue, .mla = &mla_mod, .prompt = true, .absorb_mma = true };
+    try latent.expandV(direct_roped, stream, 16, 32, 48, 64, 32, 256, 512);
+    try t.expectEqual(@as(usize, 2), Record.last.id);
 }

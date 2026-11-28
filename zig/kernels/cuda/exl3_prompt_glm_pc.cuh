@@ -78,17 +78,21 @@ struct PcEpi {
     float limit;
     int act_mode;
 };
+// Unaligned CTA barrier across all PTH threads (barrier 2: distinct from 0 and pc_decode's 1).
+__device__ __forceinline__ void pc_cta_sync() {
+    asm volatile("barrier.cta.sync 2, %0;\n" ::"n"(PTH) : "memory");
+}
 // Every warp; a pass spills members 32 hf.. of each half h as rows 32 h.. of [gate | up][64][GU_ES], then their rows.
 template <class Spill>
 __device__ __forceinline__ void pc_epilogue(const PcEpi& a, unsigned char* smem, Spill spill, int warp, int lane) {
-    __syncthreads(); // every stage consumed and every copy landed: the stages become the sums
+    pc_cta_sync(); // every stage consumed and every copy landed: the stages become the sums
     float* E = reinterpret_cast<float*>(smem);
     const int* rows_sh = reinterpret_cast<const int*>(smem + POR);
     const volatile int* meta = rows_sh + PM; // e, cnt: read where used, not held through the rows
     for (int hf = 0; hf < 2 && hf * TPH < meta[1]; ++hf) {
-        if (hf) __syncthreads(); // the first pass's rows are read
+        if (hf) pc_cta_sync(); // the first pass's rows are read
         spill(E, hf);
-        __syncthreads();
+        pc_cta_sync();
         for (int r = warp; r < TPM; r += PW) {
             const int m = (r / TPH) * TPM + hf * TPH + r % TPH;
             if (m < meta[1])
